@@ -10,7 +10,8 @@ OtterHive 對舊 `agend-terminal` 的行為主張，以本頁列出的證據為�
 | 舊 daemon binary | `target/release/agend-terminal`，SHA-256 `80951250b2ee213ac9c263581fc0a904cb4354fb842f8887da68f7e6edb0bd7d` |
 | workflow source | `agend-customization@d49735d89ae97c58a09cc243428dd629d013a650` |
 | REA | `rea-agents@6.4.0`，provider `rea-process` v3，darwin/arm64，node-pty |
-| 證據檔 | `docs/reverse-engineering/evidence/rea-legacy-baseline.json`（5 records、3 unknowns） |
+| 證據檔 | `docs/reverse-engineering/evidence/rea-legacy-baseline.json`（MCP session 匯出：5 records、3 unknowns，含 `ev_d4b324c2…` 與 `ev_33e9c28b…`）；`docs/reverse-engineering/evidence/rea-baseline-rerun.json`（`scripts/research/rea-baseline.sh` 經 REA CLI 產生的 `ev_b0853814…` 完整 Evidence） |
+| 舊 source 取得 | GitHub `cheerc/agend-terminal`，checkout 上列 commit；`scripts/research/build_mcp_catalog.py` 也需要它 |
 
 binary 與 source 的對應只依 `~/.cargo/bin/agend-terminal` 和 `target/release/agend-terminal` SHA-256 相同推得，未重新 build 驗證。
 
@@ -29,6 +30,22 @@ binary 與 source 的對應只依 `~/.cargo/bin/agend-terminal` 和 `target/rele
 - log 顯示 `AGEND_ENV_ISOLATION off`：backend 繼承 daemon 的完整環境。
 - 子程序結束後記錄 `refusing to signal a shared process group pid=<pid> pgid=-1`：無法確認 process group 時不發 signal。
 - 程序在無輸入下過快結束時判為 `startup failure (exited too quickly, no user input)`。
+
+## 靜態 source 推論（不是行為證據）
+
+以下主張來自閱讀 `agend-terminal@593da97c` 的原始碼，沒有以 REA 觀測其執行。設計時可作為參考，但不能當成已觀測的行為。
+
+| 主張 | 依據 |
+|---|---|
+| runtime 不呼叫 tmux；tmux 只是操作風格 | `Command::new("tmux"` 在 `src/` 出現 0 次；`tmux` 只出現在註解：`src/keybinds.rs:1`、`:192`、`:200`，`src/bootstrap/daemon_spawn.rs:1`，`src/layout/split.rs:203` |
+| 終端以 portable-pty 加 alacritty_terminal 實作 | `Cargo.toml` 依賴；`src/agent/mod.rs:1331–1586`；`src/vterm.rs:1005` |
+| 再次 drain 會隱式 ack 上一批 | `src/inbox/storage.rs:55`、`:850–851` |
+| restart 不等舊程序結束就 spawn | `src/mcp/handlers/instance_state/mod.rs:534–535` |
+| deploy 的成員 spawn 失敗只寫 log，仍回 `deployed` | `src/deployments.rs:633`、`:646`、`:994` |
+| 慢的訂閱者會被丟 chunk | `src/agent/broadcast.rs:64–88` |
+| Claude preset 執行 `claude --dangerously-skip-permissions`，resume 用 cwd 的 `--continue` | `src/backend.rs:417–421` |
+| Claude spawn 只在檔案存在時加 instructions／MCP flags | `src/backend.rs:854–881`；`spawn_flags` 檢查檔案存在後才加入 `--append-system-prompt-file`、`--mcp-config` |
+| 舊版以編碼後的 canonical cwd 找 session，至少一筆 `"type":"user"` 才認為可 resume | `src/backend.rs:1100–1184`；`has_resumable`、`encode_project_dir`、`jsonl_has_user_entry`。這是舊 adapter 的判斷，不證明真 Claude 的相容性 |
 
 ## 已知限制與事件
 

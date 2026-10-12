@@ -7,6 +7,11 @@ Usage:
         --legacy-commit <full sha> \
         --out docs/reverse-engineering/mcp-catalog.json
 
+The legacy source is cheerc/agend-terminal on GitHub; check out the commit
+passed as --legacy-commit (the published catalog uses
+593da97c6f94d874f793777b4550d5df2ae4f43c) and point --legacy-tools at its
+src/mcp/tools.rs.
+
 The legacy schemas are `serde_json::json!` literals. They are parsed as JSON
 after removing trailing commas; a literal that cannot be parsed (for example
 one built with `format!`) must have an entry in MANUAL_SCHEMAS, otherwise the
@@ -59,24 +64,28 @@ MANUAL_SCHEMAS = {
 P1A_SUPPORT = {
     "create_instance": {
         "supported": ["name", "backend", "args", "model", "effort", "working_directory",
-                      "team", "description", "role", "env"],
+                      "description", "role", "env"],
         "added": ["command", "instructions", "skills_path"],
+        "supported_values": {"backend": ["claude", "command"]},
         "caller": "operator",
     },
-    "list_instances": {"supported": ["instance"], "caller": "operator, instance"},
+    "list_instances": {"supported": ["instance"], "caller": "all callers"},
     "delete_instance": {"supported": ["instance"], "caller": "operator"},
     "start_instance": {"supported": ["instance"], "caller": "operator"},
     "restart_instance": {
         "supported": ["instance", "mode", "reason"],
-        "caller": "operator; instance for itself only",
+        "added": ["expected_generation"],
+        "supported_values": {"mode": ["fresh", "resume"]},
+        "caller": "operator, manager; any instance for itself",
     },
-    "interrupt": {"supported": ["instance"], "caller": "operator; same-team orchestrator"},
-    "pane_snapshot": {"supported": ["instance", "lines"], "caller": "operator, instance"},
+    "interrupt": {"supported": ["instance"], "caller": "operator, manager; orchestrator for its team members"},
+    "pane_snapshot": {"supported": ["instance", "lines"],
+                      "caller": "operator, manager; orchestrator for its team; instance for itself"},
     "send": {
         "supported": ["instance", "instances", "team", "message", "request_kind",
                       "correlation_id", "parent_id", "thread_id"],
         "supported_values": {"request_kind": ["query", "report", "update"]},
-        "caller": "operator, instance (sender identity is server-derived)",
+        "caller": "operator, manager, instance (instance recipients follow the team ACL; sender identity is server-derived)",
     },
     "inbox": {
         "supported": ["action", "message_id"],
@@ -88,7 +97,7 @@ P1A_SUPPORT = {
         "supported": ["action", "name", "members", "orchestrator", "description",
                       "add", "remove", "accept_from"],
         "supported_actions": ["create", "delete", "list", "update"],
-        "caller": "operator (list: operator, instance)",
+        "caller": "operator; list: all callers",
     },
     "deployment": {
         "supported": ["action", "template", "name", "directory"],
@@ -113,7 +122,7 @@ CONTRACT_CHANGES = {
     ],
     "create_instance": ["instance callers are refused; creation is an operator action"],
     "delete_instance": ["the inbox is archived under the deleted identity; a later instance with the same name gets a new identity"],
-    "deployment": ["deploy reports each member's outcome; a failed member yields a partial result, never deployed"],
+    "deployment": ["deploy reports each member's outcome: all succeed is completed, mixed is partial, all fail is refused; failed definitions are retained and never reported as deployed"],
 }
 
 

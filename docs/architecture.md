@@ -8,7 +8,7 @@
 | `otterhive <command>` | operator CLI：instance、team、deployment、attach |
 | `otterhive-mcp-bridge` | 每個 instance 的 MCP stdio server，把 tool call 轉給 daemon，帶該 generation 的 token |
 
-backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 斷線不影響 daemon 與 instance。
+backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 斷線不影響 daemon 與 instance。所有 I/O 都是同步呼叫加執行緒，不使用 async runtime（ADR 0001 第 10 點）。
 
 ## 模組
 
@@ -16,7 +16,7 @@ backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 
 |---|---|
 | `protocol` | 身分型別、`OperationResult`、錯誤碼、請求格式 |
 | `store` | SQLite schema、交易、journal |
-| `config` | `otterhive.yaml`：instances、teams、templates、managers |
+| `config` | `$OTTERHIVE_HOME/otterhive.yaml`：templates、managers（instance 與 team 只存在 SQLite） |
 | `daemon` | socket 服務、授權、lifecycle、daemon 重啟後的收斂 |
 | `backend` | adapter（`claude`、`command`）、參數、instructions／skills 物化、resume 證據、喚醒提示 |
 | `terminal` | PTY session、VT 畫面、snapshot 與訂閱、attach 串流協定 |
@@ -31,6 +31,6 @@ backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 
 | 範圍 | 狀態 |
 |---|---|
 | P0：功能對照、MCP catalog、REA 行為基線 | 完成 |
-| P1a：lifecycle、訊息、終端 attach、team、deployment | 進行中 |
+| P1a：lifecycle、訊息、終端 attach、team、deployment | 規格與實作計畫完成，尚未實作；見 [P1a 實作計畫](plans/p1a-implementation.md) |
 | P1b：TUI、resume／handoff 觸發、`set_metadata` 等 | 未開始 |
 | P2 以後：task、decision、worktree、review、CI、channel | 未開始；清單在 [`mcp-catalog.json`](reverse-engineering/mcp-catalog.json) |

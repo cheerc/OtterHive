@@ -4,7 +4,7 @@ OtterHive 是一個精簡的 Rust daemon，讓多個 AI coding agent CLI（例�
 
 ## 狀態
 
-尚無可用的發行版本。目前完成功能對照與行為基線（P0），正在實作 P1a：instance 生命週期、訊息、終端 attach、team 與 deployment。各期範圍見 [架構](docs/architecture.md#實作狀態)。
+尚無可用的程式。目前完成功能對照、行為基線，以及 P1a 的規格與實作計畫；P1a（instance 生命週期、訊息、終端 attach、team 與 deployment）尚未開始實作。各期範圍見 [架構](docs/architecture.md#實作狀態)。
 
 ## 文件
 
@@ -12,6 +12,7 @@ OtterHive 是一個精簡的 Rust daemon，讓多個 AI coding agent CLI（例�
 |---|---|
 | [架構](docs/architecture.md) | 程序、模組與實作狀態 |
 | [P1a 協作契約](docs/specs/p1-coordination.md) | 首版對外行為規格 |
+| [P1a 實作計畫](docs/plans/p1a-implementation.md) | 工作包、順序、測試案例與驗收 |
 | [ADR 0001](docs/adr/0001-runtime-boundaries.md) | 執行期邊界與選型理由 |
 | [功能對照](docs/reverse-engineering/feature-map.md) | workflow → 舊實作 → 分期 |
 | [MCP catalog](docs/reverse-engineering/mcp-catalog.json) | 舊版 34 個工具的分期與欄位支援 |

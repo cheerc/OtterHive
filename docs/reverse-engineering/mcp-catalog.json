@@ -147,7 +147,7 @@
         "required": []
       },
       "p1a": {
-        "caller": "operator, instance (sender identity is server-derived)",
+        "caller": "operator, manager, instance (instance recipients follow the team ACL; sender identity is server-derived)",
         "supported_fields": [
           "instance",
           "instances",
@@ -281,7 +281,7 @@
         "required": []
       },
       "p1a": {
-        "caller": "operator, instance",
+        "caller": "all callers",
         "supported_fields": [
           "instance"
         ],
@@ -339,7 +339,6 @@
           "model",
           "effort",
           "working_directory",
-          "team",
           "description",
           "role",
           "env"
@@ -351,6 +350,7 @@
           "layout",
           "target_pane",
           "count",
+          "team",
           "backends",
           "topic_binding"
         ],
@@ -360,7 +360,12 @@
           "skills_path"
         ],
         "supported_actions": null,
-        "supported_values": {},
+        "supported_values": {
+          "backend": [
+            "claude",
+            "command"
+          ]
+        },
         "contract_changes": [
           "instance callers are refused; creation is an operator action"
         ]
@@ -508,7 +513,7 @@
         ]
       },
       "p1a": {
-        "caller": "operator; instance for itself only",
+        "caller": "operator, manager; any instance for itself",
         "supported_fields": [
           "instance",
           "mode",
@@ -517,9 +522,16 @@
         "refused_fields": [
           "force"
         ],
-        "added_fields": [],
+        "added_fields": [
+          "expected_generation"
+        ],
         "supported_actions": null,
-        "supported_values": {},
+        "supported_values": {
+          "mode": [
+            "fresh",
+            "resume"
+          ]
+        },
         "contract_changes": [
           "resume without backend session evidence returns resume_unavailable and leaves the running process untouched",
           "the replacement starts only after the previous process is proven stopped; otherwise recovery_required"
@@ -549,7 +561,7 @@
         ]
       },
       "p1a": {
-        "caller": "operator; same-team orchestrator",
+        "caller": "operator, manager; orchestrator for its team members",
         "supported_fields": [
           "instance"
         ],
@@ -656,7 +668,7 @@
         ]
       },
       "p1a": {
-        "caller": "operator, instance",
+        "caller": "operator, manager; orchestrator for its team; instance for itself",
         "supported_fields": [
           "instance",
           "lines"
@@ -891,7 +903,7 @@
         ]
       },
       "p1a": {
-        "caller": "operator (list: operator, instance)",
+        "caller": "operator; list: all callers",
         "supported_fields": [
           "action",
           "name",
@@ -1013,7 +1025,7 @@
         ],
         "supported_values": {},
         "contract_changes": [
-          "deploy reports each member's outcome; a failed member yields a partial result, never deployed"
+          "deploy reports each member's outcome: all succeed is completed, mixed is partial, all fail is refused; failed definitions are retained and never reported as deployed"
         ]
       }
     },
