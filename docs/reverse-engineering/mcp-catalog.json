@@ -1,0 +1,1317 @@
+{
+  "schema_version": 1,
+  "legacy_source": {
+    "repository": "cheerc/agend-terminal",
+    "commit": "593da97c6f94d874f793777b4550d5df2ae4f43c",
+    "file": "src/mcp/tools.rs"
+  },
+  "customization_source": {
+    "repository": "agend-customization",
+    "commit": "d49735d89ae97c58a09cc243428dd629d013a650",
+    "file": "skills/general/agend-changelog/references/dependency-surface.md:10"
+  },
+  "phases": [
+    "P1a",
+    "P1b",
+    "P2",
+    "P3",
+    "P4",
+    "deferred-operator",
+    "deferred-channel"
+  ],
+  "tool_count": 34,
+  "tools": [
+    {
+      "name": "reply",
+      "phase": "deferred-channel",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          27,
+          36
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "message",
+          "message_from_file",
+          "message_id",
+          "default_action",
+          "timeout_secs",
+          "task_id",
+          "correlation_id"
+        ],
+        "required": []
+      }
+    },
+    {
+      "name": "operator_page",
+      "phase": "deferred-channel",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          40,
+          43
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "message"
+        ],
+        "required": [
+          "message"
+        ]
+      }
+    },
+    {
+      "name": "download_attachment",
+      "phase": "deferred-channel",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          47,
+          48
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "file_id"
+        ],
+        "required": [
+          "file_id"
+        ]
+      }
+    },
+    {
+      "name": "send",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          52,
+          99
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "instances",
+          "team",
+          "tags",
+          "message",
+          "message_from_file",
+          "request_kind",
+          "report_purpose",
+          "code_review",
+          "success_criteria",
+          "context",
+          "task_id",
+          "correlation_id",
+          "parent_id",
+          "thread_id",
+          "force",
+          "force_reason",
+          "second_reviewer",
+          "second_reviewer_reason",
+          "review_class",
+          "governing_decision_id",
+          "plan_ack_required",
+          "plan_ack_reason",
+          "review_assignment",
+          "repository",
+          "pr_number",
+          "review_author",
+          "reviewed_head",
+          "expected_head",
+          "artifacts",
+          "branch",
+          "eta_minutes",
+          "reporting_cadence",
+          "bind",
+          "worktree_binding_required",
+          "expect_reply_within_secs",
+          "next_after_ci",
+          "terminal",
+          "no_report_expected",
+          "ack_inbox",
+          "triaged"
+        ],
+        "required": []
+      },
+      "p1a": {
+        "caller": "operator, instance (sender identity is server-derived)",
+        "supported_fields": [
+          "instance",
+          "instances",
+          "team",
+          "message",
+          "request_kind",
+          "correlation_id",
+          "parent_id",
+          "thread_id"
+        ],
+        "refused_fields": [
+          "tags",
+          "message_from_file",
+          "report_purpose",
+          "code_review",
+          "success_criteria",
+          "context",
+          "task_id",
+          "force",
+          "force_reason",
+          "second_reviewer",
+          "second_reviewer_reason",
+          "review_class",
+          "governing_decision_id",
+          "plan_ack_required",
+          "plan_ack_reason",
+          "review_assignment",
+          "repository",
+          "pr_number",
+          "review_author",
+          "reviewed_head",
+          "expected_head",
+          "artifacts",
+          "branch",
+          "eta_minutes",
+          "reporting_cadence",
+          "bind",
+          "worktree_binding_required",
+          "expect_reply_within_secs",
+          "next_after_ci",
+          "terminal",
+          "no_report_expected",
+          "ack_inbox",
+          "triaged"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {
+          "request_kind": [
+            "query",
+            "report",
+            "update"
+          ]
+        },
+        "contract_changes": [
+          "each recipient receives a durable message_id and its own outcome; a partial broadcast is reported as partial",
+          "request_kind=task and every task/review/branch/CI field is refused until the phase that owns it",
+          "the sender identity comes from the bridge credential, never from caller arguments"
+        ]
+      }
+    },
+    {
+      "name": "inbox",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          103,
+          110
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "clear",
+          "ack",
+          "discharge"
+        ],
+        "properties": [
+          "action",
+          "message_id",
+          "reason",
+          "thread_id",
+          "instance"
+        ],
+        "required": []
+      },
+      "p1a": {
+        "caller": "instance for its own inbox",
+        "supported_fields": [
+          "action",
+          "message_id"
+        ],
+        "refused_fields": [
+          "reason",
+          "thread_id",
+          "instance"
+        ],
+        "added_fields": [
+          "delivery_token"
+        ],
+        "supported_actions": [
+          "drain (action omitted)",
+          "ack"
+        ],
+        "supported_values": {},
+        "contract_changes": [
+          "drain issues a delivery_token and never acknowledges an earlier batch implicitly",
+          "ack requires message_id plus the current delivery_token; stale or never-delivered rows are refused"
+        ]
+      }
+    },
+    {
+      "name": "list_instances",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          114,
+          119
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "verbose",
+          "include_evidence"
+        ],
+        "required": []
+      },
+      "p1a": {
+        "caller": "operator, instance",
+        "supported_fields": [
+          "instance"
+        ],
+        "refused_fields": [
+          "verbose",
+          "include_evidence"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": []
+      }
+    },
+    {
+      "name": "create_instance",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          123,
+          143
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "name",
+          "backend",
+          "args",
+          "model",
+          "model_tier",
+          "effort",
+          "working_directory",
+          "branch",
+          "task",
+          "layout",
+          "target_pane",
+          "count",
+          "team",
+          "backends",
+          "description",
+          "role",
+          "env",
+          "topic_binding"
+        ],
+        "required": []
+      },
+      "p1a": {
+        "caller": "operator",
+        "supported_fields": [
+          "name",
+          "backend",
+          "args",
+          "model",
+          "effort",
+          "working_directory",
+          "team",
+          "description",
+          "role",
+          "env"
+        ],
+        "refused_fields": [
+          "model_tier",
+          "branch",
+          "task",
+          "layout",
+          "target_pane",
+          "count",
+          "backends",
+          "topic_binding"
+        ],
+        "added_fields": [
+          "command",
+          "instructions",
+          "skills_path"
+        ],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": [
+          "instance callers are refused; creation is an operator action"
+        ]
+      }
+    },
+    {
+      "name": "delete_instance",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          147,
+          152
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "force",
+          "force_reason"
+        ],
+        "required": [
+          "instance"
+        ]
+      },
+      "p1a": {
+        "caller": "operator",
+        "supported_fields": [
+          "instance"
+        ],
+        "refused_fields": [
+          "force",
+          "force_reason"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": [
+          "the inbox is archived under the deleted identity; a later instance with the same name gets a new identity"
+        ]
+      }
+    },
+    {
+      "name": "start_instance",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          156,
+          157
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance"
+        ],
+        "required": [
+          "instance"
+        ]
+      },
+      "p1a": {
+        "caller": "operator",
+        "supported_fields": [
+          "instance"
+        ],
+        "refused_fields": [],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": []
+      }
+    },
+    {
+      "name": "bind_topic",
+      "phase": "deferred-channel",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          161,
+          165
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "channel"
+        ],
+        "required": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "name": "set_model",
+      "phase": "deferred-operator",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          169,
+          176
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "model",
+          "tier",
+          "effort",
+          "restart"
+        ],
+        "required": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "name": "restart_instance",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          180,
+          186
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "mode",
+          "reason",
+          "force"
+        ],
+        "required": [
+          "instance"
+        ]
+      },
+      "p1a": {
+        "caller": "operator; instance for itself only",
+        "supported_fields": [
+          "instance",
+          "mode",
+          "reason"
+        ],
+        "refused_fields": [
+          "force"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": [
+          "resume without backend session evidence returns resume_unavailable and leaves the running process untouched",
+          "the replacement starts only after the previous process is proven stopped; otherwise recovery_required"
+        ]
+      }
+    },
+    {
+      "name": "interrupt",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          190,
+          195
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "reason",
+          "snapshot"
+        ],
+        "required": [
+          "instance"
+        ]
+      },
+      "p1a": {
+        "caller": "operator; same-team orchestrator",
+        "supported_fields": [
+          "instance"
+        ],
+        "refused_fields": [
+          "reason",
+          "snapshot"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": []
+      }
+    },
+    {
+      "name": "set_metadata",
+      "phase": "P1b",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          199,
+          204
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "display_name",
+          "description"
+        ],
+        "properties": [
+          "action",
+          "name",
+          "description"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "set_waiting_on",
+      "phase": "P1b",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          208,
+          209
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "condition"
+        ],
+        "required": []
+      }
+    },
+    {
+      "name": "move_pane",
+      "phase": "P1b",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          213,
+          218
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "target_tab",
+          "split_dir"
+        ],
+        "required": [
+          "instance",
+          "target_tab"
+        ]
+      }
+    },
+    {
+      "name": "pane_snapshot",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          222,
+          228
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "lines",
+          "to_file",
+          "head"
+        ],
+        "required": [
+          "instance"
+        ]
+      },
+      "p1a": {
+        "caller": "operator, instance",
+        "supported_fields": [
+          "instance",
+          "lines"
+        ],
+        "refused_fields": [
+          "to_file",
+          "head"
+        ],
+        "added_fields": [],
+        "supported_actions": null,
+        "supported_values": {},
+        "contract_changes": []
+      }
+    },
+    {
+      "name": "instance",
+      "phase": "P1b",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          232,
+          241
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "list",
+          "pane_snapshot"
+        ],
+        "properties": [
+          "action",
+          "instance",
+          "verbose",
+          "include_evidence",
+          "lines",
+          "to_file",
+          "head"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "decision",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          245,
+          276
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "post",
+          "list",
+          "get",
+          "update",
+          "answer",
+          "archive_batch"
+        ],
+        "properties": [
+          "action",
+          "title",
+          "content",
+          "text",
+          "scope",
+          "review_class",
+          "tags",
+          "ttl_days",
+          "supersedes",
+          "id",
+          "archive",
+          "include_archived",
+          "view",
+          "consistency",
+          "since",
+          "until",
+          "status",
+          "author",
+          "limit",
+          "scan_budget",
+          "cursor",
+          "verbose",
+          "fields",
+          "apply",
+          "confirm_token",
+          "confirm_ids",
+          "audit_reason",
+          "needs_answer",
+          "options",
+          "allow_free_text",
+          "answer",
+          "timeout_secs",
+          "timeout_default"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "task",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          280,
+          314
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "create",
+          "list",
+          "get",
+          "claim",
+          "done",
+          "update",
+          "sweep",
+          "board_sweep",
+          "board_unretire",
+          "health",
+          "activity",
+          "metadata_set",
+          "metadata_get",
+          "ack_plan",
+          "orphan_reconcile_preview",
+          "orphan_reconcile_apply"
+        ],
+        "properties": [
+          "action",
+          "title",
+          "description",
+          "priority",
+          "assignee",
+          "depends_on",
+          "parent_id",
+          "supersedes",
+          "id",
+          "task_id",
+          "result",
+          "status",
+          "filter_assignee",
+          "filter_status",
+          "filter_tag",
+          "tag",
+          "tags",
+          "include_history",
+          "verbose",
+          "fields",
+          "limit",
+          "due_at",
+          "branch",
+          "apply",
+          "confirm_ids",
+          "audit_reason",
+          "repository",
+          "metadata_key",
+          "metadata_value",
+          "bind",
+          "eta_secs",
+          "project",
+          "scope",
+          "plan_ack_required",
+          "plan_ack_reason",
+          "review_class",
+          "governing_decision_id",
+          "decision_id",
+          "board",
+          "mappings",
+          "confirmation"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "restart_daemon",
+      "phase": "P4",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          318,
+          319
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [],
+        "required": []
+      }
+    },
+    {
+      "name": "team",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          323,
+          334
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "create",
+          "delete",
+          "list",
+          "update"
+        ],
+        "properties": [
+          "action",
+          "name",
+          "members",
+          "orchestrator",
+          "description",
+          "repository_path",
+          "project_id",
+          "accept_from",
+          "add",
+          "remove"
+        ],
+        "required": [
+          "action"
+        ]
+      },
+      "p1a": {
+        "caller": "operator (list: operator, instance)",
+        "supported_fields": [
+          "action",
+          "name",
+          "members",
+          "orchestrator",
+          "description",
+          "add",
+          "remove",
+          "accept_from"
+        ],
+        "refused_fields": [
+          "repository_path",
+          "project_id"
+        ],
+        "added_fields": [],
+        "supported_actions": [
+          "create",
+          "delete",
+          "list",
+          "update"
+        ],
+        "supported_values": {},
+        "contract_changes": []
+      }
+    },
+    {
+      "name": "schedule",
+      "phase": "P4",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          338,
+          379
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "create",
+          "list",
+          "update",
+          "delete",
+          "runs",
+          "complete",
+          "deliver",
+          "resolve_recovery"
+        ],
+        "properties": [
+          "action",
+          "id",
+          "run_id",
+          "cleanup_confirmed",
+          "attempt_id",
+          "result",
+          "job",
+          "cron",
+          "run_at",
+          "message",
+          "message_from_file",
+          "instance",
+          "label",
+          "timezone",
+          "enabled",
+          "full_history",
+          "fire_strategy",
+          "linked_task_id",
+          "replacement_key",
+          "subject_ref"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "deployment",
+      "phase": "P1a",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          383,
+          390
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "deploy",
+          "teardown",
+          "list"
+        ],
+        "properties": [
+          "action",
+          "template",
+          "directory",
+          "name",
+          "branch"
+        ],
+        "required": [
+          "action"
+        ]
+      },
+      "p1a": {
+        "caller": "operator",
+        "supported_fields": [
+          "action",
+          "template",
+          "name",
+          "directory"
+        ],
+        "refused_fields": [
+          "branch"
+        ],
+        "added_fields": [],
+        "supported_actions": [
+          "deploy",
+          "teardown",
+          "list"
+        ],
+        "supported_values": {},
+        "contract_changes": [
+          "deploy reports each member's outcome; a failed member yields a partial result, never deployed"
+        ]
+      }
+    },
+    {
+      "name": "ci",
+      "phase": "P3",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          394,
+          412
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "watch",
+          "unwatch",
+          "status",
+          "defer",
+          "ack_handoff"
+        ],
+        "properties": [
+          "action",
+          "repository",
+          "branch",
+          "interval_secs",
+          "next_after_ci",
+          "review_class",
+          "ci_provider",
+          "ci_provider_url",
+          "task_id",
+          "head_sha",
+          "subject_head_sha",
+          "notification_only",
+          "episode",
+          "wake_task_id",
+          "reason",
+          "defer_secs"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "config",
+      "phase": "P4",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          420,
+          424
+        ],
+        "extraction": "manual",
+        "actions": [
+          "get",
+          "list"
+        ],
+        "properties": [
+          "action",
+          "key"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "health",
+      "phase": "P4",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          428,
+          435
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "report",
+          "clear"
+        ],
+        "properties": [
+          "action",
+          "reason",
+          "retry_after_secs",
+          "note",
+          "instance"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "repo",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          439,
+          462
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "checkout",
+          "release",
+          "cleanup_init_commits",
+          "cleanup_merged_branches",
+          "merge"
+        ],
+        "properties": [
+          "action",
+          "pr",
+          "repository",
+          "repository_path",
+          "branch",
+          "path",
+          "instance",
+          "bind",
+          "base",
+          "min_age_days",
+          "apply",
+          "confirm_ids",
+          "audit_reason",
+          "from_ref",
+          "expected_head",
+          "checkout_purpose",
+          "task_id",
+          "force",
+          "force_reason",
+          "discard_nested_dirt",
+          "expected_nested_dirt_digest"
+        ],
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "bind_self",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          466,
+          472
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "repository_path",
+          "branch",
+          "rebase_mode",
+          "task_id"
+        ],
+        "required": [
+          "branch"
+        ]
+      }
+    },
+    {
+      "name": "release_worktree",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          476,
+          483
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "dry_run",
+          "force",
+          "branch",
+          "repository_path"
+        ],
+        "required": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "name": "binding_state",
+      "phase": "P2",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          487,
+          490
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance"
+        ],
+        "required": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "name": "revoke_review_assignment",
+      "phase": "P3",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          497,
+          500
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "assignment_id"
+        ],
+        "required": [
+          "assignment_id"
+        ]
+      }
+    },
+    {
+      "name": "correct_review_class",
+      "phase": "P3",
+      "otterhive_status": "planned",
+      "called_by_customization": true,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          504,
+          515
+        ],
+        "extraction": "parsed",
+        "actions": [
+          "preview",
+          "apply"
+        ],
+        "properties": [
+          "action",
+          "repository",
+          "pr_number",
+          "branch",
+          "head_sha",
+          "expected_old_class",
+          "new_class",
+          "operation_id",
+          "reason"
+        ],
+        "required": [
+          "action",
+          "repository",
+          "pr_number",
+          "branch",
+          "head_sha",
+          "expected_old_class",
+          "new_class",
+          "operation_id",
+          "reason"
+        ]
+      }
+    },
+    {
+      "name": "usage_limit_takeover",
+      "phase": "P4",
+      "otterhive_status": "planned",
+      "called_by_customization": false,
+      "legacy": {
+        "source": "agend-terminal@593da97c6f94d874f793777b4550d5df2ae4f43c:src/mcp/tools.rs",
+        "lines": [
+          519,
+          523
+        ],
+        "extraction": "parsed",
+        "actions": null,
+        "properties": [
+          "instance",
+          "episode_id"
+        ],
+        "required": [
+          "instance",
+          "episode_id"
+        ]
+      }
+    }
+  ]
+}
