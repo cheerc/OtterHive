@@ -1,64 +1,607 @@
-//! T3 Lane A RED：`src/procs.rs` 目前僅含 test-only 私有單元測試。
+//! T3 Lane A GREEN：程序啟動時間、有證據的停止（契約 §4.3）。
 //!
-//! GREEN 業務實作（`process_start_time`、`stop_group`、`OwnedLeaderLease` 等）
-//! 尚未授權撰寫。本檔在 `lib.rs` 接入 `mod procs;` 之前是孤立法，不參與編譯；
-//! 接入後，這些測試即為 compile-RED（引用的 `super::` 項目尚不存在）。
+//! 契約行為不變，只修查詢參數：`process_start_time` 與驗證一律以
+//! `PROC_PIDTBSDINFO arg=1` 查詢（同一 zombie 上 arg=0 回 ESRCH、arg=1 回
+//! start／pgid；只有後者可用於重驗）。`waitid(WEXITED|WNOHANG|WNOWAIT)`
+//! 觀測 exit 而不 reap；絕不呼叫 portable-pty 的 `wait`／`try_wait`、
+//! `ChildKiller::kill`／`clone_killer` 做觀測或清理。
 //!
-//! ## 對 GREEN 的內部 seam 提案 v3（非公開契約變更）
-//!
-//! coordinator 查核後要求：`probe_child` 必須獨立於 start／pgid 查詢；
-//! group 列舉與 reap 必須是 fallible；併發測試必須用可逾時 gate／channel。
-//! 本輪再修正測試自身前提：腳本值用可 Clone 的 `Script` 列舉（`io::Error`
-//! 不實作 `Clone`，不可直接存 `VecDeque<io::Result<_>>`）；ECHILD 以
-//! `from_raw_os_error(libc::ECHILD)` 攜帶 raw errno，production 必須以
-//! raw errno 判定 ownership loss，不可把所有 `NotFound` 混為一談。
-//!
-//! ```rust,ignore
-//! /// waitid WNOWAIT 觀測結果（不 reap）。
-//! #[derive(Debug, Clone, PartialEq)]
-//! pub(crate) enum ChildProbe {
-//!     Alive,
-//!     Exited { code: Option<i32>, signal: Option<i32> },
-//! }
-//!
-//! /// 同一個 stop 核心的可注入 OS 面。`probe_child` 的 ECHILD 必須是
-//! /// raw errno == ECHILD 的錯誤（child 已被外部 reap 或根本非本程序
-//! /// child）；其他查詢失敗是暫時性錯誤。兩者都使 lease 永久失效
-//! ///（fail-closed），但測試分別覆蓋。
-//! pub(crate) trait OsAdapter: Send + Sync {
-//!     fn start_time(&self, pid: i32) -> std::io::Result<u64>;
-//!     fn pgid(&self, pid: i32) -> std::io::Result<i32>;
-//!     fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe>;
-//!     fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>>;
-//!     fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()>;
-//!     fn reap(&self, pid: i32) -> std::io::Result<()>;
-//! }
-//! pub(crate) fn stop_group_with_adapter(
-//!     pid: i32,
-//!     expected_start: u64,
-//!     evidence: GroupEvidence<'_>,
-//!     term_wait: Duration,
-//!     kill_wait: Duration,
-//!     os: &dyn OsAdapter,
-//! ) -> StopOutcome;
-//! impl OwnedLeaderLease {
-//!     #[cfg(test)]
-//!     pub(crate) fn for_test(pid: i32, start: u64, pgid: i32) -> Self;
-//!     #[cfg(test)]
-//!     pub(crate) fn revoke(&self); // 僅測試用；production 不得暴露任意重建 lease
-//! }
-//! ```
-//!
-//! 核心順序提案（測試據此斷言事件全序）：驗證（lease 有效＋綁定相符＋
-//! start／pgid／probe 一致）→ SIGTERM → 等待 → 列舉 group（失敗即 `Unproven`；
-//! 只排除已確認退出的 owned leader，不盲目排除存活 leader；空列舉但 probe
-//! 仍 Alive 屬證據矛盾，同樣 `Unproven`）→ 仍有成員則 SIGKILL → 仍有成員則
-//! `Unproven{residual_pids}` → 撤銷 lease → reap（reap 前 probe 須已退出；
-//! reap 失敗即 `Unproven`，不宣稱 `Stopped`）。
-//! `stop_group` 公開入口以真實 adapter 呼叫 `stop_group_with_adapter`；
-//! lease 需為 `Sync`（併發測試跨執行緒共用同一 lease）。
-//! 若 coordinator 凍結不同的 seam，本檔測試隨 GREEN 調整，不擅改契約。
+//! 核心順序：撤銷檢查優先 → 綁定相符 → start(arg=1)／pgid／probe 一致 →
+//! SIGTERM → 有界等待 → 列舉（失敗即 `Unproven`；只排除已確認退出的 owned
+//! leader；空列舉但 probe 仍 Alive 屬證據矛盾）→ 仍有成員則 SIGKILL →
+//! 有界等待 → 列舉 → 仍有成員則 `Unproven{residual_pids}` → 撤銷 lease →
+//! reap（失敗即 `Unproven`）。等待期間每次 signal 前重驗；ECHILD／查詢失敗
+//! 永久失效（fail-closed）。`RecordedLeader` 永不授權 zombie 清理。
+//! reap 由 Session 在撤銷後對持有的 Child 執行——公開 `stop_group` 的真實
+//! 路徑以 `waitpid(WNOHANG)` 做最終回收（一次性；ECHILD 即 fail-closed）；
+//! `Session` 內部停止在同一 lifecycle 鎖內走同一核心，成功後標記 Child
+//! 已釋放、不再觸碰，鎖外 join 執行緒。
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// `waitid` 輪詢間隔（等待期間的重驗粒度）。
+const POLL_STEP: Duration = Duration::from_millis(20);
+
+/// 同一把 lifecycle 鎖：驗證、每次 signal 前重驗、撤銷、reap 全程序列化。
+/// `stop_group_with_adapter` 進入即持有；`Session` 內部停止取用同一把鎖，
+/// 保證驗證後、signal 前不可 reap（RED `lease_validation_and_reap_are_serialized`
+/// 的 production 對應；單元併發測試直接競爭此鎖）。
+static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取同一把 lifecycle 鎖（`Session` 內部停止用；`Session` 層見 `session.rs`）。
+pub(crate) fn lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
+    LIFECYCLE_LOCK
+        .lock()
+        .expect("繁中說明：lifecycle 鎖不應中毒")
+}
+
+/// `waitid WNOWAIT` 觀測結果（不 reap）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ChildProbe {
+    Alive,
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+/// 同一個 stop 核心的可注入 OS 面（seam v4；非公開契約）。
+///
+/// `start_time` 的真實實作必須以 `PROC_PIDTBSDINFO arg=1` 查詢；
+/// `probe_child` 必須把 `si_pid==0`（尚無 exit 事件）映射為 `Alive`；
+/// ECHILD 必須是 raw errno == ECHILD 的錯誤。
+pub(crate) trait OsAdapter: Send + Sync {
+    fn start_time(&self, pid: i32) -> std::io::Result<u64>;
+    fn pgid(&self, pid: i32) -> std::io::Result<i32>;
+    fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe>;
+    fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>>;
+    fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()>;
+    fn reap(&self, pid: i32) -> std::io::Result<()>;
+}
+
+/// 停止操作的證據：`OwnedLeader` 為本 daemon 持有的 child；
+/// `RecordedLeader` 僅為 SQLite 歷史，只能用於存活 leader 的 recovery。
+#[derive(Debug)]
+pub enum GroupEvidence<'a> {
+    OwnedLeader(&'a OwnedLeaderLease),
+    RecordedLeader,
+}
+
+/// 停止結果。
+#[derive(Debug)]
+pub enum StopOutcome {
+    Stopped { escalated_to_kill: bool },
+    Unproven { residual_pids: Vec<i32> },
+    IdentityMismatch,
+}
+
+/// 本 daemon 擁有的 leader 身分：綁定 spawn 時的 pid／啟動時間／pgid，
+/// 且 child 尚未被 reap。欄位私有，不可由 SQLite 重建；一旦失效永久有效。
+#[derive(Debug)]
+pub struct OwnedLeaderLease {
+    pid: i32,
+    start: u64,
+    pgid: i32,
+    state: Mutex<LeaseState>,
+}
+
+#[derive(Debug)]
+struct LeaseState {
+    revoked: bool,
+    /// ECHILD 或任何查詢失敗後永久失效（fail-closed）。
+    invalidated: bool,
+}
+
+impl OwnedLeaderLease {
+    /// Session spawn 成功後建立（綁定當時的 pid／start／pgid 與未 reap 的 child）。
+    pub(crate) fn new(pid: i32, start: u64, pgid: i32) -> Self {
+        Self {
+            pid,
+            start,
+            pgid,
+            state: Mutex::new(LeaseState {
+                revoked: false,
+                invalidated: false,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(pid: i32, start: u64, pgid: i32) -> Self {
+        Self::new(pid, start, pgid)
+    }
+
+    /// 僅測試用：模擬清理完成後的撤銷狀態。
+    #[cfg(test)]
+    pub(crate) fn revoke(&self) {
+        self.state
+            .lock()
+            .expect("繁中說明：lease 鎖不應中毒")
+            .revoked = true;
+    }
+
+    /// 清理完成後撤銷（production 路徑；`&` 方法，改內部 Mutex）。
+    fn revoke_production(&self) {
+        self.state
+            .lock()
+            .expect("繁中說明：lease 鎖不應中毒")
+            .revoked = true;
+    }
+
+    fn invalidate(&self) {
+        self.state
+            .lock()
+            .expect("繁中說明：lease 鎖不應中毒")
+            .invalidated = true;
+    }
+
+    /// 撤銷或失效其一即不可用。檢查本身不做 OS 呼叫。
+    fn is_usable(&self) -> bool {
+        let state = self.state.lock().expect("繁中說明：lease 鎖不應中毒");
+        !state.revoked && !state.invalidated
+    }
+
+    /// 綁定是否與傳入參數相符（production 不得以傳入參數覆蓋綁定）。
+    fn binds(&self, pid: i32, expected_start: u64) -> bool {
+        self.pid == pid && self.start == expected_start
+    }
+}
+
+/// 以 `PROC_PIDTBSDINFO arg=1` 讀 pid 的啟動時間（秒＋微秒）。
+/// arg=0 對 zombie 回 ESRCH，不可用於重驗，故一律用 arg=1。
+fn proc_start_arg1(pid: i32) -> std::io::Result<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret == size {
+        Ok(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// 以 `PROC_PIDTBSDINFO arg=1` 讀 pid 的 pgid（同一次查詢的身分附帶值）。
+fn proc_pgid_arg1(pid: i32) -> std::io::Result<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret == size {
+        Ok(info.pbi_pgid as i32)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `waitid(P_PID, pid, WEXITED|WNOHANG|WNOWAIT)` 觀測（不 reap）。
+/// `ret==0 && si_pid==0` 表示尚無 exit 事件 → `Alive`。
+fn waitid_probe(pid: i32) -> std::io::Result<ChildProbe> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.si_pid == 0 {
+        return Ok(ChildProbe::Alive);
+    }
+    if info.si_pid != pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "waitid 回傳非目標 pid",
+        ));
+    }
+    match info.si_code {
+        c if c == libc::CLD_EXITED => Ok(ChildProbe::Exited {
+            code: Some(info.si_status),
+            signal: None,
+        }),
+        c if c == libc::CLD_KILLED || c == libc::CLD_DUMPED => Ok(ChildProbe::Exited {
+            code: None,
+            signal: Some(info.si_status),
+        }),
+        _ => Ok(ChildProbe::Alive),
+    }
+}
+
+/// 以 `proc_listpgrppids` 列舉 group 成員。
+fn proc_group_members(pgid: i32) -> std::io::Result<Vec<i32>> {
+    // 單一 group 極少超過此數；若截斷，測試以 residuals 語意覆蓋（不靜默）。
+    let mut buffer = vec![0 as libc::pid_t; 4096];
+    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    let count =
+        unsafe { libc::proc_listpgrppids(pgid, buffer.as_mut_ptr() as *mut libc::c_void, bytes) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(count as usize);
+    Ok(buffer)
+}
+
+/// 真實 OS adapter（production 用；只做 pid 數字的查詢與 signal，
+/// 不觸碰 portable-pty 的 `Child` 物件——絕不呼叫 `wait`／`try_wait`／`kill`）。
+struct RealOs;
+
+impl OsAdapter for RealOs {
+    fn start_time(&self, pid: i32) -> std::io::Result<u64> {
+        proc_start_arg1(pid)
+    }
+
+    fn pgid(&self, pid: i32) -> std::io::Result<i32> {
+        proc_pgid_arg1(pid)
+    }
+
+    fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe> {
+        waitid_probe(pid)
+    }
+
+    fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>> {
+        proc_group_members(pgid)
+    }
+
+    fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
+        let ret = unsafe { libc::kill(-pgid, sig) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// 最終回收：`waitpid(pid, WNOHANG)` 一次性回收 zombie。
+    /// ECHILD 回 Err（fail-closed）：正常流程中不應出現（Session 持有 Child，
+    /// 未經此處即被 reap）；Session 內部路徑見 `session.rs`。
+    fn reap(&self, pid: i32) -> std::io::Result<()> {
+        let mut status = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if ret == pid {
+            Ok(())
+        } else if ret == 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "child 尚未退出，不可 reap",
+            ))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// 讀 pid 的啟動時間（契約 §4.3 的身分要素；arg=1）。
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    proc_start_arg1(pid).ok()
+}
+
+/// 同一個 stop 核心（production 與測試共用）。
+///
+/// 進入即持有全域 lifecycle 鎖全程：驗證、signal、撤銷、reap 序列化；
+/// 併發的第二個 stop 在鎖外等待，前一個撤銷後它見到失效即拒絕。
+pub(crate) fn stop_group_with_adapter(
+    pid: i32,
+    expected_start: u64,
+    evidence: GroupEvidence<'_>,
+    term_wait: Duration,
+    kill_wait: Duration,
+    os: &dyn OsAdapter,
+) -> StopOutcome {
+    let _lifecycle = lifecycle_guard();
+    // 0. 撤銷檢查優先於一切驗證（即使 zombie 仍 waitable 也零 signal）。
+    // 1. RecordedLeader 永不授權 zombie 清理；存活 leader 才可 recovery stop。
+    let owned: Option<&OwnedLeaderLease> = match evidence {
+        GroupEvidence::OwnedLeader(lease) => {
+            if !lease.is_usable() {
+                return StopOutcome::Unproven {
+                    residual_pids: Vec::new(),
+                };
+            }
+            if !lease.binds(pid, expected_start) {
+                return StopOutcome::IdentityMismatch;
+            }
+            Some(lease)
+        }
+        GroupEvidence::RecordedLeader => None,
+    };
+
+    // 2. 起始驗證：start(arg=1) 相符。
+    let start = match os.start_time(pid) {
+        Ok(start) => start,
+        Err(_) => {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+    };
+    if start != expected_start {
+        return StopOutcome::IdentityMismatch;
+    }
+
+    // 3. pgid 驗證：活體須 pgid==pid；zombie 的 ESRCH（raw errno）為預期；
+    //    暫時性失敗 → Unproven。ECHILD 以外一律 fail-closed。
+    let pgid = match os.pgid(pid) {
+        Ok(pgid) => pgid,
+        Err(error) => {
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                // zombie 的 getpgid 回 ESRCH 為預期：以綁定的 pgid 繼續，
+                // 後續 probe 必須為 Exited，否則仍拒絕。
+                match owned {
+                    Some(lease) => lease.pgid,
+                    None => {
+                        return StopOutcome::Unproven {
+                            residual_pids: Vec::new(),
+                        };
+                    }
+                }
+            } else {
+                if let Some(lease) = owned {
+                    lease.invalidate();
+                }
+                return StopOutcome::Unproven {
+                    residual_pids: Vec::new(),
+                };
+            }
+        }
+    };
+    if let Some(lease) = owned {
+        if pgid != lease.pgid {
+            return StopOutcome::IdentityMismatch;
+        }
+    } else {
+        // RecordedLeader：活體須 pgid==pid，否則不授權。
+        if pgid != pid {
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+    }
+
+    // 4. probe：ECHILD（raw errno）→ 永久失效；其它失敗 → Unproven＋失效。
+    let probe = match os.probe_child(pid) {
+        Ok(probe) => probe,
+        Err(_) => {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+    };
+
+    // RecordedLeader：只有 probe Alive 的存活 leader 可 recovery stop；
+    // zombie（Exited）永不授權——OS 查得到身分也不構成 ownership。
+    if owned.is_none() {
+        match probe {
+            ChildProbe::Alive => {}
+            ChildProbe::Exited { .. } => {
+                return StopOutcome::Unproven {
+                    residual_pids: Vec::new(),
+                };
+            }
+        }
+    }
+
+    let exited_already = matches!(probe, ChildProbe::Exited { .. });
+
+    // 5. 發 SIGTERM（發前重驗：lease 可用＋start 相符；每次 signal 前皆然）。
+    if let Some(lease) = owned {
+        if !lease.is_usable() {
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+        match os.start_time(pid) {
+            Ok(current) if current == expected_start => {}
+            Ok(_) => return StopOutcome::IdentityMismatch,
+            Err(_) => {
+                lease.invalidate();
+                return StopOutcome::Unproven {
+                    residual_pids: Vec::new(),
+                };
+            }
+        }
+    }
+    if os.kill_group(pgid, libc::SIGTERM).is_err() {
+        if let Some(lease) = owned {
+            lease.invalidate();
+        }
+        return StopOutcome::Unproven {
+            residual_pids: Vec::new(),
+        };
+    }
+    let mut escalated = false;
+
+    // 6. 有界等待 TERM 生效 → 列舉。列舉失敗 → Unproven。
+    wait_quiet(term_wait);
+    let probe_after_term = match os.probe_child(pid) {
+        Ok(probe) => probe,
+        Err(_) => {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+    };
+    let members = match os.list_group(pgid) {
+        Ok(members) => members,
+        Err(_) => {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+    };
+    // 只排除「已確認退出」的 owned leader：probe 必須為 Exited，否則 leader
+    // 本人仍算成員（si_pid==0 尚無 exit 事件時絕不排除）。
+    let leader_gone = matches!(probe_after_term, ChildProbe::Exited { .. });
+    let mut remaining: Vec<i32> = members
+        .into_iter()
+        .filter(|member| if *member == pid { !leader_gone } else { true })
+        .collect();
+    // 空列舉但 probe 仍 Alive 屬證據矛盾 → Unproven。
+    if remaining.is_empty() {
+        if matches!(probe_after_term, ChildProbe::Alive) && !exited_already {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
+        }
+        return finish_stopped(owned, pid, os, escalated);
+    }
+
+    // 6b. leader 已確認退出、但 group 仍有其他成員：TERM 已送達 group，
+    //     child 可能正在退出途中。給一次 grace（等 kill_wait、不升級），
+    //     重列舉；仍有成員才升級 KILL。probe 仍 Alive（leader 存活）時
+    //     直接升級——符合契約「仍有存活成員則 SIGKILL」。
+    if leader_gone {
+        wait_quiet(kill_wait);
+        let probe_grace = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+        let members = match os.list_group(pgid) {
+            Ok(members) => members,
+            Err(_) => {
+                if let Some(lease) = owned {
+                    lease.invalidate();
+                }
+                return StopOutcome::Unproven {
+                    residual_pids: remaining,
+                };
+            }
+        };
+        let leader_gone = matches!(probe_grace, ChildProbe::Exited { .. });
+        remaining = members
+            .into_iter()
+            .filter(|member| if *member == pid { !leader_gone } else { true })
+            .collect();
+        if remaining.is_empty() {
+            return finish_stopped(owned, pid, os, escalated);
+        }
+    }
+
+    // 7. 仍有成員 → 重驗後 SIGKILL → 有界等待 → 列舉。
+    if let Some(lease) = owned {
+        if !lease.is_usable() {
+            return StopOutcome::Unproven {
+                residual_pids: remaining,
+            };
+        }
+        match os.start_time(pid) {
+            Ok(current) if current == expected_start => {}
+            Ok(_) => return StopOutcome::IdentityMismatch,
+            Err(_) => {
+                lease.invalidate();
+                return StopOutcome::Unproven {
+                    residual_pids: remaining,
+                };
+            }
+        }
+    }
+    if os.kill_group(pgid, libc::SIGKILL).is_err() {
+        if let Some(lease) = owned {
+            lease.invalidate();
+        }
+        return StopOutcome::Unproven {
+            residual_pids: remaining,
+        };
+    }
+    escalated = true;
+    wait_quiet(kill_wait);
+    let probe_after_kill = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+    let members = match os.list_group(pgid) {
+        Ok(members) => members,
+        Err(_) => {
+            if let Some(lease) = owned {
+                lease.invalidate();
+            }
+            return StopOutcome::Unproven {
+                residual_pids: remaining,
+            };
+        }
+    };
+    let leader_gone = matches!(probe_after_kill, ChildProbe::Exited { .. });
+    let remaining: Vec<i32> = members
+        .into_iter()
+        .filter(|member| if *member == pid { !leader_gone } else { true })
+        .collect();
+    if !remaining.is_empty() {
+        return StopOutcome::Unproven {
+            residual_pids: remaining,
+        };
+    }
+    finish_stopped(owned, pid, os, escalated)
+}
+
+/// 清空確認後：撤銷 lease（如有）→ reap。reap 失敗即 `Unproven`，不宣稱 `Stopped`。
+/// `RecordedLeader` 活體成功路徑同樣 reap：recovery 的 daemon 本就是該 child
+/// 的父程序，回收是其職責（zombie 情境仍在步驟 4 直接 `Unproven`，不到此處）。
+fn finish_stopped(
+    owned: Option<&OwnedLeaderLease>,
+    pid: i32,
+    os: &dyn OsAdapter,
+    escalated_to_kill: bool,
+) -> StopOutcome {
+    if let Some(lease) = owned {
+        lease.revoke_production();
+    }
+    if os.reap(pid).is_err() {
+        if let Some(lease) = owned {
+            lease.invalidate();
+        }
+        return StopOutcome::Unproven {
+            residual_pids: Vec::new(),
+        };
+    }
+    StopOutcome::Stopped { escalated_to_kill }
+}
+
+/// 有界等待（Instant 迴圈＋POLL 間隔；fake 層以靜態腳本模擬已等待後狀態）。
+fn wait_quiet(duration: Duration) {
+    let begin = Instant::now();
+    while begin.elapsed() < duration {
+        std::thread::sleep(POLL_STEP);
+    }
+}
+
+/// 公開入口：同一 production core，以真實 adapter 執行。
+pub fn stop_group(
+    pid: i32,
+    expected_start: u64,
+    evidence: GroupEvidence<'_>,
+    term_wait: Duration,
+    kill_wait: Duration,
+) -> StopOutcome {
+    let os = RealOs;
+    stop_group_with_adapter(pid, expected_start, evidence, term_wait, kill_wait, &os)
+}
 #[cfg(test)]
 mod ownership_tests {
     use super::{ChildProbe, GroupEvidence, OsAdapter, OwnedLeaderLease, StopOutcome};

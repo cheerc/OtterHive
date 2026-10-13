@@ -254,36 +254,40 @@ fn slow_subscriber_gets_resync_and_reader_never_blocks() {
         !session.plain_text().is_empty(),
         "繁中說明：flood 期間 plain_text 應持續更新"
     );
-    // 恢復讀取停滯者：應先收到 Resync。
+    // 恢復讀取停滯者：先收到 Resync。flood 餘量可能讓佇列在第一個 Resync
+    // 被讀走後再次溢出而產生連續 Resync，故用引流迴圈逐個接續邊界；
+    // 判準不變：Output 必須是「最後一個 Resync.seq 加一」。
     write_line(session, "stop");
+    write_line(session, "post-resync-probe");
     let start = Instant::now();
     let mut saw_resync = false;
     let mut resync_seq = 0u64;
-    while start.elapsed() < LONG_TIMEOUT {
+    loop {
+        assert!(
+            start.elapsed() < LONG_TIMEOUT,
+            "繁中說明：應在期限內收到接續 Output，最後邊界為 {resync_seq}"
+        );
         match stalled.recv_timeout(RECV_TIMEOUT) {
             Ok(StreamEvent::Resync { snapshot }) => {
                 saw_resync = true;
                 resync_seq = snapshot.seq;
+                continue;
+            }
+            Ok(StreamEvent::Output { seq, .. }) => {
+                assert_eq!(
+                    seq,
+                    resync_seq + 1,
+                    "繁中說明：Resync 後 Output 應為該 Snapshot.seq 加一"
+                );
                 break;
             }
-            Ok(_) => continue,
-            Err(_) => break,
+            Ok(StreamEvent::Ended) => {
+                panic!("繁中說明：fixture 不應在此結束");
+            }
+            Err(_) => continue,
         }
     }
     assert!(saw_resync, "繁中說明：佇列滿的停滯者恢復後應先收到 Resync");
-    let next = stalled
-        .recv_timeout(RECV_TIMEOUT)
-        .expect("繁中說明：Resync 後應有後續 Output");
-    match next {
-        StreamEvent::Output { seq, .. } => {
-            assert_eq!(
-                seq,
-                resync_seq + 1,
-                "繁中說明：Resync 後 Output 應為該 Snapshot.seq 加一"
-            );
-        }
-        other => panic!("繁中說明：Resync 後應為 Output，實際為 {other:?}"),
-    }
     // log_dir 在此 Drop，隔離暫存檔隨測試結束刪除。
     let _ = &log_dir;
 }
