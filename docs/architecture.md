@@ -31,6 +31,6 @@ backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 
 | 範圍 | 狀態 |
 |---|---|
 | P0：功能對照、MCP catalog、REA 行為基線 | 完成 |
-| P1a：lifecycle、訊息、終端 attach、team、deployment | 規格與實作計畫完成，尚未實作；見 [P1a 實作計畫](plans/p1a-implementation.md) |
+| P1a：lifecycle、訊息、終端 attach、team、deployment | T2（protocol、admission、home、config、store）實作完成，T3 待進行；見 [P1a 實作計畫](plans/p1a-implementation.md) |
 | P1b：TUI、resume／handoff 觸發、`set_metadata` 等 | 未開始 |
 | P2 以後：task、decision、worktree、review、CI、channel | 未開始；清單在 [`mcp-catalog.json`](reverse-engineering/mcp-catalog.json) |
