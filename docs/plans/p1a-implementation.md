@@ -11,8 +11,8 @@
 ## 目前狀態
 
 - 已完成：P0（本 repo 的 `docs/`、`scripts/research/`、`tests/fixtures/backends/capture_stub.sh`）。
-- `origin`（`github.com/cheerc/OtterHive`，private）已設定，但 `main` 尚未推上去；開第一個 PR 前需要 operator 決定（見「需要 operator 決定的事」）。
-- 本計畫尚未開始實作，repo 沒有任何 Rust 程式碼。
+- `origin`（`github.com/cheerc/OtterHive`，private）已設定，`main` 已同步為 `c174be2`。
+- 本計畫開始 T2 實作，建立基礎 crate、CI 與 RED 測試。
 
 ## 全域約束
 
@@ -383,7 +383,7 @@ T4 建立真正可用的 `otterhive-mcp-bridge`，不是空 bin 或 fixture 替�
 
 ## 需要 operator 決定的事
 
-1. **推送 `main`**：`origin` 目前沒有 `main`。agentic-git 拒絕在未綁定 worktree 時 push，需要 operator 自行推送 bootstrap commit `441ac139`，或另行授權單次做法。在此之前無法開 PR。
+1. **推送 `main`**：`origin/main` 已推送且與本地 `main`（`c174be2`）同步，不再是開工阻塞。各 PR 從最新 `main` 開分支推進。
 2. **由誰實作**：本 session 不實作；可交給既有 team 的 impl／reviewer，或日後由 OtterHive 自己的 team 接手。
 3. **review 安排**：上表的 review class 是建議；dual 需要兩位不同的 reviewer。
 4. **native canary**：是否授權、預算上限。
