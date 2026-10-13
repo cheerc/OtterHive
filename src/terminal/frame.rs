@@ -24,10 +24,9 @@ fn encode_then_read_preserves_tag_and_payload() {
     let payload = b"frame unit test".to_vec();
     let encoded = crate::terminal::frame::encode_frame(tag, &payload);
 
-    let (read_tag, read_payload) = crate::terminal::frame::read_frame(
-        &mut std::io::Cursor::new(encoded),
-    )
-    .expect("剛剛編碼出來的 frame 應該讀得回來");
+    let (read_tag, read_payload) =
+        crate::terminal::frame::read_frame(&mut std::io::Cursor::new(encoded))
+            .expect("剛剛編碼出來的 frame 應該讀得回來");
 
     assert_eq!(read_tag, tag, "tag 應該原樣往返");
     assert_eq!(read_payload, payload, "payload 應該原樣往返");

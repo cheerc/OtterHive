@@ -10,9 +10,10 @@
 
 ## 目前狀態
 
-- 已完成：P0（本 repo 的 `docs/`、`scripts/research/`、`tests/fixtures/backends/capture_stub.sh`）。
-- `origin`（`github.com/cheerc/OtterHive`，private）已設定，`main` 已同步為 `c174be2`。
-- 本計畫開始 T2 實作，建立基礎 crate、CI 與 RED 測試。
+- 已完成：P0 與 T2（protocol、admission、home、config、store）；T2 已經由 PR #1 合併。
+- T3 基準：`main`／`origin/main` 為 `b1a42b45f9f65bc2d4ccfc26f7f3378768f90840`；本包使用獨立整合分支，不直接修改 main。
+- T3 已集中 RED：程序／Session、Screen／Frame 的測試與四個 fixtures，尚無行為實作。`cargo test --locked --lib --test process_stop --test terminal_session --test frame` 及不含 `--lib` 的三組整合測試命令皆實際 exit 101（compile-RED：缺少待實作的型別／函式）；Screen 與 procs 私有測試已接入模組編譯，不將零測試執行視為 RED。`cargo fmt --check` 通過。
+- T3 共 73 個測試宣告（35 個整合、38 個單元）；尚未執行成功，不宣稱 H1／H2／H3／H8 已驗證。macOS CI 與 Rust 1.88 編譯驗收沿用 T2 jobs，完整 GREEN 後才發 PR。
 
 ## 全域約束
 
@@ -383,7 +384,7 @@ T4 建立真正可用的 `otterhive-mcp-bridge`，不是空 bin 或 fixture 替�
 
 ## 需要 operator 決定的事
 
-1. **推送 `main`**：`origin/main` 已推送且與本地 `main`（`c174be2`）同步，不再是開工阻塞。各 PR 從最新 `main` 開分支推進。
+1. **推送 `main`**：T2 已合併，T3 開始時 `origin/main` 與本地 `main`（`b1a42b4`）同步，不再是開工阻塞。各 PR 從最新 `main` 開分支推進。
 2. **由誰實作**：本 session 不實作；可交給既有 team 的 impl／reviewer，或日後由 OtterHive 自己的 team 接手。
 3. **review 安排**：上表的 review class 是建議；dual 需要兩位不同的 reviewer。
 4. **native canary**：是否授權、預算上限。

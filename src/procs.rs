@@ -245,8 +245,11 @@ mod ownership_tests {
 
         fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
             let count = self.kill_count.fetch_add(1, Ordering::SeqCst);
-            if let Some((gate, at)) =
-                self.gate.lock().expect("繁中說明：fake adapter 鎖不應中毒").clone()
+            if let Some((gate, at)) = self
+                .gate
+                .lock()
+                .expect("繁中說明：fake adapter 鎖不應中毒")
+                .clone()
             {
                 if count == at {
                     // 先記到達（阻塞之前），再等待放行；到達計數不等於已發 signal。
@@ -354,10 +357,7 @@ mod ownership_tests {
         let os = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
             vec![Script::Ok(4242)],
-            vec![
-                Script::Err(StepErr::Echild),
-                Script::Ok(ChildProbe::Alive),
-            ],
+            vec![Script::Err(StepErr::Echild), Script::Ok(ChildProbe::Alive)],
             vec![Script::Ok(vec![4242])],
             vec![Script::Ok(())],
         );
@@ -392,24 +392,29 @@ mod ownership_tests {
         // start／pgid 暫時性查詢失敗同樣 fail-closed：Unproven、零 signal，
         // 且不得回 Stopped；查詢恢復後再次 stop 仍拒絕且零新 signal（永久撤銷）。
         let os_start = FakeOs::new(
-            vec![
-                Script::Err(StepErr::Transient),
-                Script::Ok(9_999_000_000),
-            ],
+            vec![Script::Err(StepErr::Transient), Script::Ok(9_999_000_000)],
             vec![Script::Ok(4242)],
             vec![Script::Ok(ChildProbe::Alive)],
             vec![Script::Ok(Vec::new())],
             vec![Script::Ok(())],
         );
         let lease = lease_for_test();
-        let outcome =
-            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_start);
+        let outcome = stop_once(
+            4242,
+            9_999_000_000,
+            GroupEvidence::OwnedLeader(&lease),
+            &os_start,
+        );
         assert!(
             matches!(outcome, StopOutcome::Unproven { .. }),
             "繁中說明：start 查詢失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
         );
-        let retry =
-            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_start);
+        let retry = stop_once(
+            4242,
+            9_999_000_000,
+            GroupEvidence::OwnedLeader(&lease),
+            &os_start,
+        );
         assert!(
             matches!(
                 retry,
@@ -425,23 +430,28 @@ mod ownership_tests {
 
         let os_pgid = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
-            vec![
-                Script::Err(StepErr::Transient),
-                Script::Ok(4242),
-            ],
+            vec![Script::Err(StepErr::Transient), Script::Ok(4242)],
             vec![Script::Ok(ChildProbe::Alive)],
             vec![Script::Ok(Vec::new())],
             vec![Script::Ok(())],
         );
         let lease = lease_for_test();
-        let outcome =
-            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_pgid);
+        let outcome = stop_once(
+            4242,
+            9_999_000_000,
+            GroupEvidence::OwnedLeader(&lease),
+            &os_pgid,
+        );
         assert!(
             matches!(outcome, StopOutcome::Unproven { .. }),
             "繁中說明：pgid 查詢失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
         );
-        let retry =
-            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_pgid);
+        let retry = stop_once(
+            4242,
+            9_999_000_000,
+            GroupEvidence::OwnedLeader(&lease),
+            &os_pgid,
+        );
         assert!(
             matches!(
                 retry,
@@ -649,8 +659,7 @@ mod ownership_tests {
         // 都主動放行（不依賴 `Gate::drop`，因 `FakeOs` 仍持有 `Arc`）。
         let os = Arc::new(FakeOs::happy());
         let gate = Arc::new(Gate::closed());
-        *os.gate.lock().expect("繁中說明：fake adapter 鎖不應中毒") =
-            Some((Arc::clone(&gate), 0));
+        *os.gate.lock().expect("繁中說明：fake adapter 鎖不應中毒") = Some((Arc::clone(&gate), 0));
         let _opener = GateOpener(Arc::clone(&gate));
         let lease = Arc::new(lease_for_test());
 

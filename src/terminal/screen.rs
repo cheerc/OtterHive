@@ -97,9 +97,7 @@ impl ColorView {
     /// 判斷是否為非預設顏色（Named(Foreground/Background) 視為預設）。
     fn is_non_default(&self) -> bool {
         match self {
-            ColorView::Named(name) => {
-                !name.contains("Foreground") && !name.contains("Background")
-            }
+            ColorView::Named(name) => !name.contains("Foreground") && !name.contains("Background"),
             ColorView::Indexed(_) | ColorView::Rgb(..) => true,
         }
     }
@@ -120,9 +118,9 @@ fn cell_views(term: &Term<VoidListener>, cols: u16, rows: u16) -> Vec<Vec<CellVi
                     }];
                     CellView {
                         char: cell.c,
-                        wide_spacer: cell.flags.contains(
-                            alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER,
-                        ),
+                        wide_spacer: cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER),
                         leading_wide_spacer: cell.flags.contains(
                             alacritty_terminal::term::cell::Flags::LEADING_WIDE_CHAR_SPACER,
                         ),
@@ -136,18 +134,18 @@ fn cell_views(term: &Term<VoidListener>, cols: u16, rows: u16) -> Vec<Vec<CellVi
                         italic: cell
                             .flags
                             .contains(alacritty_terminal::term::cell::Flags::ITALIC),
-                        underline: cell.flags.contains(
-                            alacritty_terminal::term::cell::Flags::UNDERLINE,
-                        ),
-                        inverse: cell.flags.contains(
-                            alacritty_terminal::term::cell::Flags::INVERSE,
-                        ),
-                        dim: cell.flags.contains(
-                            alacritty_terminal::term::cell::Flags::DIM,
-                        ),
-                        strikethrough: cell.flags.contains(
-                            alacritty_terminal::term::cell::Flags::STRIKEOUT,
-                        ),
+                        underline: cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::UNDERLINE),
+                        inverse: cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::INVERSE),
+                        dim: cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::DIM),
+                        strikethrough: cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::STRIKEOUT),
                         fg: ColorView::of(cell.fg),
                         bg: ColorView::of(cell.bg),
                     }
@@ -201,7 +199,8 @@ fn resize_to_same_dimensions_keeps_content() {
     screen.feed(b"unchanged");
     screen.resize(80, 24);
     assert_eq!(
-        screen.plain_lines()[0], "unchanged",
+        screen.plain_lines()[0],
+        "unchanged",
         "同尺寸 resize 不應清空畫面"
     );
 }
@@ -237,10 +236,7 @@ fn plain_lines_trims_trailing_blanks() {
     let mut screen = Screen::new(20, 3);
     screen.feed(b"hi");
 
-    assert_eq!(
-        screen.plain_lines()[0], "hi",
-        "行尾空格沒有語意，應被 trim"
-    );
+    assert_eq!(screen.plain_lines()[0], "hi", "行尾空格沒有語意，應被 trim");
 }
 
 #[test]
@@ -251,7 +247,8 @@ fn plain_lines_trims_only_the_end_and_keeps_leading_blanks() {
     screen.feed(b"\x1b[2;1H  pad  ");
 
     assert_eq!(
-        screen.plain_lines()[1], "  pad",
+        screen.plain_lines()[1],
+        "  pad",
         "行首空格有意義應保留，行尾應被 trim，實際：{:?}",
         screen.plain_lines()[1]
     );
@@ -264,7 +261,8 @@ fn plain_lines_keeps_blanks_left_by_cursor_positioning() {
     screen.feed(b"\x1b[2;3H  pad  ");
 
     assert_eq!(
-        screen.plain_lines()[1], "    pad",
+        screen.plain_lines()[1],
+        "    pad",
         "游標定位留下的前導空白也要保留，實際：{:?}",
         screen.plain_lines()[1]
     );
@@ -319,7 +317,8 @@ fn plain_lines_reports_empty_rows_for_unused_lines() {
     assert_eq!(lines[0], "only one line", "第 1 行");
     for row in 1..4 {
         assert_eq!(
-            lines[row], "",
+            lines[row],
+            "",
             "沒有內容的第 {} 行應為空字串，實際：{:?}",
             row + 1,
             lines[row]
@@ -408,10 +407,7 @@ fn render_ansi_restores_default_attributes_after_reset() {
 
     // "styled" 佔 0..5，" " 是第 6 格，"unstyled" 從第 7 格起。
     let space = &views[0][6];
-    assert!(
-        !space.bold,
-        "reset 後應恢復非粗體，實際：{space:?}"
-    );
+    assert!(!space.bold, "reset 後應恢復非粗體，實際：{space:?}");
     assert!(
         !space.fg.is_non_default(),
         "reset 後前景色應回到預設，實際：{:?}",
