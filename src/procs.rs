@@ -4,12 +4,14 @@
 //! 尚未授權撰寫。本檔在 `lib.rs` 接入 `mod procs;` 之前是孤立法，不參與編譯；
 //! 接入後，這些測試即為 compile-RED（引用的 `super::` 項目尚不存在）。
 //!
-//! ## 對 GREEN 的內部 seam 提案 v2（非公開契約變更）
+//! ## 對 GREEN 的內部 seam 提案 v3（非公開契約變更）
 //!
-//! coordinator 查核後要求：`probe_child` 必須獨立於 start／pgid 查詢
-//! （ECHILD 是 ownership 證據，不是 lookup 值）；group 列舉與 reap 必須是
-//! fallible（查詢失敗只能 `Unproven`，不可 `Stopped`）；併發測試必須用可逾時
-//! 的 gate／channel，不能用無界 `Barrier::wait` 掛住整個 suite。
+//! coordinator 查核後要求：`probe_child` 必須獨立於 start／pgid 查詢；
+//! group 列舉與 reap 必須是 fallible；併發測試必須用可逾時 gate／channel。
+//! 本輪再修正測試自身前提：腳本值用可 Clone 的 `Script` 列舉（`io::Error`
+//! 不實作 `Clone`，不可直接存 `VecDeque<io::Result<_>>`）；ECHILD 以
+//! `from_raw_os_error(libc::ECHILD)` 攜帶 raw errno，production 必須以
+//! raw errno 判定 ownership loss，不可把所有 `NotFound` 混為一談。
 //!
 //! ```rust,ignore
 //! /// waitid WNOWAIT 觀測結果（不 reap）。
@@ -19,9 +21,10 @@
 //!     Exited { code: Option<i32>, signal: Option<i32> },
 //! }
 //!
-//! /// 同一個 stop 核心的可注入 OS 面。ECHILD（child 已被外部 reap 或根本
-//! /// 非本程序 child）以 `ErrorKind::NotFound` 回傳，與暫時性查詢失敗區分；
-//! /// 兩者都使 lease 永久失效（fail-closed），但測試分別覆蓋。
+//! /// 同一個 stop 核心的可注入 OS 面。`probe_child` 的 ECHILD 必須是
+//! /// raw errno == ECHILD 的錯誤（child 已被外部 reap 或根本非本程序
+//! /// child）；其他查詢失敗是暫時性錯誤。兩者都使 lease 永久失效
+//! ///（fail-closed），但測試分別覆蓋。
 //! pub(crate) trait OsAdapter: Send + Sync {
 //!     fn start_time(&self, pid: i32) -> std::io::Result<u64>;
 //!     fn pgid(&self, pid: i32) -> std::io::Result<i32>;
@@ -48,9 +51,10 @@
 //!
 //! 核心順序提案（測試據此斷言事件全序）：驗證（lease 有效＋綁定相符＋
 //! start／pgid／probe 一致）→ SIGTERM → 等待 → 列舉 group（失敗即 `Unproven`；
-//! 只排除已確認退出的 owned leader，不盲目排除存活 leader）→ 仍有成員則
-//! SIGKILL → 仍有成員則 `Unproven{residual_pids}` → 撤銷 lease → reap
-//!（reap 失敗即 `Unproven`，不宣稱 `Stopped`）。
+//! 只排除已確認退出的 owned leader，不盲目排除存活 leader；空列舉但 probe
+//! 仍 Alive 屬證據矛盾，同樣 `Unproven`）→ 仍有成員則 SIGKILL → 仍有成員則
+//! `Unproven{residual_pids}` → 撤銷 lease → reap（reap 前 probe 須已退出；
+//! reap 失敗即 `Unproven`，不宣稱 `Stopped`）。
 //! `stop_group` 公開入口以真實 adapter 呼叫 `stop_group_with_adapter`；
 //! lease 需為 `Sync`（併發測試跨執行緒共用同一 lease）。
 //! 若 coordinator 凍結不同的 seam，本檔測試隨 GREEN 調整，不擅改契約。
@@ -68,15 +72,41 @@ mod ownership_tests {
     const POLL_STEP: Duration = Duration::from_millis(20);
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    fn echild() -> std::io::Error {
-        std::io::Error::new(ErrorKind::NotFound, "ECHILD：child 已被外部 reap 或非本程序持有")
+    /// 腳本錯誤（可 Clone）：ECHILD 攜帶 raw errno，production 以此判定
+    /// ownership loss；暫時性錯誤另行覆蓋。
+    #[derive(Debug, Clone, Copy)]
+    enum StepErr {
+        Echild,
+        Transient,
     }
 
-    fn transient() -> std::io::Error {
-        std::io::Error::new(ErrorKind::TimedOut, "暫時性查詢失敗")
+    impl StepErr {
+        fn to_io(self, ctx: &'static str) -> std::io::Error {
+            match self {
+                StepErr::Echild => std::io::Error::from_raw_os_error(libc::ECHILD),
+                StepErr::Transient => std::io::Error::new(ErrorKind::TimedOut, ctx),
+            }
+        }
     }
 
-    /// 可逾時的 gate：Drop 時自動開啟，測試失敗也不會永久阻塞 suite。
+    /// 可 Clone 的腳本值（`io::Error` 不實作 `Clone`，不可直接存 Result）。
+    #[derive(Debug, Clone)]
+    enum Script<T> {
+        Ok(T),
+        Err(StepErr),
+    }
+
+    impl<T> Script<T> {
+        fn to_io(self, ctx: &'static str) -> std::io::Result<T> {
+            match self {
+                Script::Ok(value) => Ok(value),
+                Script::Err(error) => Err(error.to_io(ctx)),
+            }
+        }
+    }
+
+    /// 可逾時的 gate。注意：`FakeOs` 仍持有 `Arc<Gate>` 時本體的 `Drop`
+    /// 不會觸發，測試另用 `GateOpener` 在 panic 路徑主動放行。
     struct Gate {
         open: Mutex<bool>,
         cvar: Condvar,
@@ -101,42 +131,50 @@ mod ownership_tests {
                 .wait_timeout_while(
                     self.open.lock().expect("繁中說明：gate 鎖不應中毒"),
                     timeout,
-                    |is_open| !**is_open,
+                    |is_open| !*is_open,
                 )
                 .expect("繁中說明：gate 鎖不應中毒");
             *guard
         }
     }
 
-    impl Drop for Gate {
+    /// 作用域放行守衛：持有 `Arc<Gate>` 的複本，自身 Drop 時主動 `open`。
+    /// 測試函式內以 `let _opener = GateOpener(...)` 持有，任何 assert panic
+    /// 展開時都會放行被 gate 擋住的執行緒，不掛住整個 suite。
+    struct GateOpener(Arc<Gate>);
+
+    impl Drop for GateOpener {
         fn drop(&mut self) {
-            self.open();
+            self.0.open();
         }
     }
 
     /// 可程式化的 fake OS adapter：照腳本回應查詢，記錄所有 signal／reap。
     /// 所有腳本用盡後重複最後一個值。
     struct FakeOs {
-        starts: Mutex<VecDeque<std::io::Result<u64>>>,
-        pgids: Mutex<VecDeque<std::io::Result<i32>>>,
-        probes: Mutex<VecDeque<std::io::Result<ChildProbe>>>,
-        lists: Mutex<VecDeque<std::io::Result<Vec<i32>>>>,
-        reaps: Mutex<VecDeque<std::io::Result<()>>>,
+        starts: Mutex<VecDeque<Script<u64>>>,
+        pgids: Mutex<VecDeque<Script<i32>>>,
+        probes: Mutex<VecDeque<Script<ChildProbe>>>,
+        lists: Mutex<VecDeque<Script<Vec<i32>>>>,
+        reaps: Mutex<VecDeque<Script<()>>>,
         events: Mutex<Vec<String>>,
         kill_calls: AtomicUsize,
         reap_calls: AtomicUsize,
         /// 在第 `gate_at` 次 `kill_group` 前等待 gate（併發測試用）。
         gate: Mutex<Option<(Arc<Gate>, usize)>>,
         kill_count: AtomicUsize,
+        /// 到達 signal 擋點的次數（阻塞之前累計；與「已發 signal」分開記，
+        /// 不混淆事件語意）。
+        entered_gate: AtomicUsize,
     }
 
     impl FakeOs {
         fn new(
-            starts: Vec<std::io::Result<u64>>,
-            pgids: Vec<std::io::Result<i32>>,
-            probes: Vec<std::io::Result<ChildProbe>>,
-            lists: Vec<std::io::Result<Vec<i32>>>,
-            reaps: Vec<std::io::Result<()>>,
+            starts: Vec<Script<u64>>,
+            pgids: Vec<Script<i32>>,
+            probes: Vec<Script<ChildProbe>>,
+            lists: Vec<Script<Vec<i32>>>,
+            reaps: Vec<Script<()>>,
         ) -> Self {
             Self {
                 starts: Mutex::new(starts.into()),
@@ -149,20 +187,29 @@ mod ownership_tests {
                 reap_calls: AtomicUsize::new(0),
                 gate: Mutex::new(None),
                 kill_count: AtomicUsize::new(0),
+                entered_gate: AtomicUsize::new(0),
             }
         }
 
+        /// 一致的正面腳本：驗證時 Alive，TERM 後 Exited，group 已空。
+        /// reap 前 probe 必已退出，不鼓勵對存活 child reap。
         fn happy() -> Self {
             Self::new(
-                vec![Ok(9_999_000_000)],
-                vec![Ok(4242)],
-                vec![Ok(ChildProbe::Alive)],
-                vec![Ok(Vec::new())],
-                vec![Ok(())],
+                vec![Script::Ok(9_999_000_000)],
+                vec![Script::Ok(4242)],
+                vec![
+                    Script::Ok(ChildProbe::Alive),
+                    Script::Ok(ChildProbe::Exited {
+                        code: Some(0),
+                        signal: None,
+                    }),
+                ],
+                vec![Script::Ok(Vec::new())],
+                vec![Script::Ok(())],
             )
         }
 
-        fn pop_or_last<T: Clone>(queue: &Mutex<VecDeque<T>>) -> T {
+        fn pop_script<T: Clone>(queue: &Mutex<VecDeque<Script<T>>>) -> Script<T> {
             let mut guard = queue.lock().expect("繁中說明：fake adapter 鎖不應中毒");
             if guard.len() > 1 {
                 guard.pop_front().expect("繁中說明：腳本不應為空")
@@ -181,19 +228,19 @@ mod ownership_tests {
 
     impl OsAdapter for FakeOs {
         fn start_time(&self, _pid: i32) -> std::io::Result<u64> {
-            Self::pop_or_last(&self.starts)
+            Self::pop_script(&self.starts).to_io("start_time")
         }
 
         fn pgid(&self, _pid: i32) -> std::io::Result<i32> {
-            Self::pop_or_last(&self.pgids)
+            Self::pop_script(&self.pgids).to_io("pgid")
         }
 
         fn probe_child(&self, _pid: i32) -> std::io::Result<ChildProbe> {
-            Self::pop_or_last(&self.probes)
+            Self::pop_script(&self.probes).to_io("probe_child")
         }
 
         fn list_group(&self, _pgid: i32) -> std::io::Result<Vec<i32>> {
-            Self::pop_or_last(&self.lists)
+            Self::pop_script(&self.lists).to_io("list_group")
         }
 
         fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
@@ -201,8 +248,12 @@ mod ownership_tests {
             if let Some((gate, at)) =
                 self.gate.lock().expect("繁中說明：fake adapter 鎖不應中毒").clone()
             {
-                if count == at && !gate.wait_open(TEST_TIMEOUT) {
-                    return Err(std::io::Error::new(ErrorKind::TimedOut, "gate 等待逾時"));
+                if count == at {
+                    // 先記到達（阻塞之前），再等待放行；到達計數不等於已發 signal。
+                    self.entered_gate.fetch_add(1, Ordering::SeqCst);
+                    if !gate.wait_open(TEST_TIMEOUT) {
+                        return Err(std::io::Error::new(ErrorKind::TimedOut, "gate 等待逾時"));
+                    }
                 }
             }
             self.kill_calls.fetch_add(1, Ordering::SeqCst);
@@ -220,7 +271,7 @@ mod ownership_tests {
                 .lock()
                 .expect("繁中說明：fake adapter 鎖不應中毒")
                 .push("reap".to_owned());
-            Self::pop_or_last(&self.reaps)
+            Self::pop_script(&self.reaps).to_io("reap")
         }
     }
 
@@ -239,7 +290,7 @@ mod ownership_tests {
 
     #[test]
     fn valid_lease_signals_term_and_reaps() {
-        // 正面案例：身分相符、TERM 後 group 已空 → Stopped（不升級）。
+        // 正面案例：身分相符、TERM 後 probe 已退出、group 已空 → Stopped（不升級）。
         let os = FakeOs::happy();
         let lease = lease_for_test();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -269,7 +320,7 @@ mod ownership_tests {
         // 同一舊 pgid 回報無關的新 group（啟動時間不同），且 lease 已撤銷：
         // 由真正 stop 核心入口帶入 → Unproven，signal 與 reap 呼叫數皆為 0。
         let mut os = FakeOs::happy();
-        os.starts = Mutex::new(vec![Ok(1_111_000_000)].into());
+        os.starts = Mutex::new(vec![Script::Ok(1_111_000_000)].into());
         let lease = lease_for_test();
         lease.revoke();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -291,15 +342,24 @@ mod ownership_tests {
 
     #[test]
     fn external_reap_with_matching_start_and_pgid_permanently_revokes() {
-        // 關鍵：start／pgid 始終相符，但 probe 回 ECHILD（child 已被外部 reap）：
-        // lease 永久撤銷；之後 probe 恢復 Alive，同一 lease 再次 stop 仍拒絕，
-        // 全程零 signal。這不用 start_time=None 冒充 ECHILD。
+        // 關鍵：start／pgid 始終相符，但 probe 回 ECHILD（child 已被外部 reap）。
+        // ECHILD 映射攜帶 raw errno（production 以 raw errno 判定 ownership，
+        // 不可把所有 NotFound 混為一談）；lease 永久撤銷；之後 probe 恢復
+        // Alive，同一 lease 再次 stop 仍拒絕且零新 signal。
+        assert_eq!(
+            StepErr::Echild.to_io("probe").raw_os_error(),
+            Some(libc::ECHILD),
+            "繁中說明：ECHILD 測試映射必須攜帶 raw errno"
+        );
         let os = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Ok(4242)],
-            vec![Err(echild()), Ok(ChildProbe::Alive)],
-            vec![Ok(vec![4242])],
-            vec![Ok(())],
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![
+                Script::Err(StepErr::Echild),
+                Script::Ok(ChildProbe::Alive),
+            ],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
         let first = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -329,44 +389,70 @@ mod ownership_tests {
 
     #[test]
     fn start_and_pgid_lookup_failures_are_unproven_not_stopped() {
-        // start／pgid 查詢失敗（非 ECHILD，是暫時性錯誤）同樣 fail-closed：
-        // Unproven、零 signal，且不得回 Stopped。
+        // start／pgid 暫時性查詢失敗同樣 fail-closed：Unproven、零 signal，
+        // 且不得回 Stopped；查詢恢復後再次 stop 仍拒絕且零新 signal（永久撤銷）。
         let os_start = FakeOs::new(
-            vec![Err(transient())],
-            vec![Ok(4242)],
-            vec![Ok(ChildProbe::Alive)],
-            vec![Ok(Vec::new())],
-            vec![Ok(())],
+            vec![
+                Script::Err(StepErr::Transient),
+                Script::Ok(9_999_000_000),
+            ],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
-        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_start);
+        let outcome =
+            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_start);
         assert!(
             matches!(outcome, StopOutcome::Unproven { .. }),
             "繁中說明：start 查詢失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
         );
+        let retry =
+            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_start);
+        assert!(
+            matches!(
+                retry,
+                StopOutcome::Unproven { .. } | StopOutcome::IdentityMismatch
+            ),
+            "繁中說明：查詢恢復後仍應拒絕（永久撤銷），實際為 {retry:?}"
+        );
         assert_eq!(
             os_start.kill_calls.load(Ordering::SeqCst),
             0,
-            "繁中說明：start 查詢失敗不得發 signal"
+            "繁中說明：start 查詢失敗路徑全程不得發 signal"
         );
 
         let os_pgid = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Err(transient())],
-            vec![Ok(ChildProbe::Alive)],
-            vec![Ok(Vec::new())],
-            vec![Ok(())],
+            vec![Script::Ok(9_999_000_000)],
+            vec![
+                Script::Err(StepErr::Transient),
+                Script::Ok(4242),
+            ],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
-        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_pgid);
+        let outcome =
+            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_pgid);
         assert!(
             matches!(outcome, StopOutcome::Unproven { .. }),
             "繁中說明：pgid 查詢失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
         );
+        let retry =
+            stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os_pgid);
+        assert!(
+            matches!(
+                retry,
+                StopOutcome::Unproven { .. } | StopOutcome::IdentityMismatch
+            ),
+            "繁中說明：查詢恢復後仍應拒絕（永久撤銷），實際為 {retry:?}"
+        );
         assert_eq!(
             os_pgid.kill_calls.load(Ordering::SeqCst),
             0,
-            "繁中說明：pgid 查詢失敗不得發 signal"
+            "繁中說明：pgid 查詢失敗路徑全程不得發 signal"
         );
     }
 
@@ -397,11 +483,11 @@ mod ownership_tests {
     fn group_enumeration_failure_is_unproven_with_term_already_sent() {
         // TERM 已發、等待後列舉 group 失敗：Unproven（不可 Stopped），不 reap。
         let os = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Ok(4242)],
-            vec![Ok(ChildProbe::Alive)],
-            vec![Err(transient())],
-            vec![Ok(())],
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Err(StepErr::Transient)],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -422,15 +508,44 @@ mod ownership_tests {
     }
 
     #[test]
-    fn reap_failure_is_unproven_not_stopped() {
-        // group 已確認清空但 reap 失敗：不可宣稱 Stopped；lease 同樣 fail-closed，
-        // 之後重試仍拒絕且無新 signal。
+    fn empty_list_with_live_probe_is_unproven() {
+        // 列舉為空但 probe 仍 Alive：證據矛盾 → Unproven、不 reap（有界等待內判定）。
         let os = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Ok(4242)],
-            vec![Ok(ChildProbe::Alive)],
-            vec![Ok(Vec::new())],
-            vec![Err(transient())],
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：空列舉但 probe 存活屬證據矛盾，應回 Unproven，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：證據矛盾不得 reap 存活 child"
+        );
+    }
+
+    #[test]
+    fn reap_failure_is_unproven_not_stopped() {
+        // group 已確認清空（probe 已退出）但 reap 失敗：不可宣稱 Stopped；
+        // lease 同樣 fail-closed，之後重試仍拒絕且無新 signal。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![
+                Script::Ok(ChildProbe::Alive),
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+            ],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Err(StepErr::Transient)],
         );
         let lease = lease_for_test();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -458,11 +573,11 @@ mod ownership_tests {
         // probe 始終 Alive，列舉含 leader 本人：不可盲目排除存活 leader；
         // TERM＋KILL 後仍有成員 → Unproven，residuals 含 leader 與 child，不 reap。
         let os = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Ok(4242)],
-            vec![Ok(ChildProbe::Alive)],
-            vec![Ok(vec![4242, 5000])],
-            vec![Ok(())],
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(vec![4242, 5000])],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -492,14 +607,14 @@ mod ownership_tests {
         // probe 確認 leader 已退出：列舉第二次只剩 zombie leader 時，排除它即算
         // 清空 → Stopped（不升級）並 reap。
         let os = FakeOs::new(
-            vec![Ok(9_999_000_000)],
-            vec![Ok(4242)],
-            vec![Ok(ChildProbe::Exited {
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Exited {
                 code: Some(0),
-                signal: None
+                signal: None,
             })],
-            vec![Ok(vec![4242, 5001]), Ok(vec![4242])],
-            vec![Ok(())],
+            vec![Script::Ok(vec![4242, 5001]), Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
         );
         let lease = lease_for_test();
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
@@ -526,17 +641,17 @@ mod ownership_tests {
 
     #[test]
     fn concurrent_stops_serialize_on_one_lock_with_exactly_one_reap() {
-        // 真正 production 同一 lifecycle lock 的 revoke／reap 競爭（不是兩個
-        // 獨立 stop 各做各的）：stop A 在 validation 之後、signal 之前被可控
-        // seam（gate）擋住並持有鎖；stop B 以同一 lease 進入必須序列化等待，
-        // 不可並行驗證／signal。放行後事件全序為 signal→reap，reap 恰一次，
-        // A 得 Stopped、B 因 lease 已撤銷得 Unproven，撤銷後零新 signal。
-        // 全程用可逾時 channel／gate，不用無界 Barrier；執行緒以 channel 回傳
-        // 結果並 join，assert 失敗時 gate 的 Drop 也會放行，不掛 suite。
+        // 真正 production 同一 lifecycle lock 的 revoke／reap 競爭：stop A 在
+        // validation 之後、signal 之前被可控 seam（gate）擋住並持有鎖；stop B
+        // 以同一 lease 進入必須序列化等待。放行後事件全序為 signal→reap，
+        // reap 恰一次，A 得 Stopped、B 因 lease 已撤銷得 Unproven，撤銷後零新
+        // signal。全程用可逾時 gate／channel；`GateOpener` 保證任何 panic 路徑
+        // 都主動放行（不依賴 `Gate::drop`，因 `FakeOs` 仍持有 `Arc`）。
         let os = Arc::new(FakeOs::happy());
         let gate = Arc::new(Gate::closed());
         *os.gate.lock().expect("繁中說明：fake adapter 鎖不應中毒") =
             Some((Arc::clone(&gate), 0));
+        let _opener = GateOpener(Arc::clone(&gate));
         let lease = Arc::new(lease_for_test());
 
         let spawn_stop = |os: Arc<FakeOs>, lease: Arc<OwnedLeaderLease>| {
@@ -556,12 +671,13 @@ mod ownership_tests {
         };
 
         let (handle_a, rx_a) = spawn_stop(Arc::clone(&os), Arc::clone(&lease));
-        // 確認 A 已到達 signal 點（持有鎖、卡在 gate），再啟動 B，保證重疊。
+        // 以獨立到達計數確認 A 已進入 signal 擋點（持有鎖），再啟動 B 保證重疊；
+        // 到達計數不等於已發 signal，不混淆事件語意。
         let checkpoint = Instant::now();
-        while os.kill_calls.load(Ordering::SeqCst) < 1 {
+        while os.entered_gate.load(Ordering::SeqCst) < 1 {
             assert!(
                 checkpoint.elapsed() < TEST_TIMEOUT,
-                "繁中說明：stop A 應在期限內到達 signal 點"
+                "繁中說明：stop A 應在期限內到達 signal 擋點"
             );
             std::thread::sleep(POLL_STEP);
         }

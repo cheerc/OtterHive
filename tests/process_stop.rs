@@ -74,46 +74,72 @@ mod support {
         }
     }
 
-    /// 從 spawn 後立即接管裸 Command 的守衛：任何前提 assert／stop 斷言
-    /// panic 時，Drop 仍核對身分並清理 leader 與已知的 child，不留殘留。
+    /// 從 spawn 後立即接管裸 Command 的守衛：先把 `Child` 移入 guard
+    /// （不做任何可能失敗的 OS 呼叫、不 panic），之後再以 `fingerprint()`
+    /// 驗證可讀的啟動時間。任何前提 assert／stop 斷言 panic 時，Drop 仍按
+    /// ownership 證據清理 leader 與已登記的 child，不留殘留。
     /// 這是測試自己擁有的 Command child（可合法 reap），與 Session 的
     /// exit-observer 禁止 reap 不同。
     pub struct RawLeaderGuard {
         child: Option<std::process::Child>,
         pub pid: i32,
-        pub start: u64,
-        known_child: Option<(i32, Option<u64>)>,
+        start: Option<u64>,
+        /// A：只保存正面 fingerprint（Some）。`None`（查詢失敗）永遠不登記，
+        /// Drop 的 `Some == Some` 比對天然拒絕 `None == None` 授權。
+        known_child: Option<(i32, u64)>,
     }
 
     impl RawLeaderGuard {
+        /// B：接管只移動 handle，不做 OS 呼叫、不 panic。即使後續 fingerprint
+        /// 失敗而測試主體 panic，unwind 經過 guard 的 Drop 仍會清理持有的 child。
         pub fn take_over(child: std::process::Child) -> Self {
             let pid = child.id() as i32;
-            let start = proc_start_raw(pid).expect("繁中說明：歷史 leader 啟動時間應可讀");
             Self {
                 child: Some(child),
                 pid,
-                start,
+                start: None,
                 known_child: None,
             }
         }
 
-        /// 取得 child 身分後立即登記：之後任何路徑的 Drop 都會清理它。
-        pub fn register_child(&mut self, pid: i32) {
-            self.known_child = Some((pid, proc_start_raw(pid)));
+        /// 正面 fingerprint：讀到啟動時間才存入並回傳；讀不到回 Err，
+        /// 由測試主體（可 assert）決定，不在此 panic。
+        pub fn fingerprint(&mut self) -> Result<u64, &'static str> {
+            match proc_start_raw(self.pid) {
+                Some(start) => {
+                    self.start = Some(start);
+                    Ok(start)
+                }
+                None => Err("歷史 leader 啟動時間不可讀，無法建立正面身分"),
+            }
+        }
+
+        /// A：登記必須是正面 fingerprint；查詢失敗拒絕登記（fail-closed）。
+        pub fn register_child(&mut self, pid: i32) -> Result<(), &'static str> {
+            match proc_start_raw(pid) {
+                Some(start) => {
+                    self.known_child = Some((pid, start));
+                    Ok(())
+                }
+                None => Err("子程序啟動時間不可讀，拒絕登記（fail-closed）"),
+            }
         }
 
         /// 核對 leader 身分（pid＋啟動時間）後發 signal；檢查 kill 結果。
+        /// 測試主體呼叫（可 assert／expect）；Drop 不走此函式。
         pub fn kill_leader_checked(&self, sig: libc::c_int) {
+            let start = self.start.expect("繁中說明：需先 fingerprint 成功");
             assert_eq!(
                 proc_start_raw(self.pid),
-                Some(self.start),
+                Some(start),
                 "繁中說明：kill 前應核對 leader 身分未變（防 PID 重用）"
             );
             let ret = unsafe { libc::kill(self.pid, sig) };
             assert_eq!(ret, 0, "繁中說明：leader kill 應成功，否則測試前提已變");
         }
 
-        /// 有界等待 leader 結束並 reap（不用無界 wait）；回傳是否成功回收。
+        /// 有界等待 leader 結束並 reap（不用無界 wait）。`try_wait` 失敗回
+        /// false（C：Drop 路徑與主體都不得在此 panic；主體以回傳值 assert）。
         pub fn reap_bounded(&mut self, timeout: Duration) -> bool {
             let start = Instant::now();
             loop {
@@ -124,7 +150,7 @@ mod support {
                             return true;
                         }
                         Ok(None) => {}
-                        Err(error) => panic!("繁中說明：try_wait 不應失敗：{error:?}"),
+                        Err(_) => return false,
                     }
                 } else {
                     return true;
@@ -135,21 +161,49 @@ mod support {
                 std::thread::sleep(POLL_STEP);
             }
         }
+
+        /// B：fingerprint 缺失時的正面 ownership 證據——以持有的未 reap
+        /// child 加 WNOWAIT 確認。只有本程序持有的 child 才 waitable；
+        /// ECHILD（或已無持有的 child）即非我方，回 false。
+        fn confirm_owned_via_waitid(&self) -> bool {
+            if self.child.is_none() {
+                return false;
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            ret == 0
+        }
     }
 
     impl Drop for RawLeaderGuard {
+        /// C：Drop 路徑不可 panic——無 expect／assert／panic，只有界清理；
+        /// 正常測試主體已做主要清理並斷言，此處是 panic 展開時的最後防線。
         fn drop(&mut self) {
-            // 先回收 leader（核對身分＋有界 wait），再清理已知的 child。
             if self.child.is_some() {
-                if proc_start_raw(self.pid) == Some(self.start) {
+                // B：有正面 fingerprint 則核對後清理；缺失時以 held-child＋
+                // WNOWAIT 確認 ownership，確認失敗則 fail-closed（不發 signal，
+                // 不把 unknown pid 當可 kill）。
+                let owned = match self.start {
+                    Some(start) => proc_start_raw(self.pid) == Some(start),
+                    None => self.confirm_owned_via_waitid(),
+                };
+                if owned {
                     unsafe {
                         libc::kill(self.pid, libc::SIGKILL);
                     }
                 }
                 let _ = self.reap_bounded(Duration::from_secs(2));
             }
+            // A：只接受保存的 Some 與新查的 Some 相符；查詢失敗絕不授權。
             if let Some((pid, start)) = self.known_child {
-                if proc_start_raw(pid) == start {
+                if proc_start_raw(pid) == Some(start) {
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
@@ -518,11 +572,15 @@ fn recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group() {
         .current_dir(tmp.path())
         .spawn()
         .expect("繁中說明：歷史 leader 應可啟動");
-    // 從 spawn 後立即交給守衛：之後任何 assert panic，Drop 仍清理 leader
-    // 與已登記的 child，不留殘留。
+    // B：從 spawn 後立即交給守衛（只移動 handle，不做 OS 呼叫、不 panic）：
+    // 之後任何 assert panic，Drop 仍處理持有的 child，不留殘留。
     let mut guard = RawLeaderGuard::take_over(leader_child);
     let leader_pid = guard.pid;
-    let leader_start = guard.start;
+    // 正面 fingerprint：讀到啟動時間才繼續；讀不到由主體 assert 終止，
+    // 守衛仍持有 child 並在 Drop 以 WNOWAIT 證據處理（不裸 kill unknown pid）。
+    let leader_start = guard
+        .fingerprint()
+        .expect("繁中說明：歷史 leader 啟動時間應可讀");
     assert!(
         poll_until(LONG_TIMEOUT, || {
             fs::read_to_string(&log)
@@ -542,8 +600,10 @@ fn recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group() {
         .parse::<i32>()
         .expect("繁中說明：子程序 pid 應為整數");
     let child_start = proc_start_raw(child).expect("繁中說明：子程序啟動時間應可讀");
-    // 取得 child 身分後立即登記：之後任何路徑的 Drop 都會清理它。
-    guard.register_child(child);
+    // A：取得正面 fingerprint 後立即登記；查詢失敗拒絕登記（fail-closed）。
+    guard
+        .register_child(child)
+        .expect("繁中說明：子程序 fingerprint 應可建立");
 
     // 模擬 daemon 重啟後的狀態：歷史 leader 結束並被 reap（測試自己持有
     // Command 故合法 wait），只剩 SQLite 記的 pid／啟動時間。
