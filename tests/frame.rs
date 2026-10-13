@@ -386,7 +386,7 @@ fn truncated_header_is_an_error() {
     // frame，由 empty_payload_frames_are_readable 覆蓋，因此 prefix_len = 4 不是截斷。
     for prefix_len in 0..4usize {
         let mut stream = vec![TAG_OUTPUT];
-        stream.extend(std::iter::repeat(0x00).take(prefix_len));
+        stream.resize(1 + prefix_len, 0x00);
 
         let error = read_frame(&mut Cursor::new(stream)).expect_err("截斷的 frame header 應該回錯");
         assert_eq!(
