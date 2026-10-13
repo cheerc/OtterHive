@@ -74,23 +74,87 @@ mod support {
         }
     }
 
-    /// 緊急清理：只有在 leader 存活、啟動時間相符、`pgid == pid` 三者皆成立
-    /// （契約 §4.3 的證據）時，才對該 group 發 SIGKILL；否則什麼都不做。
-    /// 這是測試的最後防線，不是 `stop_group` 的替代路徑。
-    pub fn emergency_kill_group(pid: i32, expected_start: u64) {
-        let start = match proc_start_raw(pid) {
-            Some(start) => start,
-            None => return,
-        };
-        if start != expected_start {
-            return;
+    /// 從 spawn 後立即接管裸 Command 的守衛：任何前提 assert／stop 斷言
+    /// panic 時，Drop 仍核對身分並清理 leader 與已知的 child，不留殘留。
+    /// 這是測試自己擁有的 Command child（可合法 reap），與 Session 的
+    /// exit-observer 禁止 reap 不同。
+    pub struct RawLeaderGuard {
+        child: Option<std::process::Child>,
+        pub pid: i32,
+        pub start: u64,
+        known_child: Option<(i32, Option<u64>)>,
+    }
+
+    impl RawLeaderGuard {
+        pub fn take_over(child: std::process::Child) -> Self {
+            let pid = child.id() as i32;
+            let start = proc_start_raw(pid).expect("繁中說明：歷史 leader 啟動時間應可讀");
+            Self {
+                child: Some(child),
+                pid,
+                start,
+                known_child: None,
+            }
         }
-        let pgid = unsafe { libc::getpgid(pid) };
-        if pgid != pid {
-            return;
+
+        /// 取得 child 身分後立即登記：之後任何路徑的 Drop 都會清理它。
+        pub fn register_child(&mut self, pid: i32) {
+            self.known_child = Some((pid, proc_start_raw(pid)));
         }
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+
+        /// 核對 leader 身分（pid＋啟動時間）後發 signal；檢查 kill 結果。
+        pub fn kill_leader_checked(&self, sig: libc::c_int) {
+            assert_eq!(
+                proc_start_raw(self.pid),
+                Some(self.start),
+                "繁中說明：kill 前應核對 leader 身分未變（防 PID 重用）"
+            );
+            let ret = unsafe { libc::kill(self.pid, sig) };
+            assert_eq!(ret, 0, "繁中說明：leader kill 應成功，否則測試前提已變");
+        }
+
+        /// 有界等待 leader 結束並 reap（不用無界 wait）；回傳是否成功回收。
+        pub fn reap_bounded(&mut self, timeout: Duration) -> bool {
+            let start = Instant::now();
+            loop {
+                if let Some(child) = self.child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            self.child = None;
+                            return true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => panic!("繁中說明：try_wait 不應失敗：{error:?}"),
+                    }
+                } else {
+                    return true;
+                }
+                if start.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(POLL_STEP);
+            }
+        }
+    }
+
+    impl Drop for RawLeaderGuard {
+        fn drop(&mut self) {
+            // 先回收 leader（核對身分＋有界 wait），再清理已知的 child。
+            if self.child.is_some() {
+                if proc_start_raw(self.pid) == Some(self.start) {
+                    unsafe {
+                        libc::kill(self.pid, libc::SIGKILL);
+                    }
+                }
+                let _ = self.reap_bounded(Duration::from_secs(2));
+            }
+            if let Some((pid, start)) = self.known_child {
+                if proc_start_raw(pid) == start {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
         }
     }
 
@@ -192,7 +256,15 @@ mod support {
                     Duration::from_secs(1),
                 );
             }
-            emergency_kill_group(self.pid, self.start);
+            // 最後防線：核對身分（pid＋啟動時間＋pgid==pid）後才 SIGKILL
+            // 該 group；否則什麼都不做。不是 stop_group 的替代路徑。
+            if proc_start_raw(self.pid) == Some(self.start)
+                && unsafe { libc::getpgid(self.pid) } == self.pid
+            {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGKILL);
+                }
+            }
         }
     }
 }
@@ -439,15 +511,18 @@ fn recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group() {
             Ok(())
         });
     }
-    let mut leader = leader_cmd
+    let leader_child = leader_cmd
         .env("OTTERHIVE_FIXTURE_LOG", &log)
         .env("HOME", tmp.path())
         .env("OTTERHIVE_HOME", tmp.path())
         .current_dir(tmp.path())
         .spawn()
         .expect("繁中說明：歷史 leader 應可啟動");
-    let leader_pid = leader.id() as i32;
-    let leader_start = proc_start_raw(leader_pid).expect("繁中說明：歷史 leader 啟動時間應可讀");
+    // 從 spawn 後立即交給守衛：之後任何 assert panic，Drop 仍清理 leader
+    // 與已登記的 child，不留殘留。
+    let mut guard = RawLeaderGuard::take_over(leader_child);
+    let leader_pid = guard.pid;
+    let leader_start = guard.start;
     assert!(
         poll_until(LONG_TIMEOUT, || {
             fs::read_to_string(&log)
@@ -467,13 +542,18 @@ fn recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group() {
         .parse::<i32>()
         .expect("繁中說明：子程序 pid 應為整數");
     let child_start = proc_start_raw(child).expect("繁中說明：子程序啟動時間應可讀");
+    // 取得 child 身分後立即登記：之後任何路徑的 Drop 都會清理它。
+    guard.register_child(child);
 
-    // 模擬 daemon 重啟後的狀態：歷史 leader 已結束並被 reap（測試自己持有
+    // 模擬 daemon 重啟後的狀態：歷史 leader 結束並被 reap（測試自己持有
     // Command 故合法 wait），只剩 SQLite 記的 pid／啟動時間。
-    unsafe {
-        libc::kill(leader_pid, libc::SIGKILL);
-    }
-    let _ = leader.wait();
+    // kill 前核對 leader 身分；wait 用有界 try_wait，不用無界 wait，
+    // 更不用 `let _` 吞掉錯誤。
+    guard.kill_leader_checked(libc::SIGKILL);
+    assert!(
+        guard.reap_bounded(LONG_TIMEOUT),
+        "繁中說明：歷史 leader 應在期限內結束並被回收"
+    );
     assert!(
         !pid_alive(leader_pid),
         "繁中說明：歷史 leader 應已消失（被 reap）"
@@ -496,15 +576,15 @@ fn recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group() {
         "繁中說明：Unproven 不得對殘留 child 發 signal"
     );
 
-    // cleanup：核對保存的 child 身分（pid＋啟動時間）後才清理。
+    // cleanup：核對保存的 child 身分（pid＋啟動時間）後才清理；檢查 signal
+    // 結果，有界收斂。守衛 Drop 是最後防線，不是主要清理路徑。
     assert_eq!(
         proc_start_raw(child),
         Some(child_start),
         "繁中說明：cleanup 前應核對子程序身分未變"
     );
-    unsafe {
-        libc::kill(child, libc::SIGKILL);
-    }
+    let kill_ret = unsafe { libc::kill(child, libc::SIGKILL) };
+    assert_eq!(kill_ret, 0, "繁中說明：殘留 child 的清理 signal 應成功");
     assert!(
         poll_until(LONG_TIMEOUT, || !pid_alive(child)),
         "繁中說明：測試結束應清理殘留子程序"

@@ -293,19 +293,31 @@ fn resize_updates_pty_and_screen() {
     let holder = FixtureSession::spawn("echo_agent.sh", &[]);
     let session = &holder.session;
     session.resize(100, 30).expect("繁中說明：resize 應成功");
+    // 先 resize 再 subscribe：斷言 Snapshot 已反映新尺寸；之後才寫 size，
+    // 避免回覆先被 snapshot 包含而再無 Output（正確實作也會 timeout）。
+    // Snapshot 形狀依 plan T3（generation／seq／cols／rows／ansi）。
+    let (snapshot, sub): (Snapshot, _) = session.subscribe();
+    assert_eq!(
+        snapshot.cols, 100,
+        "繁中說明：Snapshot 應反映 resize 後的 cols"
+    );
+    assert_eq!(
+        snapshot.rows, 30,
+        "繁中說明：Snapshot 應反映 resize 後的 rows"
+    );
     write_line(session, "size");
-    let (_snapshot, sub) = session.subscribe();
-    // PTY 輸出可能分 chunk 到達，累積後再比對，避免跨 chunk 邊界漏判。
+    // PTY 輸出可能分 chunk 到達：累積後以完整行比對，trim 後恰為 "30 100"
+    //（stty size 印「行 列」），不是兩個不相干的數字子字串。
     let start = Instant::now();
     let mut buffered: Vec<u8> = Vec::new();
-    let mut ok = false;
+    let mut matched = false;
     while start.elapsed() < LONG_TIMEOUT {
         match sub.recv_timeout(RECV_TIMEOUT) {
             Ok(StreamEvent::Output { bytes, .. }) => {
                 buffered.extend_from_slice(&bytes);
                 let text = String::from_utf8_lossy(&buffered);
-                if text.contains("30") && text.contains("100") {
-                    ok = true;
+                if text.lines().any(|line| line.trim() == "30 100") {
+                    matched = true;
                     break;
                 }
             }
@@ -314,7 +326,8 @@ fn resize_updates_pty_and_screen() {
         }
     }
     assert!(
-        ok,
-        "繁中說明：resize 到 100x30 後 echo size 應回 30 100（行 列）"
+        matched,
+        "繁中說明：resize 到 100x30 後應收到恰為「30 100」的完整行，最後觀測為 {:?}",
+        String::from_utf8_lossy(&buffered)
     );
 }
