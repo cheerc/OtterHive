@@ -731,4 +731,167 @@ mod ownership_tests {
             "繁中說明：reap 應恰一次"
         );
     }
+
+    #[test]
+    fn no_exit_event_never_excludes_leader() {
+        // probe 始終 Alive，即 waitid 回 0 但 si_pid==0（尚無 exit 事件）：
+        // 即使列舉僅含 leader 本人，也不得把它當已退出排除 → Unproven，
+        // residuals 含 leader，零 reap。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        match outcome {
+            StopOutcome::Unproven { residual_pids } => {
+                assert!(
+                    residual_pids.contains(&4242),
+                    "繁中說明：無 exit 事件時 residuals 應含 leader，實際為 {residual_pids:?}"
+                );
+            }
+            other => panic!("繁中說明：無 exit 事件不得授權排除，實際為 {other:?}"),
+        }
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            2,
+            "繁中說明：應發 TERM 後升級 KILL（leader 未清空）"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：無 exit 事件不得 reap"
+        );
+    }
+
+    #[test]
+    fn revocation_beats_waitability() {
+        // probe 已 Exited（zombie 仍 waitable），但 lease 已撤銷：
+        // 撤銷檢查優先於一切驗證 → Unproven，零 signal、零 reap。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        lease.revoke();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：已撤銷 lease 即使 zombie 可 wait 仍應回 Unproven，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：撤銷後不得發任何 signal"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：撤銷後不得 reap"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_never_owns_zombie_cleanup() {
+        // RecordedLeader＋probe Exited＋start 相符＋列舉僅 zombie → 仍 Unproven。
+        // OS 查得到身分也不構成 ownership：只有 owned lease 可授權清理。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
+        );
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：RecordedLeader 永不授權 zombie 清理，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：RecordedLeader 不得發任何 signal"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
+        );
+    }
+
+    #[test]
+    fn zombie_branch_treats_esrch_pgid_as_expected() {
+        // probe 已退出、pgid 查回 raw-errno ECHILD → 仍可 Stopped（不升級）。
+        // zombie 的 getpgid 回 ESRCH 為預期，不當查詢失敗；production 必須以
+        // raw errno 區分 ECHILD 與暫時性失敗，不可把所有錯誤混為一談。
+        assert_eq!(
+            StepErr::Echild.to_io("pgid").raw_os_error(),
+            Some(libc::ECHILD),
+            "繁中說明：pgid 的 ECHILD 映射必須攜帶 raw errno"
+        );
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Err(StepErr::Echild)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：zombie 分支 pgid ESRCH 為預期，應回 Stopped 且不升級，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            1,
+            "繁中說明：清理完成應 reap 恰一次"
+        );
+    }
+
+    #[test]
+    fn zombie_branch_with_transient_pgid_failure_is_unproven() {
+        // 對照：同上但 pgid 為暫時性失敗 → Unproven（不可與 ESRCH 混為一談）。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Err(StepErr::Transient)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(vec![4242])],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：pgid 暫時性失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：pgid 暫時性失敗不得 reap"
+        );
+    }
 }
