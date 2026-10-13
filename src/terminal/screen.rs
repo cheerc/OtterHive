@@ -49,8 +49,10 @@ fn reference(cols: u16, rows: u16, feed: &[u8]) -> Term<VoidListener> {
         columns: cols as usize,
         screen_lines: rows as usize,
     };
-    let (mut term, mut processor) =
-        (Term::new(config, &size, VoidListener), Processor::new());
+    // Processor 的 Timeout 型別參數必須顯式指定為預設的 StdSyncHandler；
+    // 放在 tuple 中無法推導，會造成 E0283。
+    let mut term = Term::new(config, &size, VoidListener);
+    let mut processor: Processor = Processor::new();
     processor.advance(&mut term, feed);
     term
 }
@@ -244,11 +246,26 @@ fn plain_lines_trims_trailing_blanks() {
 #[test]
 fn plain_lines_trims_only_the_end_and_keeps_leading_blanks() {
     let mut screen = Screen::new(20, 3);
-    screen.feed(b"\x1b[2;3H  pad  ");
+    // CUP 2;1H 移到第 2 行最左，再寫入兩個前導空格。
+    // （若用 2;3H，畫面會保留前兩格空白，結果會是四個前導空格。）
+    screen.feed(b"\x1b[2;1H  pad  ");
 
     assert_eq!(
         screen.plain_lines()[1], "  pad",
         "行首空格有意義應保留，行尾應被 trim，實際：{:?}",
+        screen.plain_lines()[1]
+    );
+}
+
+#[test]
+fn plain_lines_keeps_blanks_left_by_cursor_positioning() {
+    // CUP 2;3H 跳過前兩格，那兩格是畫面上真實的空白，不該被當成「不存在」。
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"\x1b[2;3H  pad  ");
+
+    assert_eq!(
+        screen.plain_lines()[1], "    pad",
+        "游標定位留下的前導空白也要保留，實際：{:?}",
         screen.plain_lines()[1]
     );
 }
@@ -293,7 +310,8 @@ fn plain_lines_splits_on_rows() {
 
 #[test]
 fn plain_lines_reports_empty_rows_for_unused_lines() {
-    let mut screen = Screen::new(10, 4);
+    // 欄數必須大於文字長度，否則文字會自動換行，測試會自行製造出預期外的內容。
+    let mut screen = Screen::new(20, 4);
     screen.feed(b"only one line\r\n");
 
     let lines = screen.plain_lines();
@@ -331,10 +349,46 @@ fn render_ansi_round_trips_sgr_colors_and_basic_styles() {
     let mut screen = Screen::new(30, 4);
     screen.feed(
         b"\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \
-          \x1b[7minverse\x1b[0m \x1b[2mdim\x1b[0m \
+          \x1b[7minverse\x1b[0m \x1b[2mdim\x1b[0m \x1b[9mstrike\x1b[0m \
           \x1b[38;2;10;20;30mfg-rgb\x1b[0m \x1b[48;2;40;50;60mbg-rgb\x1b[0m",
     );
     assert_render_round_trips(&screen, 30, 4, "SGR 顏色與基本樣式");
+}
+
+#[test]
+fn render_ansi_preserves_every_basic_style_flag() {
+    // 六種基本樣式旗標都要能被 dump 與重播保留。這裡逐項斷言來源畫面的旗標，
+    // 確保 round-trip 測試不會因為某一項從未被設定而假通過。
+    let mut screen = Screen::new(60, 4);
+    screen.feed(
+        b"\x1b[1mb\x1b[0m\x1b[3mi\x1b[0m\x1b[4mu\x1b[0m\
+          \x1b[7mv\x1b[0m\x1b[2md\x1b[0m\x1b[9ms",
+    );
+
+    let views = cell_views(term_of(&screen), 60, 4);
+    let row = &views[0];
+    assert_eq!(row[0].char, 'b', "col0 應為 bold");
+    assert_eq!(row[1].char, 'i', "col1 應為 italic");
+    assert_eq!(row[2].char, 'u', "col2 應為 underline");
+    assert_eq!(row[3].char, 'v', "col3 應為 inverse");
+    assert_eq!(row[4].char, 'd', "col4 應為 dim");
+    assert_eq!(row[5].char, 's', "col5 應為 strikethrough");
+
+    assert!(row[0].bold, "bold 旗標應被設定");
+    assert!(row[1].italic, "italic 旗標應被設定");
+    assert!(row[2].underline, "underline 旗標應被設定");
+    assert!(row[3].inverse, "inverse 旗標應被設定");
+    assert!(row[4].dim, "dim 旗標應被設定");
+    assert!(
+        row[5].strikethrough,
+        "strikethrough 旗標應被設定（此測試不可漏掉 SGR 9）"
+    );
+
+    // 每種樣式都不該污染到下一格。
+    assert!(!row[1].bold, "bold 不應外溢到下一格");
+    assert!(!row[5].italic, "strikethrough 之外不應殘留其他樣式");
+
+    assert_render_round_trips(&screen, 60, 4, "六種基本樣式旗標");
 }
 
 #[test]
@@ -369,6 +423,45 @@ fn render_ansi_restores_default_attributes_after_reset() {
     assert!(
         !unstyled.bold && !unstyled.fg.is_non_default(),
         "reset 後的文字不應沿用前一段的樣式，實際：{unstyled:?}"
+    );
+}
+
+#[test]
+fn render_ansi_round_trips_reset_across_the_replay_boundary() {
+    // 純樣式 snapshot 的重繪必須跨過「樣式結束處」恢復預設，否則下一段文字
+    // 會被前一段的樣式污染。
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"\x1b[1;31mstyled\x1b[0m unstyled");
+
+    let rendered = screen.render_ansi();
+    let replay = reference(20, 3, &rendered);
+    let replayed = cell_views(&replay, 20, 3);
+
+    // 重播後，前段仍帶樣式，後段仍回到預設。
+    assert!(replayed[0][0].bold, "重播後前段仍應為粗體");
+    assert!(
+        replayed[0][0].fg.is_non_default(),
+        "重播後前段仍應有非預設前景色，實際：{:?}",
+        replayed[0][0].fg
+    );
+    assert!(
+        !replayed[0][6].bold && !replayed[0][6].fg.is_non_default(),
+        "重播後樣式必須已被 reset：第 7 格應回到預設，實際：{:?}",
+        replayed[0][6]
+    );
+    assert!(
+        replayed[0][0].fg != replayed[0][6].fg,
+        "重播後前段與 reset 後的格子前景色應不同（樣式確實有被 reset）"
+    );
+    assert!(
+        !replayed[0][7].bold,
+        "重播後後段不應沿用前段的粗體，實際：{:?}",
+        replayed[0][7]
+    );
+    assert!(
+        !replayed[0][7].fg.is_non_default(),
+        "重播後後段前景色應回到預設，實際：{:?}",
+        replayed[0][7].fg
     );
 }
 
@@ -420,20 +513,52 @@ fn render_ansi_round_trips_cursor_position_after_movement() {
 
 #[test]
 fn render_ansi_round_trips_cursor_over_a_wide_char() {
-    // 游標停在寬字元的 spacer 格上。spacer 不是可獨立定位的 cell，
-    // 顯示上應落在該寬字元本身。
-    let mut screen = Screen::new(20, 3);
+    // 讓寬字元剛好填滿整列，游標會停在最後一個寬字元的 spacer 格上。
+    // 先斷言這個前提確實成立，否則這個邊界等於沒測到。
+    let mut screen = Screen::new(4, 3);
     screen.feed("中中".as_bytes());
 
     let original_cursor = term_of(&screen).grid().cursor.point;
+    assert!(
+        term_of(&screen).grid()[original_cursor]
+            .flags
+            .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER),
+        "前提：寬字元剛好填滿整列時，原始游標應停在 spacer 格上，實際游標在 \
+         {original_cursor:?}"
+    );
+
     let rendered = screen.render_ansi();
 
-    let replay = reference(20, 3, &rendered);
+    let replay = reference(4, 3, &rendered);
     let replay_cursor = replay.grid().cursor.point;
 
     assert_eq!(
         replay_cursor, original_cursor,
         "游標位於寬字元 spacer 時仍須正確往返：原 {original_cursor:?}，還原後 {replay_cursor:?}"
+    );
+}
+
+#[test]
+fn render_ansi_round_trips_cursor_not_on_a_spacer() {
+    // 反向情境：寬字元後還有空欄時，游標落在一般空格，不在 spacer 上。
+    // 這個測試確保實作不會無條件把游標回退一格。
+    let mut screen = Screen::new(20, 3);
+    screen.feed("中中".as_bytes());
+
+    let original_cursor = term_of(&screen).grid().cursor.point;
+    assert!(
+        !term_of(&screen).grid()[original_cursor]
+            .flags
+            .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER),
+        "前提：欄數足夠時游標不應停在 spacer，實際游標在 {original_cursor:?}"
+    );
+
+    let replay = reference(20, 3, &screen.render_ansi());
+
+    assert_eq!(
+        replay.grid().cursor.point,
+        original_cursor,
+        "游標不在 spacer 上時應原樣往返，不得被回退"
     );
 }
 

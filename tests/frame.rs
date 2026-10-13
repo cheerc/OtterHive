@@ -206,23 +206,101 @@ fn input_payload_starts_with_eight_byte_big_endian_generation() {
 }
 
 #[test]
-fn resize_payload_encodes_generation_cols_and_rows_as_big_endian() {
+fn resize_payload_is_json_with_generation_cols_and_rows() {
     // 契約 §7.2：Resize 內容 = JSON {"generation","cols","rows"}。
-    // 測試只驗 layout 可手工切出三個欄位，不固定 JSON 的空白與鍵序。
+    //
+    // Resize 的 payload 是 **JSON 文字**，不是二進位欄位，因此這裡不宣稱任何
+    // big-endian 編碼 —— BE 只適用於 frame 長度前綴、Output 的 seq 與 Input 的
+    // generation 這三個二進位欄位。測試只驗 JSON 可被解析出三個欄位及其型別。
     let json = br#"{"generation":2,"cols":100,"rows":30}"#;
     let encoded = encode_frame(TAG_RESIZE, json);
     let (tag, _, body) = parse_wire(&encoded);
     assert_eq!(tag, TAG_RESIZE);
+    assert_eq!(body, json.as_slice(), "payload 應原樣保留 JSON bytes");
+
+    // 真正解析 JSON，確認欄位名稱、型別與值，而不是只做字串包含檢查。
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).expect("Resize payload 應是有效的 JSON");
+    let object = parsed.as_object().expect("Resize payload 應是 JSON 物件");
+    assert_eq!(
+        object.len(),
+        3,
+        "Resize JSON 應恰有 generation/cols/rows 三個欄位，實際：{object:?}"
+    );
+    assert_eq!(
+        object.get("generation").and_then(serde_json::Value::as_u64),
+        Some(2),
+        "generation 應是整數 2"
+    );
+    assert_eq!(
+        object.get("cols").and_then(serde_json::Value::as_u64),
+        Some(100),
+        "cols 應是整數 100"
+    );
+    assert_eq!(
+        object.get("rows").and_then(serde_json::Value::as_u64),
+        Some(30),
+        "rows 應是整數 30"
+    );
+}
+
+#[test]
+fn ended_payload_is_json_with_generation_and_reason() {
+    // 契約 §7.2：Ended 內容 = JSON {"generation","reason"}。
+    let json = br#"{"generation":4,"reason":"exit"}"#;
+    let encoded = encode_frame(TAG_ENDED, json);
+    let (tag, _, body) = parse_wire(&encoded);
+    assert_eq!(tag, TAG_ENDED);
     assert_eq!(body, json.as_slice());
 
-    // 逐欄位確認可被獨立解析。
-    let text = std::str::from_utf8(body).expect("Resize payload 應是 UTF-8 JSON");
-    for key in ["\"generation\"", "\"cols\"", "\"rows\""] {
-        assert!(
-            text.contains(key),
-            "Resize JSON 應含欄位 {key}，實際：{text}"
-        );
-    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).expect("Ended payload 應是有效的 JSON");
+    let object = parsed.as_object().expect("Ended payload 應是 JSON 物件");
+    assert_eq!(
+        object.len(),
+        2,
+        "Ended JSON 應恰有 generation/reason 兩個欄位，實際：{object:?}"
+    );
+    assert_eq!(
+        object.get("generation").and_then(serde_json::Value::as_u64),
+        Some(4),
+        "generation 應是整數 4"
+    );
+    assert_eq!(
+        object.get("reason").and_then(serde_json::Value::as_str),
+        Some("exit"),
+        "reason 應是字串 \"exit\""
+    );
+}
+
+#[test]
+fn error_payload_is_json_with_code_and_message() {
+    // 契約 §7.2：Error 內容 = JSON {"code","message"}。
+    // byte string literal 只能是 ASCII，因此中文訊息用 str 再轉 bytes。
+    let json: &[u8] = r#"{"code":"stale_generation","message":"世代不符"}"#.as_bytes();
+    let encoded = encode_frame(TAG_ERROR, json);
+    let (tag, _, body) = parse_wire(&encoded);
+    assert_eq!(tag, TAG_ERROR);
+    assert_eq!(body, json, "payload 應原樣保留 JSON bytes");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).expect("Error payload 應是有效的 JSON");
+    let object = parsed.as_object().expect("Error payload 應是 JSON 物件");
+    assert_eq!(
+        object.len(),
+        2,
+        "Error JSON 應恰有 code/message 兩個欄位，實際：{object:?}"
+    );
+    assert_eq!(
+        object.get("code").and_then(serde_json::Value::as_str),
+        Some("stale_generation"),
+        "code 應是字串 \"stale_generation\""
+    );
+    assert_eq!(
+        object.get("message").and_then(serde_json::Value::as_str),
+        Some("世代不符"),
+        "message 應保留原字串"
+    );
 }
 
 // --- 4. 1 MiB 界限 ---
@@ -258,18 +336,20 @@ fn payload_exactly_at_limit_is_accepted() {
 }
 
 #[test]
-fn payload_one_byte_over_limit_is_rejected() {
+fn payload_one_byte_over_limit_is_rejected_by_the_reader() {
     let payload = vec![0x5Au8; MAX_FRAME_BYTES + 1];
 
-    // 寫入端：encode_frame 的既定回傳型別是 Vec<u8>，因此超出上限時不允許靜默
-    // 產出一個超大 frame。RED 階段先記錄期望，待 GREEN 決定是走 additive 的
-    // fallible helper 還是在 encode 階段就拒絕。
+    // 本測試只驗證 **decoder 拒絕** 超限 payload。
+    //
+    // 寫入端屬 T4：`encode_frame` 的既定回傳型別是 `Vec<u8>`，本輪不提供 fallible
+    // 版本，因此這裡不斷言寫入端會拒絕，也不宣稱已拒絕 —— 有界寫入會在 T4
+    // socket 寫入前補 RED 驗證。
     let encoded = encode_frame(TAG_OUTPUT, &payload);
     let (_, declared_len, _) = parse_wire(&encoded);
     assert_eq!(
         declared_len,
         MAX_FRAME_BYTES + 1,
-        "若 encode_frame 原樣編碼，宣告長度會是上限 +1"
+        "前提：宣告長度應為上限 +1"
     );
 
     // 讀取端必須拒絕這個 frame（daemon 端遇此情形會關閉連線）。
