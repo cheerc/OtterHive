@@ -24,6 +24,15 @@ pub const MEMBER_KNOWN_KEYS: [&str; 10] = [
     "working_directory",
 ];
 
+/// 成員名稱規則（契約 §4.1）：1–64 字元，只含 `[A-Za-z0-9_-]`，不得為 `operator`。
+const RESERVED_NAME: &str = "operator";
+
+/// 解析後的成員，包含成員本身與它不生效的欄位路徑。
+struct ParsedMember {
+    member: TemplateMember,
+    ignored_fields: Vec<String>,
+}
+
 /// `templates.<name>` 會採用的頂層鍵；其餘鍵不生效但要列入 ignored fields。
 pub const TEMPLATE_KNOWN_KEYS: [&str; 2] = ["orchestrator", "instances"];
 
@@ -235,7 +244,10 @@ fn parse_template(name: &str, value: &serde_yaml_ng::Value) -> Result<Template, 
                 }
             }
             "instances" => {
-                template.instances = parse_instances(name, value)?;
+                let (instances, member_ignored) = parse_instances(name, value)?;
+                template.instances = instances;
+                // 成員層級的不生效欄位也要回報（契約 §8.2）。
+                template.ignored_fields.extend(member_ignored);
             }
             other => {
                 // 其他鍵（例如 source_repo、project_id、github_login）不生效，
@@ -247,13 +259,24 @@ fn parse_template(name: &str, value: &serde_yaml_ng::Value) -> Result<Template, 
         }
     }
 
+    // 契約 §8.2：orchestrator 必須是 instances 其中之一；缺漏或不符回 invalid_argument。
+    let orchestrator = template.orchestrator.as_deref().ok_or_else(|| {
+        invalid_template(name, "orchestrator 必須存在，且必須是 instances 其中之一")
+    })?;
+    if !template.instances.contains_key(orchestrator) {
+        return Err(invalid_template(
+            name,
+            &format!("orchestrator {orchestrator} 不在 instances 的成員之中"),
+        ));
+    }
+
     Ok(template)
 }
 
 fn parse_instances(
     template_name: &str,
     value: &serde_yaml_ng::Value,
-) -> Result<BTreeMap<String, TemplateMember>, ConfigError> {
+) -> Result<(BTreeMap<String, TemplateMember>, Vec<String>), ConfigError> {
     let mapping = match value {
         serde_yaml_ng::Value::Mapping(mapping) => mapping,
         // 契約 §8.2：instances 必須是非空物件。
@@ -264,6 +287,7 @@ fn parse_instances(
     }
 
     let mut instances = BTreeMap::new();
+    let mut ignored_fields = Vec::new();
     for (key, value) in mapping {
         let member_name = match key.as_str() {
             Some(member_name) => member_name.to_string(),
@@ -274,17 +298,51 @@ fn parse_instances(
                 ))
             }
         };
-        let member = parse_member(template_name, &member_name, value)?;
-        instances.insert(member_name, member);
+        // 契約 §8.2：member key 遵守 §4.1 名稱規則。
+        validate_member_name(template_name, &member_name)?;
+        let parsed = parse_member(template_name, &member_name, value)?;
+        ignored_fields.extend(parsed.ignored_fields);
+        instances.insert(member_name, parsed.member);
     }
-    Ok(instances)
+    Ok((instances, ignored_fields))
+}
+
+/// 契約 §8.2：member key 遵守 §4.1 名稱規則。
+fn validate_member_name(template_name: &str, member_name: &str) -> Result<(), ConfigError> {
+    let valid_charset = !member_name.is_empty()
+        && member_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    let too_long = member_name.chars().count() > 64;
+    if !valid_charset {
+        return Err(invalid_member(
+            template_name,
+            member_name,
+            "成員名稱只能含 [A-Za-z0-9_-] 且長度為 1–64",
+        ));
+    }
+    if too_long {
+        return Err(invalid_member(
+            template_name,
+            member_name,
+            "成員名稱長度不得超過 64 字元",
+        ));
+    }
+    if member_name == RESERVED_NAME {
+        return Err(invalid_member(
+            template_name,
+            member_name,
+            "成員名稱不得為 operator",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_member(
     template_name: &str,
     member_name: &str,
     value: &serde_yaml_ng::Value,
-) -> Result<TemplateMember, ConfigError> {
+) -> Result<ParsedMember, ConfigError> {
     let mapping = match value {
         serde_yaml_ng::Value::Mapping(mapping) => mapping,
         serde_yaml_ng::Value::Null => {
@@ -333,7 +391,10 @@ fn parse_member(
         }
     }
 
-    Ok(member)
+    Ok(ParsedMember {
+        member,
+        ignored_fields,
+    })
 }
 
 fn parse_env(value: &serde_yaml_ng::Value) -> Result<BTreeMap<String, String>, ConfigError> {

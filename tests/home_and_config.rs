@@ -127,3 +127,165 @@ fn config_rejects_unknown_top_level_keys() {
     assert!(empty.managers.is_empty(), "空設定的 managers 應為空");
     assert!(empty.templates.is_empty(), "空設定的 templates 應為空");
 }
+
+/// 寫入設定內容並回傳路徑，讓每個案例各自擁有獨立檔案。
+fn write_config(directory: &Path, name: &str, contents: &str) -> std::path::PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, contents).expect("寫入測試用 otterhive.yaml");
+    path
+}
+
+#[test]
+fn member_level_ignored_fields_are_collected_into_template() {
+    let temp = tempdir().expect("建立暫存目錄");
+    let config_path = write_config(
+        temp.path(),
+        "member-ignored.yaml",
+        "templates:\n  team-a:\n    orchestrator: lead\n    instances:\n      lead:\n        role: coordinator\n        tmux_pane: '%3'\n        legacy_note: 舊版備註\n",
+    );
+
+    let config = Config::load(&config_path).expect("成員層的不生效欄位不應讓載入失敗");
+    let template = config
+        .templates
+        .get("team-a")
+        .expect("載入後應保留 team-a template");
+
+    // 成員層的不生效欄位必須回報，且帶完整點分路徑以指回來源。
+    for ignored_field in ["tmux_pane", "legacy_note"] {
+        let expected_path = format!("templates.team-a.instances.lead.{ignored_field}");
+        assert!(
+            template.ignored_fields.contains(&expected_path),
+            "成員層的 ignored field 應回報 {expected_path}，實際為 {:?}",
+            template.ignored_fields
+        );
+    }
+
+    // template 層級的 ignored field 仍要一併保留，兩者不可互相覆蓋。
+    assert!(
+        !template
+            .ignored_fields
+            .iter()
+            .any(|path| path == "templates.team-a.role"),
+        "成員欄位不得被誤報為 template 層級欄位：{:?}",
+        template.ignored_fields
+    );
+    assert_eq!(
+        template
+            .instances
+            .get("lead")
+            .map(|member| member.role.as_deref()),
+        Some(Some("coordinator")),
+        "成員本身仍應正確解析 role"
+    );
+}
+
+#[test]
+fn orchestrator_must_be_one_of_the_template_members() {
+    let temp = tempdir().expect("建立暫存目錄");
+
+    // orchestrator 指向不存在的成員。
+    let not_a_member = write_config(
+        temp.path(),
+        "orchestrator-missing.yaml",
+        "templates:\n  team-a:\n    orchestrator: ghost\n    instances:\n      lead:\n        role: coordinator\n",
+    );
+    let error =
+        Config::load(&not_a_member).expect_err("orchestrator 不在 instances 之中時應被拒絕");
+    let message = error.to_string();
+    assert!(
+        message.contains("orchestrator") && message.contains("ghost"),
+        "錯誤訊息應指出 orchestrator 與其值，實際訊息：{message}"
+    );
+
+    // 完全缺少 orchestrator。
+    let absent = write_config(
+        temp.path(),
+        "orchestrator-absent.yaml",
+        "templates:\n  team-a:\n    instances:\n      lead:\n        role: coordinator\n",
+    );
+    let error = Config::load(&absent).expect_err("缺少 orchestrator 時應被拒絕");
+    assert!(
+        error.to_string().contains("orchestrator"),
+        "錯誤訊息應指出缺少 orchestrator，實際訊息：{error}"
+    );
+
+    // orchestrator 是合法成員時應通過。
+    let valid = write_config(
+        temp.path(),
+        "orchestrator-valid.yaml",
+        "templates:\n  team-a:\n    orchestrator: lead\n    instances:\n      lead:\n        role: coordinator\n",
+    );
+    let config = Config::load(&valid).expect("orchestrator 是成員之一時應載入成功");
+    assert_eq!(
+        config
+            .templates
+            .get("team-a")
+            .and_then(|template| template.orchestrator.as_deref()),
+        Some("lead")
+    );
+}
+
+#[test]
+fn template_member_names_must_follow_instance_name_rules() {
+    let temp = tempdir().expect("建立暫存目錄");
+
+    for (file_name, member_name, reason) in [
+        ("member-operator.yaml", "operator", "不得為保留名 operator"),
+        ("member-dot.yaml", "bad.name", "不得含小數點"),
+        ("member-space.yaml", "bad name", "不得含空白"),
+        ("member-slash.yaml", "bad/name", "不得含斜線"),
+    ] {
+        let config_path = write_config(
+            temp.path(),
+            file_name,
+            &format!(
+                "templates:\n  team-a:\n    orchestrator: {member_name}\n    instances:\n      {member_name}:\n        role: coordinator\n"
+            ),
+        );
+        let error = Config::load(&config_path)
+            .expect_err(&format!("成員名稱違反 §4.1 規則時應被拒絕：{reason}"));
+        let message = error.to_string();
+        assert!(
+            message.contains("instances"),
+            "錯誤訊息應指出問題出在 instances 之下，實際訊息：{message}"
+        );
+        assert!(
+            message.contains(member_name),
+            "錯誤訊息應指出無效的成員名稱 {member_name}，實際訊息：{message}"
+        );
+    }
+
+    // 65 個字元超出上限。
+    let too_long = "a".repeat(65);
+    let config_path = write_config(
+        temp.path(),
+        "member-too-long.yaml",
+        &format!(
+            "templates:\n  team-a:\n    orchestrator: {too_long}\n    instances:\n      {too_long}:\n        role: coordinator\n"
+        ),
+    );
+    let error = Config::load(&config_path).expect_err("成員名稱超過 64 字元時應被拒絕");
+    assert!(
+        error.to_string().contains("64"),
+        "錯誤訊息應指出 64 字元上限，實際訊息：{error}"
+    );
+
+    // 剛好 64 字元應通過。
+    let at_limit = "a".repeat(64);
+    let config_path = write_config(
+        temp.path(),
+        "member-at-limit.yaml",
+        &format!(
+            "templates:\n  team-a:\n    orchestrator: {at_limit}\n    instances:\n      {at_limit}:\n        role: coordinator\n"
+        ),
+    );
+    Config::load(&config_path).expect("成員名稱剛好 64 字元應可載入");
+
+    // 保留底線與連字元的合法名稱應通過。
+    let config_path = write_config(
+        temp.path(),
+        "member-legal.yaml",
+        "templates:\n  team-a:\n    orchestrator: lead_1\n    instances:\n      lead_1:\n        role: coordinator\n",
+    );
+    Config::load(&config_path).expect("含底線與數字的名稱應可載入");
+}

@@ -354,13 +354,11 @@ pub fn admit(op: &str, args: &Value) -> Result<(), OpError> {
         }
     }
 
-    // action 值：省略視為 drain（只對 inbox 有意義）；舊版 action 拒收，未知值無效。
+    // action 值：省略即為 drain；字面的 action 須列於 supported_actions，
+    // 舊版 action 拒收，未知值無效。
     if let Some(action) = map.and_then(|map| map.get("action")) {
         match str_value(action) {
-            Some(value)
-                if spec.supported_actions.contains(&value)
-                    || (spec.supported_actions.is_empty() && value == "drain") =>
-            {
+            Some(value) if spec.supported_actions.contains(&value) => {
                 // 接受。
             }
             Some(value) if spec.legacy_actions.contains(&value) => {
