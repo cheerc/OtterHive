@@ -10,9 +10,10 @@
 
 ## 目前狀態
 
-- 已完成：P0（本 repo 的 `docs/`、`scripts/research/`、`tests/fixtures/backends/capture_stub.sh`）。
-- `origin`（`github.com/cheerc/OtterHive`，private）已設定，`main` 已同步為 `c174be2`。
-- 本計畫開始 T2 實作，建立基礎 crate、CI 與 RED 測試。
+- 已完成：P0 與 T2（protocol、admission、home、config、store）；T2 已經由 PR #1 合併。
+- T3 基準：`main`／`origin/main` 為 `b1a42b45f9f65bc2d4ccfc26f7f3378768f90840`；本包使用獨立整合分支，不直接修改 main。
+- T3 已集中 GREEN（本分支 HEAD，b8 審查修復後本地重跑）：procs（`arg=1` zombie 查詢、zombie-pgid 判 raw-errno ESRCH／probe 判 ECHILD、fallible list／reap、單一 lifecycle lock 直取）、terminal Session（reader＋observer JoinHandle、snapshot／seq／resync、resize／input）、Screen（VT 重繪、CJK／寬字元／合併音符、游標）、frame（1 MiB 界限、partial reader）。`cargo test --locked --all-targets` 全綠 106 passed（lib 48＋frame 19＋home_and_config 7＋process_arg1 2＋process_stop 11＋protocol_admission 8＋store_recovery 6＋terminal_session 5）；`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --doc` 通過。
+- H1／H2 已由整合測試驗證（`spawned_child_leads_its_process_group`、`process_start_time_is_stable_for_a_live_pid`）；H3 由 Screen 語意 round-trip 測試驗證；H8 由 `leader_exit_observation_keeps_the_owned_child_unreaped`（WNOWAIT 重複觀測＋`arg=1` 重驗）、`stop_after_leader_exit_cleans_remaining_group_members`、`recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group`、`revoked_lease_on_reused_group_makes_zero_signals`、`concurrent_stops_serialize_on_one_lock_with_exactly_one_reap` 覆蓋。調查證據在工作樹 `evidence/t3-h8-spike/`（未提交，不進 PR）。待雙 review 後發 PR #2。
 
 ## 全域約束
 
@@ -44,7 +45,7 @@
 | H5 | 真 Claude Code 能以 stdio 連上 bridge（回傳它要求的 `protocolVersion`） | native canary | T8 |
 | H6 | 安裝中的 Claude 版本支援 `--append-system-prompt-file`、`--mcp-config`、`--continue`、`--effort` | native canary | T8 |
 | H7 | 提示注入不會破壞 Claude 輸入框中的既有內容 | native canary | T8 |
-| H8 | macOS 可用 `waitid(WEXITED \| WNOHANG \| WNOWAIT)` 觀測 leader exit 而不 reap，保留 child 身分到 group 清理完成；portable-pty 的 child API 不會在其他路徑提前 reap | T3 查核 macOS waitid 文件與 portable-pty 0.9 的 wait／try_wait／Drop 路徑；以 `leader_exit_observation_keeps_the_owned_child_unreaped`、`stop_after_leader_exit_cleans_remaining_group_members`、`revoked_leader_lease_cannot_signal_a_reused_group` 驗證。不能保留或重新驗證 lease 就停止回報，不以「非空 group」假設替代證據 | T3 |
+| H8 | macOS 可用 `waitid(WEXITED \| WNOHANG \| WNOWAIT)` 觀測 leader exit 而不 reap，保留 child 身分到 group 清理完成；portable-pty 的 child API 不會在其他路徑提前 reap | T3 查核 macOS waitid 文件與 portable-pty 0.9 的 wait／try_wait／Drop 路徑；以 `leader_exit_observation_keeps_the_owned_child_unreaped`、`stop_after_leader_exit_cleans_remaining_group_members`、`revoked_lease_on_reused_group_makes_zero_signals` 驗證。不能保留或重新驗證 lease 就停止回報，不以「非空 group」假設替代證據 | T3 |
 
 ## 檔案與模組
 
@@ -60,7 +61,7 @@
 | `src/procs.rs` | 程序啟動時間、group 是否還有成員、有證據的停止 | T3 |
 | `src/terminal/screen.rs` | VT 包裝：餵入 bytes、ANSI 重繪 snapshot、純文字列 | T3 |
 | `src/terminal/session.rs` | PTY spawn、讀取執行緒、訂閱者、input、resize、等待結束 | T3 |
-| `src/terminal/frame.rs` | §7.2 frame 編解碼 | T3 |
+| `src/terminal/frame.rs` | §7.2 frame 編解碼；socket 寫入用的 `try_encode_frame` 有界編碼 | T3 |
 | `src/backend/{mod,claude,command}.rs` | 啟動參數、協調提示與 MCP 設定物化、skills symlink、resume 證據 | T4 |
 | `src/daemon/{mod,auth,lifecycle,recovery}.rs` | socket 服務、授權、lifecycle 操作、daemon 重啟後收斂 | T4 |
 | `src/client.rs` | 送請求、讀回應；CLI、bridge、測試共用 | T4 |
@@ -113,7 +114,7 @@ CREATE TABLE journal(id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT, gen
 | `capture_stub.sh` | 已存在：印出 ready 標記與 CJK／ANSI 後結束 | P0 |
 | `echo_agent.sh` | 印 `ready>`；逐行讀 stdin，把每行（含 ESC 等原始 bytes 的十六進位）附加到 `$OTTERHIVE_FIXTURE_LOG`，並回印 `echo: <行>`；收到 `size` 時印出 `stty size`；收到 `flood` 時持續輸出直到收到 `stop` | T3 |
 | `crash_on_start.sh` | 立即 `exit 3` | T3 |
-| `ignore_term.sh` | `trap '' TERM`；印 ready 後無限等待 | T3 |
+| `ignore_term.sh` | `trap '' TERM`；trap 生效後才印 ready marker（`ignore-term-ready`），測試等到該行才發 signal（避免 TERM 早於 trap 到達），之後無限等待 | T3 |
 | `spawns_child.sh` | 在背景啟動 `sleep 600`（同一 process group），把子程序 pid 寫入 `$OTTERHIVE_FIXTURE_LOG`，然後等待；設了 `FIXTURE_LEADER_EXIT_AFTER_MS` 就在該毫秒數後自己結束，留下子程序 | T3 |
 | `fake_claude.sh` | 把收到的 argv 與 `OTTERHIVE_*` 環境變數名稱寫入 `$OTTERHIVE_FIXTURE_LOG`，之後行為同 `echo_agent.sh` | T4 |
 | `mcp_agent.py` | 以 `python3 -I` 執行。讀 PTY 輸入；遇到 `[OTTERHIVE-MSG]` 就啟動真的 `otterhive-mcp-bridge`，走 `initialize` → `tools/call inbox` → 逐則 ack。訊息內容為 `relay:<target>:<text>` 時，送 query `<text>` 給 target 並帶 `parent_id`；收到 query 時回 report `pong:<text>` 給 sender 並帶 `parent_id`；所有收到的訊息與自己的 pid 寫入 `$OTTERHIVE_FIXTURE_LOG`。bridge 路徑與 token 從 `OTTERHIVE_MCP_BRIDGE`、`OTTERHIVE_INSTANCE_TOKEN` 取得 | T5 |
@@ -203,14 +204,28 @@ pub struct Session;  impl Session {
   pub fn plain_text(&self) -> Vec<String>;
   pub fn last_output_at(&self) -> Instant;
   pub fn exit_status(&self) -> Option<ExitInfo>;                     // waitid + WNOWAIT 觀測執行緒寫入，不 reap
-  pub fn wait_exit(&self, timeout: Duration) -> Option<ExitInfo>; }   // 等待已觀測的 exit status，不 reap
+  pub fn wait_exit(&self, timeout: Duration) -> Option<ExitInfo>;   // 等待已觀測的 exit status，不 reap
+  pub fn child_is_released(&self) -> bool;                          // stop 核心完成回收後為 true
+  pub fn mark_child_released(&self);                                // stop 核心完成回收後標記
+  pub fn with_child<T>(&self, body: impl FnOnce(&dyn portable_pty::Child) -> T) -> Result<T, SpawnError>; } // 已釋放則回 Err
 pub enum StreamEvent { Output { seq: u64, bytes: Vec<u8> }, Resync { snapshot: Snapshot }, Ended }
 pub fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8>;  pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)>;
+pub fn try_encode_frame(tag: u8, payload: &[u8]) -> io::Result<Vec<u8>>;   // 有界寫入；payload 超過 MAX_FRAME_BYTES 回 InvalidData
 ```
 
 `subscriber_queue` 必須大於 0，production 預設 256；daemon 從測試設定傳入，Session 本身不讀環境變數。`Resync { snapshot }` 在同一把 Session 鎖內擷取畫面並重設訂閱邊界；socket writer 將它依序編碼成 Resync 與 Snapshot 兩個 frame。reader 的 seq 計數與 Snapshot.seq 定義依契約 §7.1，不以送到某個 client 的次數計數。
 
-`OwnedLeaderLease` 不是 LiveSession 布林旗標：只在本 daemon 確認持有 spawn 的 child 時建立，不可由 SQLite 重建。`stop_group` 每次 signal 前，在與 reap 共用的 lifecycle 鎖內驗證 lease 未撤銷、child 未被 reap、pid／啟動時間／pgid 相符；owned 路徑必須與傳入的 pid／expected_start 相符。kernel 回 ECHILD、查詢失敗或任何 reap 都使 lease 永久失效，回 Unproven／IdentityMismatch 而不 signal。group 清理完成後先撤銷 lease，再在鎖內 reap，釋放鎖後 join 執行緒；因停止無法證實而逾時時保留 Session，不無限等待 join。清理後保留畫面／Session 物件不恢復 lease。exit observer 不呼叫 portable-pty 的 wait／try_wait；H8 若不能證明 API 路徑，停在 spike，不改成舊 pgid 清理。
+`OwnedLeaderLease` 不是 LiveSession 布林旗標：只在本 daemon 確認持有 spawn 的 child 時建立，不可由 SQLite 重建。`stop_group` 每次 signal 前，在與 reap 共用的 lifecycle 鎖內驗證 lease 未撤銷、child 未被 reap、pid／啟動時間／pgid 相符；owned 路徑必須與傳入的 pid／expected_start 相符。probe 回 ECHILD（child 已被外部 reap）、查詢失敗或任何 reap 都使 lease 永久失效，回 Unproven／IdentityMismatch 而不 signal；zombie 的 getpgid 回 ESRCH 為預期形態（以綁定 pgid 繼續，後續 probe 須為 Exited），與 probe 的 ECHILD 區分。group 清理完成後先撤銷 lease，再在鎖內 reap，釋放鎖後 join 執行緒；因停止無法證實而逾時時保留 Session，不無限等待 join。清理後保留畫面／Session 物件不恢復 lease。exit observer 不呼叫 portable-pty 的 wait／try_wait；H8 若不能證明 API 路徑，停在 spike，不改成舊 pgid 清理。
+
+reap 只發生在 owned 路徑：`stop_group` 以 `waitpid(WNOHANG)` 回收**本 daemon 自己持有**的 child。`RecordedLeader`（SQLite 歷史）的 leader 是上一個 daemon incarnation 留下的，本 daemon 並非其父程序，對它 waitpid 會回 ECHILD、且 pid 重用後有搶走別人 child 的風險，因此 recovery 成功路徑**不 reap**，該 zombie 由真正的父程序回收；其停止判準是「程序不在運行」（zombie 存活但已無運行狀態），不是「pid 消失」。
+
+stop 核心完成回收後由呼叫端標記 `child_released`；此後任何觸及 Child 的路徑都經 `Session::with_child` 檢查並回 `Err`，不再落到 portable-pty 的 wait／try_wait／kill。Session 內部停止＋join 屬 T4 daemon lifecycle（T3 只驗 stop 核心與 lease 語意），屆時它取用同一把 lifecycle 鎖走同一核心，成功後標記 `child_released`、鎖外 join 執行緒。
+
+leader 已確認退出但 group 仍有其他成員時，stop 核心給一次固定的短寬限（實作常數 250ms，內部重列舉間隔）讓成員自行收尾，再重列舉、仍有成員才升級 SIGKILL。這不是契約的停止等待：契約 §4.3 的 TERM 5 秒／KILL 2 秒由 daemon 傳入 `term_wait`／`kill_wait`，不受此常數影響。
+
+frame 寫入端分兩層：`encode_frame` 是既定的 infallible `Vec<u8>` 回傳型別、不做上界檢查；socket 寫入層一律用 `try_encode_frame`，它拒絕超過 1 MiB 上限的 payload（契約 §7.2）。
+
+註：Session 內部停止＋join 屬 T4 daemon lifecycle；T3 只驗 stop 核心與 lease 語意（契約 §4.3-3 的 join 字面以此注記銜接，契約本文不動）。
 
 **Fixture：**建立 `echo_agent.sh`、`crash_on_start.sh`、`ignore_term.sh`、`spawns_child.sh`（見上方 fixture 表）。
 
@@ -228,8 +243,12 @@ pub fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8>;  pub fn read_frame(r: &
 - `leader_exit_observation_keeps_the_owned_child_unreaped`（H8）：`spawns_child.sh` 設 `FIXTURE_LEADER_EXIT_AFTER_MS`；wait_exit 取得 exit status 後仍能以 WNOWAIT 觀測同一 waitable child，lease 的 pid／啟動時間／pgid 可重新驗證；child 未在 observer／try_wait 路徑被 reap。
 - `stop_after_leader_exit_cleans_remaining_group_members`：以 `GroupEvidence::OwnedLeader(session.owned_leader_lease())` 清理剩下的 group；child 消失後才撤銷 lease 與 reap leader，stop 回 Stopped。
 - `recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group`：先清理／reap fixture leader 但保留它的子程序，再用歷史 pid／啟動時間與 `GroupEvidence::RecordedLeader` → Unproven，child 未收到 signal；測試 cleanup 使用另外保存並核對的 fixture child 身分，不以歷史 group 編號清理。
-- `revoked_leader_lease_cannot_signal_a_reused_group`：保留已完成清理的舊 Session；用測試用 OS probe／signal adapter 讓同一舊 pgid 回報無關的新 group（不實際等待 PID 重用）。由真正 stop_group 入口帶入已撤銷的 lease → Unproven，signal adapter 的呼叫數為 0；持有物件或查到非空 group 都不能恢復 lease。
-- `lease_validation_and_reap_are_serialized`：以 barrier 讓 stop 驗證／signal 與清理執行緒的 reap 競爭；同一 lifecycle 鎖保證不會在驗證後、signal 前 reap，lease 撤銷後不得發任何新 signal。
+- `revoked_lease_on_reused_group_makes_zero_signals`：保留已完成清理的舊 Session；用測試用 OS probe／signal adapter 讓同一舊 pgid 回報無關的新 group（不實際等待 PID 重用）。由真正 stop_group 入口帶入已撤銷的 lease → Unproven，signal adapter 的呼叫數為 0；持有物件或查到非空 group 都不能恢復 lease。
+- `concurrent_stops_serialize_on_one_lock_with_exactly_one_reap`：以 barrier 讓 stop 驗證／signal 與清理執行緒的 reap 競爭；同一 lifecycle 鎖保證不會在驗證後、signal 前 reap，lease 撤銷後不得發任何新 signal。
+- `recorded_leader_stops_but_never_reaps`（unit）：活體 RecordedLeader 仍授權 TERM 並回 `Stopped`，但事件全序止於 signal、reap 呼叫數為 0；recovery daemon 並非該 leader 的父程序，reap 屬真正的父程序。
+- `stalled_subscriber_gets_resync_before_ended_when_program_exits`：程式在佇列溢出（`resync_pending`）後結束時，停滯者必須先收到含最新 Snapshot 的 `Resync`、再收到 `Ended`；Resync 不加 seq，`Ended` 是最後一個事件。
+- `child_release_is_recorded_and_later_child_touch_is_refused`：stop 核心完成回收後 Child 標記為已釋放；此後 `with_child` 一律回 `Err`，不再落到 portable-pty 的 wait／try_wait／kill。
+- `try_encode_rejects_payload_over_limit`（unit）：有界寫入在 payload 超過 1 MiB 時回 `InvalidData` 且不產出 frame；恰在上限允許通過，界內與 `encode_frame` 逐位元組相同。
 - `stop_refuses_when_start_time_does_not_match`：傳入錯誤的啟動時間 → `IdentityMismatch`，程序仍存活（測試自行清理）。
 - `child_exit_is_observed`：`crash_on_start.sh` 的 exit code 3 可由 `wait_exit` 取得。
 - `frame_round_trip_and_oversize_is_rejected`：所有 tag 編解碼一致；超過 1 MiB 的長度回錯誤。
@@ -383,7 +402,7 @@ T4 建立真正可用的 `otterhive-mcp-bridge`，不是空 bin 或 fixture 替�
 
 ## 需要 operator 決定的事
 
-1. **推送 `main`**：`origin/main` 已推送且與本地 `main`（`c174be2`）同步，不再是開工阻塞。各 PR 從最新 `main` 開分支推進。
+1. **推送 `main`**：T2 已合併，T3 開始時 `origin/main` 與本地 `main`（`b1a42b4`）同步，不再是開工阻塞。各 PR 從最新 `main` 開分支推進。
 2. **由誰實作**：本 session 不實作；可交給既有 team 的 impl／reviewer，或日後由 OtterHive 自己的 team 接手。
 3. **review 安排**：上表的 review class 是建議；dual 需要兩位不同的 reviewer。
 4. **native canary**：是否授權、預算上限。
