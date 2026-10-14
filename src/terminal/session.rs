@@ -182,9 +182,10 @@ impl Session {
             last_output: Mutex::new(Instant::now()),
             ended: Mutex::new(false),
         });
-        let mut threads = Vec::with_capacity(2);
-        threads.push(spawn_reader(reader, Arc::clone(&core)));
-        threads.push(spawn_observer(pid, Arc::clone(&core)));
+        let threads = vec![
+            spawn_reader(reader, Arc::clone(&core)),
+            spawn_observer(pid, Arc::clone(&core)),
+        ];
         Ok(Session {
             core,
             master: Mutex::new(pair.master),

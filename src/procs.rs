@@ -624,7 +624,7 @@ mod ownership_tests {
     }
 
     impl StepErr {
-        fn to_io(self, ctx: &'static str) -> std::io::Error {
+        fn into_io(self, ctx: &'static str) -> std::io::Error {
             match self {
                 StepErr::Echild => std::io::Error::from_raw_os_error(libc::ECHILD),
                 StepErr::Transient => std::io::Error::new(ErrorKind::TimedOut, ctx),
@@ -640,10 +640,10 @@ mod ownership_tests {
     }
 
     impl<T> Script<T> {
-        fn to_io(self, ctx: &'static str) -> std::io::Result<T> {
+        fn into_io(self, ctx: &'static str) -> std::io::Result<T> {
             match self {
                 Script::Ok(value) => Ok(value),
-                Script::Err(error) => Err(error.to_io(ctx)),
+                Script::Err(error) => Err(error.into_io(ctx)),
             }
         }
     }
@@ -771,19 +771,19 @@ mod ownership_tests {
 
     impl OsAdapter for FakeOs {
         fn start_time(&self, _pid: i32) -> std::io::Result<u64> {
-            Self::pop_script(&self.starts).to_io("start_time")
+            Self::pop_script(&self.starts).into_io("start_time")
         }
 
         fn pgid(&self, _pid: i32) -> std::io::Result<i32> {
-            Self::pop_script(&self.pgids).to_io("pgid")
+            Self::pop_script(&self.pgids).into_io("pgid")
         }
 
         fn probe_child(&self, _pid: i32) -> std::io::Result<ChildProbe> {
-            Self::pop_script(&self.probes).to_io("probe_child")
+            Self::pop_script(&self.probes).into_io("probe_child")
         }
 
         fn list_group(&self, _pgid: i32) -> std::io::Result<Vec<i32>> {
-            Self::pop_script(&self.lists).to_io("list_group")
+            Self::pop_script(&self.lists).into_io("list_group")
         }
 
         fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
@@ -817,7 +817,7 @@ mod ownership_tests {
                 .lock()
                 .expect("繁中說明：fake adapter 鎖不應中毒")
                 .push("reap".to_owned());
-            Self::pop_script(&self.reaps).to_io("reap")
+            Self::pop_script(&self.reaps).into_io("reap")
         }
     }
 
@@ -893,7 +893,7 @@ mod ownership_tests {
         // 不可把所有 NotFound 混為一談）；lease 永久撤銷；之後 probe 恢復
         // Alive，同一 lease 再次 stop 仍拒絕且零新 signal。
         assert_eq!(
-            StepErr::Echild.to_io("probe").raw_os_error(),
+            StepErr::Echild.into_io("probe").raw_os_error(),
             Some(libc::ECHILD),
             "繁中說明：ECHILD 測試映射必須攜帶 raw errno"
         );
@@ -1380,7 +1380,7 @@ mod ownership_tests {
         // zombie 的 getpgid 回 ESRCH 為預期，不當查詢失敗；production 必須以
         // raw errno 區分 ECHILD 與暫時性失敗，不可把所有錯誤混為一談。
         assert_eq!(
-            StepErr::Echild.to_io("pgid").raw_os_error(),
+            StepErr::Echild.into_io("pgid").raw_os_error(),
             Some(libc::ECHILD),
             "繁中說明：pgid 的 ECHILD 映射必須攜帶 raw errno"
         );
