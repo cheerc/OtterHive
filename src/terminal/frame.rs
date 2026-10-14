@@ -2,11 +2,14 @@
 //!
 //! frame = 1 byte tag + 4 byte big-endian 長度 + 內容。
 //!
-//! `encode_frame` 保留既定的 `Vec<u8>` 回傳型別，因此**寫入端不做上界檢查**；
-//! 有界寫入（避免呼叫端送出超限 frame）屬 T4 的 socket 寫入層，屆時會補
-//! fallible helper 與對應的 RED 測試。`read_frame` 則**必須**拒絕超限的
-//! 宣告長度，而且在配置緩衝區之前就先驗長度 —— 否則一個宣告 4 GiB 的
-//! 損壞或惡意 frame 就會在讀取時觸發大量配置。
+//! 寫入端有兩層：`encode_frame` 是既定的 infallible `Vec<u8>` 回傳型別，
+//! **不做上界檢查**；socket 寫入層一律改用 [`try_encode_frame`]，它拒絕超過
+//! [`MAX_FRAME_BYTES`] 的 payload（有界寫入，避免呼叫端送出超限 frame）。
+//! 本模組的 infallible 版本只供已知界內的呼叫端使用（例如 T7 client 編碼
+//! 自己產生的 frame）；T4 的 daemon socket 寫入必須走 fallible 路徑。
+//!
+//! `read_frame` 則**必須**拒絕超限的宣告長度，而且在配置緩衝區之前就先驗
+//! 長度 —— 否則一個宣告 4 GiB 的損壞或惡意 frame 就會在讀取時觸發大量配置。
 
 use std::io::Read;
 
@@ -17,16 +20,36 @@ use std::io::Read;
 /// 5B（tag + 長度）不計入。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// 編碼成 `tag + 4B BE 長度 + 內容`。
+/// 編碼成 `tag + 4B BE 長度 + 內容`（infallible，不做上界檢查）。
 ///
-/// 長度以 `u32` 編碼；`payload` 超過 `MAX_FRAME_BYTES` 時本函式**不會**拒絕，
-/// 這個邊界由讀取端與 T4 的有界寫入負責。
+/// 長度以 `u32` 編碼；`payload` 超過 [`MAX_FRAME_BYTES`] 時本函式**不會**拒絕。
+/// 這個 infallible 版本是契約既定的 `Vec<u8>` 回傳型別，只供已知界內的
+/// 呼叫端使用；socket 寫入層必須用 [`try_encode_frame`]。
 pub fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(5 + payload.len());
     framed.push(tag);
     framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     framed.extend_from_slice(payload);
     framed
+}
+
+/// 有界寫入：payload 超過 [`MAX_FRAME_BYTES`] 即回
+/// [`std::io::ErrorKind::InvalidData`]，不產出 frame。
+///
+/// 這是 T4 socket 寫入層要用的 helper——daemon 送出的 frame 必須保證不會
+/// 超出契約 §7.2 的 1 MiB 上限，否則對端會依 §7.2 關閉連線。邊界值
+/// （恰為 `MAX_FRAME_BYTES`）允許通過，與讀取端一致。
+pub fn try_encode_frame(tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "frame payload {} bytes 超過上限 {MAX_FRAME_BYTES} bytes",
+                payload.len()
+            ),
+        ));
+    }
+    Ok(encode_frame(tag, payload))
 }
 
 /// 讀取一個 frame，回傳 `(tag, payload)`。
@@ -59,8 +82,47 @@ pub fn read_frame(reader: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_frame, read_frame, MAX_FRAME_BYTES};
+    use super::{encode_frame, read_frame, try_encode_frame, MAX_FRAME_BYTES};
     use std::io::{Cursor, Read};
+
+    #[test]
+    fn try_encode_accepts_payload_at_limit() {
+        // 邊界值恰為上限必須允許（與讀取端一致）。
+        let payload = vec![0x5Au8; MAX_FRAME_BYTES];
+        let framed = try_encode_frame(0x02, &payload).expect("恰在上限的 payload 應被接受");
+        assert_eq!(
+            framed.len(),
+            5 + MAX_FRAME_BYTES,
+            "有界寫入應產出與 encode_frame 相同的外層"
+        );
+        assert_eq!(framed, encode_frame(0x02, &payload));
+    }
+
+    #[test]
+    fn try_encode_rejects_payload_over_limit() {
+        // 超過上限必須拒絕且不產出 frame：這是 T4 socket 寫入要依賴的保證。
+        let payload = vec![0x5Au8; MAX_FRAME_BYTES + 1];
+        let error = try_encode_frame(0x02, &payload).expect_err("超過 1 MiB 的 payload 應被拒絕");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "有界寫入超限應回 InvalidData，實際：{error}"
+        );
+    }
+
+    #[test]
+    fn try_encode_matches_encode_frame_inside_limit() {
+        // 界內兩者必須逐位元組相同（有界寫入不改變 wire bytes）。
+        for size in [0usize, 1, 258, MAX_FRAME_BYTES - 1] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let bounded = try_encode_frame(0x10, &payload).expect("界內 payload 應被接受");
+            assert_eq!(
+                bounded,
+                encode_frame(0x10, &payload),
+                "有界寫入在界內不得改變位元組（size={size}）"
+            );
+        }
+    }
 
     #[test]
     fn max_frame_bytes_constant_is_exposed() {

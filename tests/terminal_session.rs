@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use otterhive::procs::{stop_group, GroupEvidence};
+use otterhive::procs::{stop_group, GroupEvidence, StopOutcome};
 use otterhive::terminal::session::{Session, SessionConfig, StreamEvent};
 use otterhive::terminal::Snapshot;
 use tempfile::TempDir;
@@ -44,6 +44,7 @@ mod support {
 
     pub struct FixtureSession {
         pub session: Session,
+        cleaned: bool,
         _tmp: TempDir,
     }
     impl FixtureSession {
@@ -77,13 +78,37 @@ mod support {
                 subscriber_queue,
             };
             let session = Session::spawn(cfg).expect("繁中說明：fixture 應可經 Session 啟動");
-            Self { session, _tmp: tmp }
+            Self {
+                session,
+                cleaned: false,
+                _tmp: tmp,
+            }
+        }
+
+        /// 以 owned lease 停止；stop 核心完成回收後標記 Child 已釋放。
+        /// Drop 之後不再重複清理（會再做一次已釋放檢查，不發 signal）。
+        pub fn stop_owned(&mut self) -> StopOutcome {
+            let outcome = stop_group(
+                self.session.pid(),
+                self.session.start_time(),
+                GroupEvidence::OwnedLeader(self.session.owned_leader_lease()),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            );
+            if matches!(outcome, StopOutcome::Stopped { .. }) {
+                self.session.mark_child_released();
+            }
+            self.cleaned = true;
+            outcome
         }
     }
 
     /// Drop：以 owned lease 做短等待 stop，失敗中途也有回收（不斷言）。
     impl Drop for FixtureSession {
         fn drop(&mut self) {
+            if self.cleaned {
+                return;
+            }
             let _ = stop_group(
                 self.session.pid(),
                 self.session.start_time(),
@@ -290,6 +315,139 @@ fn slow_subscriber_gets_resync_and_reader_never_blocks() {
     assert!(saw_resync, "繁中說明：佇列滿的停滯者恢復後應先收到 Resync");
     // log_dir 在此 Drop，隔離暫存檔隨測試結束刪除。
     let _ = &log_dir;
+}
+
+#[test]
+fn stalled_subscriber_gets_resync_before_ended_when_program_exits() {
+    // 組合情境：佇列曾滿（`resync_pending`）之後程式結束。reader 的 EOF 走
+    // `mark_ended`；若那裡不先補 Resync，這個停滯者只會收到 Ended，從未取得
+    // 被丟棄輸出之後的畫面邊界，重連後無從知道最後狀態。
+    //
+    // 判準：停滯者（容量 1、期間完全不讀）在收到 Ended 之前至少要拿到一個
+    // Resync（其 Snapshot 帶最後畫面已含的 seq），且 Ended 是最後一個事件。
+    // 殘留的 Output 合法出現：溢出前已排隊的 Output 仍會先被讀出。
+    let holder = FixtureSession::spawn_with_queue("echo_agent.sh", &[], 1);
+    let session = &holder.session;
+    let (_snapshot, stalled) = session.subscribe();
+    // flood 持續輸出，容量 1 的佇列只要有兩個 chunk 送達就必然溢出成
+    // resync_pending。門檻刻意取得低（3 行）：這裡要證明的是「溢出發生過」，
+    // 不是 flood 能跑多快；行數門檻過高只會讓本前提在負載下變成 flake。
+    write_line(session, "flood");
+    assert!(
+        poll_until(LONG_TIMEOUT, || {
+            session
+                .plain_text()
+                .iter()
+                .filter(|line| line.contains("flood-output-line"))
+                .count()
+                >= 3
+        }),
+        "繁中說明：flood 應持續輸出到足以讓佇列溢出，最後畫面為 {:?}",
+        session.plain_text()
+    );
+    // 收掉 flood（主迴圈仍活著），再停止整個程序 → reader EOF → mark_ended。
+    write_line(session, "stop");
+    assert!(
+        poll_until(LONG_TIMEOUT, || {
+            session
+                .plain_text()
+                .iter()
+                .any(|line| line.contains("echo: stop"))
+        }),
+        "繁中說明：stop 後應看到 echo: stop，最後畫面為 {:?}",
+        session.plain_text()
+    );
+    let outcome = stop_group(
+        session.pid(),
+        session.start_time(),
+        GroupEvidence::OwnedLeader(session.owned_leader_lease()),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+    );
+    assert!(
+        matches!(outcome, StopOutcome::Stopped { .. }),
+        "繁中說明：echo_agent 應可正常停止，實際為 {outcome:?}"
+    );
+    assert!(
+        poll_until(LONG_TIMEOUT, || session.exit_status().is_some()),
+        "繁中說明：停止後應在期限內觀測到 exit（不 reap）"
+    );
+
+    // 停滯者現在才開始讀取：Ended 之前必須至少出現一個 Resync。
+    let start = Instant::now();
+    let mut saw_resync = false;
+    let mut resync_seq = 0u64;
+    loop {
+        assert!(
+            start.elapsed() < LONG_TIMEOUT,
+            "繁中說明：應在期限內收到 Ended，最後邊界為 {resync_seq}"
+        );
+        match stalled.recv_timeout(RECV_TIMEOUT) {
+            Ok(StreamEvent::Resync { snapshot }) => {
+                saw_resync = true;
+                resync_seq = snapshot.seq;
+                assert_eq!(
+                    snapshot.generation, 1,
+                    "繁中說明：Ended 前的 Resync 應帶正確 generation"
+                );
+            }
+            Ok(StreamEvent::Output { .. }) => {}
+            Ok(StreamEvent::Ended) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_resync,
+        "繁中說明：佇列曾滿又遇程式結束時，停滯者必須在 Ended 之前收到 Resync"
+    );
+    assert!(
+        resync_seq > 0,
+        "繁中說明：Ended 前的 Resync 應帶最後畫面已含的 seq，實際 {resync_seq}"
+    );
+    // Ended 之後沒有更多事件（訂閱串流已收尾）。
+    assert!(
+        matches!(
+            stalled.recv_timeout(RECV_TIMEOUT),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "繁中說明：Ended 應是最後一個事件，之後只有 timeout"
+    );
+}
+
+#[test]
+fn child_release_is_recorded_and_later_child_touch_is_refused() {
+    // B1：stop 核心完成回收後標記 Child 已釋放；此後任何再觸及 Child 的
+    // 路徑（`with_child`）一律拒絕，不再落到 portable-pty 的
+    // wait／try_wait／kill。
+    let mut holder = FixtureSession::spawn("echo_agent.sh", &[]);
+    assert!(
+        !holder.session.child_is_released(),
+        "繁中說明：spawn 後 Child 未被釋放"
+    );
+    // 釋放前 `with_child` 可通行（Child 仍由 Session 持有），並傳回 body 的值。
+    let before = holder
+        .session
+        .with_child(|_child| 42u32)
+        .expect("繁中說明：釋放前應可觸及 Child");
+    assert_eq!(before, 42, "繁中說明：with_child 應把 body 的結果傳回");
+
+    let outcome = holder.stop_owned();
+    assert!(
+        matches!(outcome, StopOutcome::Stopped { .. }),
+        "繁中說明：echo_agent 應可正常停止，實際為 {outcome:?}"
+    );
+    assert!(
+        holder.session.child_is_released(),
+        "繁中說明：Stopped 後 Child 應標記為已釋放"
+    );
+    // 已釋放：with_child 必須拒絕（不 panic、不觸及 Child）。
+    let refused = holder
+        .session
+        .with_child(|_child| panic!("繁中說明：不應觸及已釋放的 Child"));
+    assert!(
+        refused.is_err(),
+        "繁中說明：Child 已釋放後 with_child 必須回 Err"
+    );
 }
 
 #[test]

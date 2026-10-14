@@ -11,6 +11,8 @@
 //!   絕不呼叫 portable-pty 的 `wait`／`try_wait`／`kill`。
 //! - 所有執行緒 JoinHandle 皆保存，Session Drop 時有界 join（不無限等待）。
 //! - `subscriber_queue == 0` 或尺寸任一為 0 即拒絕（daemon 傳入正數；測試可調小）。
+//! - stop 核心完成回收後由呼叫端標記 `child_released`；此後任何觸及 Child 的
+//!   路徑一律經 `with_child` 檢查（過渡防護，實際呼叫在 T4）。
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -103,6 +105,9 @@ struct Core {
     exit: Mutex<Option<ExitInfo>>,
     last_output: Mutex<Instant>,
     ended: Mutex<bool>,
+    /// stop 核心完成回收後設 true。此後任何觸及 Child 的路徑都必須先經
+    /// [`Session::with_child`] 檢查，避免在 Child 已釋放後再碰它。
+    child_released: Mutex<bool>,
 }
 
 /// Session：PTY、子程序、讀取／觀測執行緒的擁有者。
@@ -181,6 +186,7 @@ impl Session {
             exit: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             ended: Mutex::new(false),
+            child_released: Mutex::new(false),
         });
         let threads = vec![
             spawn_reader(reader, Arc::clone(&core)),
@@ -204,6 +210,40 @@ impl Session {
 
     pub fn owned_leader_lease(&self) -> &OwnedLeaderLease {
         &self.core.lease
+    }
+
+    /// Child 是否已被 stop 核心回收並釋放（此後不得再觸及 Child）。
+    pub fn child_is_released(&self) -> bool {
+        *self
+            .core
+            .child_released
+            .lock()
+            .expect("繁中說明：child_released 槽不應中毒")
+    }
+
+    /// 在 Child 尚未被釋放時把它交給 `body`；已釋放則回
+    /// [`SpawnError::Identity`]。這是 T4 內部停止路徑的過渡防護：
+    /// Child 釋放後任何再觸及 Child 的呼叫都在此擋下，不落到
+    /// portable-pty 的 `wait`／`try_wait`／`kill`。
+    pub fn with_child<T>(
+        &self,
+        body: impl FnOnce(&dyn portable_pty::Child) -> T,
+    ) -> Result<T, SpawnError> {
+        if self.child_is_released() {
+            return Err(SpawnError::Identity(
+                "child 已於停止完成後釋放，不可再觸及".to_owned(),
+            ));
+        }
+        Ok(body(self._child.as_ref()))
+    }
+
+    /// 標記 Child 已被 stop 核心回收並釋放；之後的 Child 操作一律拒絕。
+    pub fn mark_child_released(&self) {
+        *self
+            .core
+            .child_released
+            .lock()
+            .expect("繁中說明：child_released 槽不應中毒") = true;
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -443,10 +483,29 @@ fn push_output(core: &Core, bytes: &[u8]) {
 }
 
 /// reader 結束（EOF／錯誤）：各訂閱者補 `Ended` 並標記。
+/// 佇列曾滿（`resync_pending`）時先補一個含最新 Snapshot 的 `Resync`，
+/// 再補 `Ended`——否則 client 只收到 `Ended` 而從未取得被丟棄輸出之後的
+/// 畫面邊界，重連後無法知道最後狀態（契約 §7.1 的 Resync 邊界語意）。
 fn mark_ended(core: &Core) {
     let mut state = core.state.lock().expect("繁中說明：Session 鎖不應中毒");
     *core.ended.lock().unwrap_or_else(|guard| guard.into_inner()) = true;
+    // 先算好最新 Snapshot（借用結束後再進可變迴圈），供待 Resync 的訂閱者使用。
+    let final_snapshot = Snapshot {
+        generation: core.generation,
+        seq: state.seq,
+        cols: state.screen.cols(),
+        rows: state.screen.rows(),
+        ansi: state.screen.render_ansi(),
+    };
     for sub in state.subscribers.iter_mut() {
+        if sub.resync_pending {
+            // 已丟棄排隊輸出：邊界必須是最新 Snapshot，且 Resync 不加 seq。
+            sub.events.clear();
+            sub.events.push_back(StreamEvent::Resync {
+                snapshot: final_snapshot.clone(),
+            });
+            sub.resync_pending = false;
+        }
         sub.events.push_back(StreamEvent::Ended);
     }
     drop(state);

@@ -54,6 +54,37 @@ mod support {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
+    /// pid 是否仍在**運行**（zombie 不算運行中，但 `kill(pid,0)` 仍回 0）。
+    ///
+    /// 用於「停止後程序不再運行」的判準：既有判準是「程序消失」，
+    /// 但 recovery（`RecordedLeader`）路徑刻意不 reap（該 daemon 並非
+    /// leader 的父程序，reap 不屬它），因此 fixture 被殺後仍會是 zombie：
+    /// 存活但不在運行。判準（終止確實發生、group 清空、回 `Stopped`）
+    /// 不變，只是觀測點由「pid 不存在」改成「pid 不在運行」。
+    pub fn pid_running(pid: i32) -> bool {
+        if !pid_alive(pid) {
+            return false;
+        }
+        // `kill(pid, 0)` 通過後用 WNOHANG waitid 判斷 exit 事件：zombie 有
+        // exit 事件且尚未被回收，因此 `si_pid == pid`；仍在運行的子程序
+        // 沒有 exit 事件，回 `si_pid == 0`。這是 H8 已驗證的觀測面。
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if ret != 0 {
+            // 查不到 exit 事件（ECHILD＝不是本程序的子程序，或暫時性失敗）：
+            // 不宣稱已終止。
+            return true;
+        }
+        info.si_pid == 0
+    }
+
     /// 以 `proc_pidinfo(PROC_PIDTBSDINFO)` 讀 pid 的啟動時間（秒＋微秒）。
     pub fn proc_start_raw(pid: i32) -> Option<u64> {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -560,8 +591,9 @@ fn recorded_leader_with_matching_live_leader_can_stop() {
         "繁中說明：身分相符的 recorded leader 應可授權 stop，實際為 {outcome:?}"
     );
     assert!(
-        poll_until(LONG_TIMEOUT, || !pid_alive(proc_.pid)),
-        "繁中說明：recovery stop 後程序應消失"
+        poll_until(LONG_TIMEOUT, || !pid_running(proc_.pid)),
+        "繁中說明：recovery stop 後程序不應再運行（該路徑刻意不 reap，故以 \
+         「不在運行」而非「pid 消失」為判準），最後觀測程序仍在運行"
     );
 }
 

@@ -12,17 +12,31 @@
 //! 有界等待 → 列舉 → 仍有成員則 `Unproven{residual_pids}` → 撤銷 lease →
 //! reap（失敗即 `Unproven`）。等待期間每次 signal 前重驗；ECHILD／查詢失敗
 //! 永久失效（fail-closed）。`RecordedLeader` 永不授權 zombie 清理。
-//! reap 由持有 Child 的一方在撤銷後執行——公開 `stop_group` 的真實
-//! 路徑以 `waitpid(WNOHANG)` 做最終回收（一次性；ECHILD 即 fail-closed）。
+//! reap 只發生在 owned 路徑：`stop_group` 以 `waitpid(WNOHANG)` 回收**本
+//! daemon 自己持有**的 child（一次性；ECHILD 即 fail-closed）。`RecordedLeader`
+//! 的 leader 是上一個 incarnation 留下的、本 daemon 並非其父程序，reap 屬
+//! 那個真正的父程序，不在此路徑執行（見 `finish_stopped`）。
 //! Session 內部停止＋join 屬 T4 daemon lifecycle（T3 只驗 stop 核心與 lease
-//! 語意）；屆時 Session 內部停止取用同一把 `LIFECYCLE_LOCK` 走同一核心，
-//! 成功後標記 Child 已釋放、不再觸碰，鎖外 join 執行緒。
+//! 語意）；屆時它取用同一把 `LIFECYCLE_LOCK` 走同一核心，成功後標記
+//! `child_released`、不再觸碰 Child，鎖外 join 執行緒。
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// `waitid` 輪詢間隔（等待期間的重驗粒度）。
 const POLL_STEP: Duration = Duration::from_millis(20);
+
+/// 步驟 6b 的寬限等待：leader 已確認退出、group 仍有其他成員時，給它們
+/// 一次短時間自行結束的機會（等這麼久後重列舉，再決定是否升級 KILL）。
+///
+/// 這是**內部重列舉間隔**，不是契約對外的停止等待：契約 §4.3 的停止語意
+/// （TERM 等待 5 秒、KILL 等待 2 秒，由 daemon 依
+/// `OTTERHIVE_TEST_STOP_TERM_MS`／`OTTERHIVE_TEST_STOP_KILL_MS` 傳入
+/// `term_wait`／`kill_wait`）不變、不受此常數影響。之所以不用整段
+/// `kill_wait`：該值預設 2 秒，用在這裡會讓每個「leader 已退出但子程序
+/// 仍在退出途中」的停止都平白多等 2 秒。250ms 足以覆蓋一般程序收尾，
+/// 不足就如實升級 SIGKILL（契約允許），不影響正確性。
+const EXITED_LEADER_GRACE: Duration = Duration::from_millis(250);
 
 /// 同一把 lifecycle 鎖：驗證、每次 signal 前重驗、撤銷、reap 全程序列化。
 /// `stop_group_with_adapter` 進入即直取此鎖全程持有；T4 daemon lifecycle 的
@@ -477,11 +491,12 @@ pub(crate) fn stop_group_with_adapter(
     }
 
     // 6b. leader 已確認退出、但 group 仍有其他成員：TERM 已送達 group，
-    //     child 可能正在退出途中。給一次 grace（等 kill_wait、不升級），
-    //     重列舉；仍有成員才升級 KILL。probe 仍 Alive（leader 存活）時
-    //     直接升級——符合契約「仍有存活成員則 SIGKILL」。
+    //     child 可能正在退出途中。給一次固定寬限（`EXITED_LEADER_GRACE`，
+    //     見該常數說明；非契約等待值），重列舉；仍有成員才升級 KILL。
+    //     probe 仍 Alive（leader 存活）時直接升級——符合契約「仍有存活
+    //     成員則 SIGKILL」。
     if leader_gone {
-        wait_quiet(kill_wait);
+        wait_quiet(EXITED_LEADER_GRACE);
         let probe_grace = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
         let members = match os.list_group(pgid) {
             Ok(members) => members,
@@ -557,9 +572,16 @@ pub(crate) fn stop_group_with_adapter(
     finish_stopped(owned, pid, os, escalated)
 }
 
-/// 清空確認後：撤銷 lease（如有）→ reap。reap 失敗即 `Unproven`，不宣稱 `Stopped`。
-/// `RecordedLeader` 活體成功路徑同樣 reap：recovery 的 daemon 本就是該 child
-/// 的父程序，回收是其職責（zombie 情境仍在步驟 4 直接 `Unproven`，不到此處）。
+/// 清空確認後：撤銷 lease（如有）→ owned 路徑再 reap。reap 失敗即
+/// `Unproven`，不宣稱 `Stopped`。
+///
+/// `RecordedLeader`（SQLite 歷史）**不 reap**：`reap` 是對自己子程序做
+/// `waitpid`，只對父程序合法。recovery 情境的 leader 是**上一個 daemon
+/// incarnation** 留下的，本 daemon 不是它的父程序，`waitpid` 會回 ECHILD；
+/// 對它 reap 要嘛失敗（誤報 `Unproven`），要嘛在 pid 重用後搶走別人的
+/// child。該 zombie 的回收屬於真正的父程序（仍在執行的舊 incarnation，
+/// 或之後由 launchd／init 接手），不屬於本次停止。owned 路徑的 reap 才
+/// 由這裡執行，因為那個 child 確實是本 daemon 持有的。
 fn finish_stopped(
     owned: Option<&OwnedLeaderLease>,
     pid: i32,
@@ -568,14 +590,12 @@ fn finish_stopped(
 ) -> StopOutcome {
     if let Some(lease) = owned {
         lease.revoke_production();
-    }
-    if os.reap(pid).is_err() {
-        if let Some(lease) = owned {
+        if os.reap(pid).is_err() {
             lease.invalidate();
+            return StopOutcome::Unproven {
+                residual_pids: Vec::new(),
+            };
         }
-        return StopOutcome::Unproven {
-            residual_pids: Vec::new(),
-        };
     }
     StopOutcome::Stopped { escalated_to_kill }
 }
@@ -1340,6 +1360,41 @@ mod ownership_tests {
             os.reap_calls.load(Ordering::SeqCst),
             0,
             "繁中說明：撤銷後不得 reap"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_stops_but_never_reaps() {
+        // 活體 RecordedLeader 的 recovery stop 成功路徑：授權 signal（＝
+        // 終止 group），但**不 reap**。reap 是對自己子程序做 waitpid，只對
+        // 父程序合法；recovery 的 leader 是上一個 incarnation 留下的，本
+        // daemon 並非其父程序（對它 waitpid 會回 ECHILD，且 pid 重用後有
+        // 搶走別人 child 的風險）。該 zombie 的回收屬真正的父程序。
+        let os = FakeOs::happy();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：活體 RecordedLeader 仍可授權 stop，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            1,
+            "繁中說明：活體 recorded leader 應確實收到一次 TERM"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
+        );
+        assert_eq!(
+            os.events_snapshot(),
+            vec!["signal TERM pgid=4242".to_owned()],
+            "繁中說明：RecordedLeader 的事件全序應止於 signal，不含 reap"
         );
     }
 
