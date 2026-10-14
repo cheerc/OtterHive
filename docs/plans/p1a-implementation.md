@@ -213,6 +213,8 @@ pub fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8>;  pub fn read_frame(r: &
 pub fn try_encode_frame(tag: u8, payload: &[u8]) -> io::Result<Vec<u8>>;   // 有界寫入；payload 超過 MAX_FRAME_BYTES 回 InvalidData
 ```
 
+`InstanceSpec` 的 `backend` 在 T4 只實作 `claude`（省略時預設；明確 `backend: command` 回 `unsupported_in_phase`，供 T5 之後擴充；`command`／`args` 欄位保留但 T4 不執行）。command backend 的完整行為延到需要它的工作包，不在 T4 以未驗證的 fixture 冒充。`tests/fixtures/backends/fake_claude.sh` 為唯一的 T4 backend fixture。
+
 `subscriber_queue` 必須大於 0，production 預設 256；daemon 從測試設定傳入，Session 本身不讀環境變數。`Resync { snapshot }` 在同一把 Session 鎖內擷取畫面並重設訂閱邊界；socket writer 將它依序編碼成 Resync 與 Snapshot 兩個 frame。reader 的 seq 計數與 Snapshot.seq 定義依契約 §7.1，不以送到某個 client 的次數計數。
 
 `OwnedLeaderLease` 不是 LiveSession 布林旗標：只在本 daemon 確認持有 spawn 的 child 時建立，不可由 SQLite 重建。`stop_group` 每次 signal 前，在與 reap 共用的 lifecycle 鎖內驗證 lease 未撤銷、child 未被 reap、pid／啟動時間／pgid 相符；owned 路徑必須與傳入的 pid／expected_start 相符。probe 回 ECHILD（child 已被外部 reap）、查詢失敗或任何 reap 都使 lease 永久失效，回 Unproven／IdentityMismatch 而不 signal；zombie 的 getpgid 回 ESRCH 為預期形態（以綁定 pgid 繼續，後續 probe 須為 Exited），與 probe 的 ECHILD 區分。group 清理完成後先撤銷 lease，再在鎖內 reap，釋放鎖後 join 執行緒；因停止無法證實而逾時時保留 Session，不無限等待 join。清理後保留畫面／Session 物件不恢復 lease。exit observer 不呼叫 portable-pty 的 wait／try_wait；H8 若不能證明 API 路徑，停在 spike，不改成舊 pgid 清理。
