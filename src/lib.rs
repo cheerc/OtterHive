@@ -1,6 +1,9 @@
 pub mod admission;
+pub mod cli;
+pub mod client;
 pub mod config;
 pub mod home;
+pub mod mcp;
 pub mod procs;
 pub mod protocol;
 pub mod store;
