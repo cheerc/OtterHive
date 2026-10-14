@@ -12,8 +12,8 @@
 
 - 已完成：P0 與 T2（protocol、admission、home、config、store）；T2 已經由 PR #1 合併。
 - T3 基準：`main`／`origin/main` 為 `b1a42b45f9f65bc2d4ccfc26f7f3378768f90840`；本包使用獨立整合分支，不直接修改 main。
-- T3 已集中 RED：程序／Session、Screen／Frame 的測試與四個 fixtures，尚無行為實作。`cargo test --locked --lib --test process_stop --test terminal_session --test frame` 及不含 `--lib` 的三組整合測試命令皆實際 exit 101（compile-RED：缺少待實作的型別／函式）；Screen 與 procs 私有測試已接入模組編譯，不將零測試執行視為 RED。`cargo fmt --check` 通過。
-- T3 共 73 個測試宣告（35 個整合、38 個單元）；尚未執行成功，不宣稱 H1／H2／H3／H8 已驗證。macOS CI 與 Rust 1.88 編譯驗收沿用 T2 jobs，完整 GREEN 後才發 PR。
+- T3 已集中 GREEN（HEAD `386e471`）：procs（`arg=1` zombie 查詢、raw-errno ECHILD、fallible list／reap、單一 lifecycle lock）、terminal Session（reader＋observer JoinHandle、snapshot／seq／resync、resize／input）、Screen（VT 重繪、CJK／寬字元／合併音符、游標）、frame（1 MiB 界限、partial reader）。`cargo test --locked --all-targets` 全綠 106 passed（lib 48＋frame 19＋home_and_config 7＋process_arg1 2＋process_stop 11＋protocol_admission 8＋store_recovery 6＋terminal_session 5）；`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --doc` 通過。
+- H1／H2 已由整合測試驗證（`spawned_child_leads_its_process_group`、`process_start_time_is_stable_for_a_live_pid`）；H3 由 Screen 語意 round-trip 測試驗證；H8 由 `leader_exit_observation_keeps_the_owned_child_unreaped`（WNOWAIT 重複觀測＋`arg=1` 重驗）、`stop_after_leader_exit_cleans_remaining_group_members`、`recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group`、`revoked_leader_lease_cannot_signal_a_reused_group`、`lease_validation_and_reap_are_serialized` 覆蓋。調查證據在工作樹 `evidence/t3-h8-spike/`（未提交，不進 PR）。待雙 review 後發 PR #2。
 
 ## 全域約束
 
