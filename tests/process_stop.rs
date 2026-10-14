@@ -399,6 +399,20 @@ fn stop_terminates_and_reaps() {
 #[test]
 fn stop_escalates_to_kill_when_term_is_ignored() {
     let mut proc_ = FixtureProc::spawn("ignore_term.sh", &[], 256);
+    // 就緒標記修法：等 trap 生效後的 `ignore-term-ready` 行出現在畫面才發
+    // signal，避免 TERM 到達早於 trap 設置；有界等待、有最後狀態輸出。
+    // 判準不變（仍須升級 KILL、回 Stopped{escalated:true}）。
+    assert!(
+        poll_until(LONG_TIMEOUT, || {
+            proc_
+                .session
+                .plain_text()
+                .iter()
+                .any(|line| line.contains("ignore-term-ready"))
+        }),
+        "繁中說明：ignore_term 就緒標記應在期限內出現，最後畫面為 {:?}",
+        proc_.session.plain_text()
+    );
     let outcome = stop_group(
         proc_.pid,
         proc_.start,
