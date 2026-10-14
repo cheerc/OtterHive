@@ -12,10 +12,11 @@
 //! 有界等待 → 列舉 → 仍有成員則 `Unproven{residual_pids}` → 撤銷 lease →
 //! reap（失敗即 `Unproven`）。等待期間每次 signal 前重驗；ECHILD／查詢失敗
 //! 永久失效（fail-closed）。`RecordedLeader` 永不授權 zombie 清理。
-//! reap 由 Session 在撤銷後對持有的 Child 執行——公開 `stop_group` 的真實
-//! 路徑以 `waitpid(WNOHANG)` 做最終回收（一次性；ECHILD 即 fail-closed）；
-//! `Session` 內部停止在同一 lifecycle 鎖內走同一核心，成功後標記 Child
-//! 已釋放、不再觸碰，鎖外 join 執行緒。
+//! reap 由持有 Child 的一方在撤銷後執行——公開 `stop_group` 的真實
+//! 路徑以 `waitpid(WNOHANG)` 做最終回收（一次性；ECHILD 即 fail-closed）。
+//! Session 內部停止＋join 屬 T4 daemon lifecycle（T3 只驗 stop 核心與 lease
+//! 語意）；屆時 Session 內部停止取用同一把 `LIFECYCLE_LOCK` 走同一核心，
+//! 成功後標記 Child 已釋放、不再觸碰，鎖外 join 執行緒。
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,17 +25,9 @@ use std::time::{Duration, Instant};
 const POLL_STEP: Duration = Duration::from_millis(20);
 
 /// 同一把 lifecycle 鎖：驗證、每次 signal 前重驗、撤銷、reap 全程序列化。
-/// `stop_group_with_adapter` 進入即持有；`Session` 內部停止取用同一把鎖，
-/// 保證驗證後、signal 前不可 reap（RED `lease_validation_and_reap_are_serialized`
-/// 的 production 對應；單元併發測試直接競爭此鎖）。
+/// `stop_group_with_adapter` 進入即直取此鎖全程持有；T4 daemon lifecycle 的
+/// Session 內部停止將來取用同一把鎖（T3 只驗 stop 核心與 lease 語意）。
 static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
-
-/// 取同一把 lifecycle 鎖（`Session` 內部停止用；`Session` 層見 `session.rs`）。
-pub(crate) fn lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
-    LIFECYCLE_LOCK
-        .lock()
-        .expect("繁中說明：lifecycle 鎖不應中毒")
-}
 
 /// `waitid WNOWAIT` 觀測結果（不 reap）。
 #[derive(Debug, Clone, PartialEq)]
@@ -271,8 +264,8 @@ impl OsAdapter for RealOs {
     }
 
     /// 最終回收：`waitpid(pid, WNOHANG)` 一次性回收 zombie。
-    /// ECHILD 回 Err（fail-closed）：正常流程中不應出現（Session 持有 Child，
-    /// 未經此處即被 reap）；Session 內部路徑見 `session.rs`。
+    /// ECHILD 回 Err（fail-closed）：正常流程中不應出現（調用方持有 Child，
+    /// 未經此處即被 reap）。
     fn reap(&self, pid: i32) -> std::io::Result<()> {
         let mut status = 0;
         let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -306,7 +299,9 @@ pub(crate) fn stop_group_with_adapter(
     kill_wait: Duration,
     os: &dyn OsAdapter,
 ) -> StopOutcome {
-    let _lifecycle = lifecycle_guard();
+    let _lifecycle = LIFECYCLE_LOCK
+        .lock()
+        .expect("繁中說明：lifecycle 鎖不應中毒");
     // 0. 撤銷檢查優先於一切驗證（即使 zombie 仍 waitable 也零 signal）。
     // 1. RecordedLeader 永不授權 zombie 清理；存活 leader 才可 recovery stop。
     let owned: Option<&OwnedLeaderLease> = match evidence {
@@ -340,12 +335,14 @@ pub(crate) fn stop_group_with_adapter(
         return StopOutcome::IdentityMismatch;
     }
 
-    // 3. pgid 驗證：活體須 pgid==pid；zombie 的 ESRCH（raw errno）為預期；
-    //    暫時性失敗 → Unproven。ECHILD 以外一律 fail-closed。
+    // 3. pgid 驗證：活體須 pgid==pid；zombie 的 getpgid 回 ESRCH（raw errno）
+    //    為預期；暫時性失敗 → Unproven。ESRCH 以外一律 fail-closed。
+    //    注意與步驟 4 區分：probe 的 ECHILD（child 已被外部 reap）是 ownership
+    //    喪失；此處的 ESRCH（zombie 無 getpgid 身分）是預期中的查詢形態。
     let pgid = match os.pgid(pid) {
         Ok(pgid) => pgid,
         Err(error) => {
-            if error.raw_os_error() == Some(libc::ECHILD) {
+            if error.raw_os_error() == Some(libc::ESRCH) {
                 // zombie 的 getpgid 回 ESRCH 為預期：以綁定的 pgid 繼續，
                 // 後續 probe 必須為 Exited，否則仍拒絕。
                 match owned {
@@ -616,10 +613,12 @@ mod ownership_tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// 腳本錯誤（可 Clone）：ECHILD 攜帶 raw errno，production 以此判定
-    /// ownership loss；暫時性錯誤另行覆蓋。
+    /// probe 的 ownership loss；ESRCH 攜帶 raw errno，production 以此判定
+    /// zombie-pgid 查詢的預期形態（與 waitid 的 ECHILD 區分）；暫時性錯誤另行覆蓋。
     #[derive(Debug, Clone, Copy)]
     enum StepErr {
         Echild,
+        Esrch,
         Transient,
     }
 
@@ -627,6 +626,7 @@ mod ownership_tests {
         fn into_io(self, ctx: &'static str) -> std::io::Error {
             match self {
                 StepErr::Echild => std::io::Error::from_raw_os_error(libc::ECHILD),
+                StepErr::Esrch => std::io::Error::from_raw_os_error(libc::ESRCH),
                 StepErr::Transient => std::io::Error::new(ErrorKind::TimedOut, ctx),
             }
         }
@@ -1376,17 +1376,17 @@ mod ownership_tests {
 
     #[test]
     fn zombie_branch_treats_esrch_pgid_as_expected() {
-        // probe 已退出、pgid 查回 raw-errno ECHILD → 仍可 Stopped（不升級）。
+        // probe 已退出、pgid 查回 raw-errno ESRCH → 仍可 Stopped（不升級）。
         // zombie 的 getpgid 回 ESRCH 為預期，不當查詢失敗；production 必須以
-        // raw errno 區分 ECHILD 與暫時性失敗，不可把所有錯誤混為一談。
+        // raw errno 區分 ESRCH、waitid 的 ECHILD 與暫時性失敗，不可混為一談。
         assert_eq!(
-            StepErr::Echild.into_io("pgid").raw_os_error(),
-            Some(libc::ECHILD),
-            "繁中說明：pgid 的 ECHILD 映射必須攜帶 raw errno"
+            StepErr::Esrch.into_io("pgid").raw_os_error(),
+            Some(libc::ESRCH),
+            "繁中說明：pgid 的 ESRCH 映射必須攜帶 raw errno"
         );
         let os = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
-            vec![Script::Err(StepErr::Echild)],
+            vec![Script::Err(StepErr::Esrch)],
             vec![Script::Ok(ChildProbe::Exited {
                 code: Some(0),
                 signal: None,
