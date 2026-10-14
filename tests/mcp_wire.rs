@@ -177,22 +177,23 @@ impl Bridge {
             panic!("繁中說明：{what} 不應有回應，但收到 {line:?}");
         }
     }
+}
 
-    /// 有上限地等待行程結束。
-    fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return status,
-                Ok(None) => {}
-                Err(error) => panic!("繁中說明：等待 bridge 結束失敗：{error}"),
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!("繁中說明：bridge 未在 {timeout:?} 內結束");
-            }
-            std::thread::sleep(common::POLL_STEP);
+/// 有上限地等待行程結束；逾時即 kill 並 panic（不無限等待）。
+#[track_caller]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {}
+            Err(error) => panic!("繁中說明：等待 bridge 結束失敗：{error}"),
         }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("繁中說明：bridge 未在 {timeout:?} 內結束");
+        }
+        std::thread::sleep(common::POLL_STEP);
     }
 }
 
@@ -456,19 +457,7 @@ fn missing_home_is_config_error_on_initialize() {
     assert_error_names_variable(&error, "OTTERHIVE_HOME", "缺少 HOME");
 
     // 前提缺失不得靜默存活：回完錯誤就該結束，讓 backend 看見失敗。
-    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => panic!("等待 bridge 結束失敗：{error}"),
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("繁中說明：缺少 OTTERHIVE_HOME 的 bridge 不應靜默存活");
-        }
-        std::thread::sleep(common::POLL_STEP);
-    };
+    let status = wait_for_exit(&mut child, EXIT_TIMEOUT);
     assert!(
         status.success(),
         "繁中說明：前提缺失的 bridge 應正常結束而非留下失敗行程，實際為 {status:?}"

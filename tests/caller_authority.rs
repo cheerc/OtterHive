@@ -67,6 +67,17 @@ impl Reply {
             ),
         }
     }
+
+    /// 工具結果的 `isError`；JSON-RPC 錯誤沒有這個欄位，回 `None`。
+    ///
+    /// daemon 在線時 `refused`／`unsupported` 才是 `true`（契約 §10）。本檔
+    /// 在 daemon 不在線的狀態下不會走到 `Tool`，但形狀仍固定下來。
+    fn is_error(&self) -> Option<bool> {
+        match self {
+            Reply::Rpc { .. } => None,
+            Reply::Tool { is_error, .. } => Some(*is_error),
+        }
+    }
 }
 
 struct Bridge {
@@ -216,31 +227,38 @@ impl Drop for Bridge {
 // ------------------------------------------------------------ admission 層
 
 #[test]
-fn lifecycle_tools_without_a_t4_handler_are_refused_before_anything_happens() {
-    // T4 的 `tools_list` 只列已完成的 lifecycle 工具；這些不列出，但直接呼叫
-    // 必須被明確拒絕，不能靜默忽略，也不能假裝成功。
-    for tool in [
-        "create_instance",
-        "delete_instance",
-        "start_instance",
-        "deployment",
-    ] {
+fn tools_whose_handler_has_not_landed_are_not_silently_ignored() {
+    // T4 的 `tools_list` 只列已完成的 lifecycle 工具；這些不列出。直接呼叫
+    // 時不得被靜默忽略，也不得假裝成功——daemon 在線時必須回
+    // `unsupported_in_phase`（daemon 端的行為由 Lane A 的 instance_lifecycle
+    // 覆蓋），daemon 不在線時 bridge 回 -32001（下面另有測試）。
+    //
+    // 注意 `create_instance`／`delete_instance`／`start_instance` 是 catalog 中
+    // 的 P1a 工具，它們的**規格存在**，所以 `admission` 的形狀檢查是通過的；
+    // 「這期還沒做」是執行期（daemon 端 handler）的判斷，不是形狀問題。
+    // 這裡驗的是這個區分：形狀合法，但不得因為形狀合法就假設可呼叫。
+    for tool in ["create_instance", "delete_instance", "start_instance"] {
         let args = match tool {
             "create_instance" => json!({"name": "worker"}),
-            "delete_instance" | "start_instance" => json!({"instance": "worker"}),
-            _ => json!({"action": "list"}),
+            _ => json!({"instance": "worker"}),
         };
-        let error = admit(tool, &args)
-            .expect_err("繁中說明：T4 未實作的 lifecycle 工具應被 admission 拒絕");
+        assert!(
+            admit(tool, &args).is_ok(),
+            "繁中說明：{tool} 是 catalog 中的 P1a 工具，形狀檢查應通過"
+        );
+        assert!(
+            !otterhive::mcp::tool_names(true).contains(&tool.to_owned()),
+            "繁中說明：{tool} 的 handler 未落地，不得出現在 T4 的工具清單裡"
+        );
+    }
+
+    // 真正在形狀層就被拒的是**非 P1a 工具**：它們連規格都沒有。
+    for tool in ["decision", "task", "set_metadata", "schedule"] {
+        let error = admit(tool, &json!({})).expect_err("繁中說明：非 P1a 工具應被 admission 拒絕");
         assert_eq!(
             error.code,
             ErrorCode::UnsupportedInPhase,
             "繁中說明：{tool} 應回 unsupported_in_phase，實際為 {error:?}"
-        );
-        assert!(
-            error.message.contains(tool),
-            "繁中說明：{tool} 的拒絕訊息應指出被拒的工具，實際為 {:?}",
-            error.message
         );
         assert!(
             error.message.contains("P1a 不支援"),
@@ -464,6 +482,14 @@ fn lifecycle_calls_are_not_disguised_as_results_when_the_daemon_is_unreachable()
     ] {
         let reply = bridge.call_tool(tool, json!({"instance": "worker"}));
         reply.expect_daemon_unreachable(&format!("呼叫 {tool}"));
+        // `-32001` 是 JSON-RPC 層的錯誤，不是工具結果，因此沒有 `isError`。
+        // daemon 在線時 `refused` 才會是 `isError: true`（契約 §10）——把這個
+        // 區分釘住，才不會有人日後把它改成「一律 isError」。
+        assert_eq!(
+            reply.is_error(),
+            None,
+            "繁中說明：daemon 不可連的回覆不該有 isError（{tool}）"
+        );
     }
 }
 

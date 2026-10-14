@@ -1,12 +1,17 @@
-//! T4 Lane B RED：測試共用骨架（暫存隔離的 home、有上限的輪詢、command 執行）。
+//! T4 Lane B：測試共用骨架（暫存隔離的 home、有上限的輪詢、command 執行）。
 //!
-//! 這是**提案**，不是行為實作：只提供各 T4 測試檔共用的一次性 fixture 與
-//! 有界等待，不含 daemon 啟停、socket 連線或任何生命週期行為。T5–T7 直接
-//! 沿用同一骨架擴充。
+//! 只提供各 T4 測試檔共用的一次性 fixture 與有界等待，不含 daemon 啟停、
+//! socket 連線或任何生命週期行為。T5–T7 直接沿用同一骨架擴充。
+//!
+//! 每個測試檔只會編譯自己用到的 `mod common`，因此這個模組裡必然有目前
+//! 尚未被任何測試引用的輔助函式與常數。把它們標為允許死碼，是為了讓
+//! `cargo clippy --all-targets -- -D warnings` 維持綠，同時讓 T5 的測試可以
+//! 直接取用同一份骨架——**不需要**為了消除警告而刪掉別人正要用的東西。
 //!
 //! 全模組只在 macOS 編譯（契約 §1 平台範圍）。
 
 #![cfg(target_os = "macos")]
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

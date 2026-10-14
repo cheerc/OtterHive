@@ -1,17 +1,21 @@
-//! T4 Lane B RED：socket client 的**凍結介面**骨架（無行為）。
+//! T4 Lane B：socket client（契約 §1／§3）。
 //!
-//! 這是 test-only 的空骨架：型別與簽章先固定，讓 GREEN 有明確的目標，GREEN
-//! 之前呼叫端會因「回傳值永遠是 placeholder」而失敗——這是刻意的 compile-RED。
+//! 一行 JSON 的 `Request` → 一行 JSON 的 `OperationResult`：
+//! `run/daemon.sock` 上送一行、讀一行。授權由 daemon 依 `auth` 內的 token
+//! 判定；client 只負責送出與讀回應。
 //!
-//! 凍結的介面（plan T4 Interfaces 與契約 §1／§3）：
-//! - 一行 JSON 的 `Request` → 一行 JSON 的 `OperationResult`。
-//! - 一個連線一個請求；`attach` 是例外（§7，本期不在此介面）。
-//! - 連不上 daemon 與請求格式錯誤都回 `ClientError`，不假裝成功。
+//! 兩種失敗分開回報，讓 CLI 能給不同的 exit code（契約 §9）：
+//! - [`ClientError::Unreachable`]：連不上 daemon（socket 不存在、連線被拒、
+//!   逾時未回應）。exit 1。
+//! - [`ClientError::Malformed`]：請求或回應的線路格式錯誤。exit 1。
 //!
-//! 授權由 daemon 依 `auth` 內的 token 判定；client 只負責送出與讀回應。
+//! 逾時一律有上限：`read` 設 `SO_RCVTIMEO`、期限以 `Instant` 計時，不因
+//! daemon 不回應而無限等待（契約 §9）。
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -20,7 +24,7 @@ use crate::protocol::{Auth, OperationResult, Request};
 /// `run/daemon.sock` 的檔名（契約 §1）。
 pub const SOCKET_FILE: &str = "daemon.sock";
 
-/// client 連線與讀回應的上限。daemon 不回應時必須逾時，不得無限等待。
+/// client 連線與讀回應的上限。daemon 不回應時必須逾時，不因 Slack 而無限等待。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// client 層的失敗。兩種成因分開，讓 CLI 能給不同 exit code（契約 §9）。
@@ -35,12 +39,8 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientError::Unreachable(reason) => {
-                write!(formatter, "無法連到 daemon：{reason}")
-            }
-            ClientError::Malformed(reason) => {
-                write!(formatter, "請求或回應格式錯誤：{reason}")
-            }
+            ClientError::Unreachable(reason) => write!(formatter, "無法連到 daemon：{reason}"),
+            ClientError::Malformed(reason) => write!(formatter, "請求或回應格式錯誤：{reason}"),
         }
     }
 }
@@ -85,6 +85,12 @@ impl CallOptions {
         self
     }
 
+    /// 覆寫逾時。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// 送出前的請求形狀（單行 JSON，`v` 固定為 1）。
     pub fn request(&self) -> Request {
         Request {
@@ -103,12 +109,171 @@ pub fn socket_path(home: &Path) -> PathBuf {
 }
 
 /// 送出一個操作並讀回 `OperationResult`。
+pub fn call(options: &CallOptions) -> Result<OperationResult, ClientError> {
+    let path = socket_path(&options.home);
+    let deadline = Instant::now() + options.timeout;
+
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|error| ClientError::Unreachable(format!("{}：{error}", path.display())))?;
+    let _ = stream.set_read_timeout(Some(options.timeout));
+    let _ = stream.set_write_timeout(Some(options.timeout));
+
+    let line = serde_json::to_string(&options.request())
+        .map_err(|error| ClientError::Malformed(format!("請求無法序列化：{error}")))?;
+    let mut payload = line.into_bytes();
+    payload.push(b'\n');
+    stream
+        .write_all(&payload)
+        .and_then(|()| stream.flush())
+        .map_err(|error| ClientError::Unreachable(format!("寫入 socket 失敗：{error}")))?;
+
+    // 一行回應；daemon 之後關閉連線（§1：一個連線一個請求）。讀到 newline
+    // 或 EOF 都算一行完整，不假設 daemon 會關閉連線。
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ClientError::Unreachable(format!(
+                "{:?} 內未讀到 daemon 回應",
+                options.timeout
+            )));
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(ClientError::Unreachable(format!(
+                    "{:?} 內未讀到 daemon 回應",
+                    options.timeout
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(ClientError::Unreachable(format!(
+                    "讀取 socket 失敗：{error}"
+                )))
+            }
+        }
+    }
+
+    parse_result(&buffer)
+}
+
+/// 由回應的位元組解析 `OperationResult`。
 ///
-/// GREEN 之前這是佔位實作：**永遠回 `Unreachable`**。這是刻意的——
-/// Lane A 的 daemon 端與本檔的 client 端會同時是 compile-RED，
-/// 由 T4 GREEN 一次把兩邊接起來。不可為了讓某個測試變綠而在這裡塞假回應。
-pub fn call(_options: &CallOptions) -> Result<OperationResult, ClientError> {
-    Err(ClientError::Unreachable(
-        "client 尚未實作（T4 GREEN 補上 socket 連線與讀回應）".to_owned(),
-    ))
+/// daemon 回的是**一行** JSON；多餘的空白與換行忽略，回應內部的換行（若
+/// daemon 的 JSON 含有轉義的換行）由 `serde_json` 處理。
+fn parse_result(buffer: &[u8]) -> Result<OperationResult, ClientError> {
+    let text = String::from_utf8_lossy(buffer);
+    let line = text.trim();
+    if line.is_empty() {
+        return Err(ClientError::Unreachable(
+            "daemon 關閉連線但沒有回應".to_owned(),
+        ));
+    }
+    serde_json::from_str(line)
+        .map_err(|error| ClientError::Malformed(format!("回應不是有效的 OperationResult：{error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_result, socket_path, CallOptions, ClientError};
+    use crate::protocol::Auth;
+    use std::path::Path;
+
+    #[test]
+    fn socket_path_is_under_the_run_directory() {
+        assert_eq!(
+            socket_path(Path::new("/tmp/h")),
+            Path::new("/tmp/h/run/daemon.sock"),
+            "繁中說明：socket 路徑應為 $OTTERHIVE_HOME/run/daemon.sock"
+        );
+    }
+
+    #[test]
+    fn request_carries_version_one_and_the_given_auth() {
+        let options = CallOptions::new(
+            Path::new("/tmp/h"),
+            Auth::Operator("tok".to_owned()),
+            "list_instances",
+            serde_json::json!({}),
+        );
+        let request = options.request();
+        assert_eq!(request.v, 1, "繁中說明：線路版本固定為 1");
+        assert_eq!(request.auth, Auth::Operator("tok".to_owned()));
+        assert_eq!(request.op, "list_instances");
+        assert!(request.operation_id.is_none());
+    }
+
+    #[test]
+    fn operation_id_is_carried_when_given() {
+        let options = CallOptions::new(
+            Path::new("/tmp/h"),
+            Auth::Operator("t".to_owned()),
+            "create_instance",
+            serde_json::json!({"name": "w"}),
+        )
+        .with_operation_id("op-1");
+        assert_eq!(options.request().operation_id.as_deref(), Some("op-1"));
+    }
+
+    #[test]
+    fn a_result_line_is_parsed() {
+        let line = br#"{"operation_id":"op-1","outcome":"completed","subject":null,"value":{},"effects":[],"error":null}"#;
+        let result = parse_result(line).expect("繁中說明：合法的 OperationResult 應解析成功");
+        assert_eq!(result.outcome, crate::protocol::Outcome::Completed);
+    }
+
+    #[test]
+    fn trailing_newline_and_spaces_are_tolerated() {
+        let line = b"  {\"operation_id\":\"x\",\"outcome\":\"queued\",\"subject\":null,\"value\":null,\"effects\":[],\"error\":null}  \n";
+        let result = parse_result(line).expect("應可解析");
+        assert_eq!(result.outcome, crate::protocol::Outcome::Queued);
+    }
+
+    #[test]
+    fn garbage_is_malformed_not_unreachable() {
+        let error = parse_result(b"not json at all").expect_err("應回錯誤");
+        assert!(
+            matches!(error, ClientError::Malformed(_)),
+            "繁中說明：回應不是 JSON 屬格式錯誤（exit 1），不是連線問題，實際為 {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_response_is_unreachable() {
+        let error = parse_result(b"").expect_err("應回錯誤");
+        assert!(
+            matches!(error, ClientError::Unreachable(_)),
+            "繁中說明：daemon 關閉連線但沒回應屬連線失敗，實際為 {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_socket_is_unreachable() {
+        // 暫存 home 底下不可能有 daemon：連線必然失敗，且不得 panic。
+        let options = CallOptions::new(
+            Path::new("/tmp/otterhive-nonexistent-home-for-client-test"),
+            Auth::Operator("t".to_owned()),
+            "list_instances",
+            serde_json::json!({}),
+        );
+        let error = super::call(&options).expect_err("應回連線錯誤");
+        assert!(
+            matches!(error, ClientError::Unreachable(_)),
+            "繁中說明：socket 不存在應回 Unreachable，實際為 {error:?}"
+        );
+    }
 }
