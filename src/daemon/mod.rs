@@ -50,6 +50,121 @@ use crate::store::{InstanceRow, NewInstance, Store, StoreError};
 use crate::terminal::frame;
 use crate::terminal::session::{Session, SessionConfig, StreamEvent};
 
+/// T5 Lane B GREEN：契約預設值的守門測試（§1 的環境變數、§6.3、§6.4）。
+///
+/// 為什麼需要這個模組：`Tuning::from_env` 是所有「測試可縮短的時間常數」的
+/// **唯一**真相來源。`src/wake.rs` 的排程器刻意不知道契約預設是多少——它只
+/// 接受呼叫端傳入的視窗。因此若有人把 `millis("OTTERHIVE_TEST_WAKE_INPUT_MS",
+/// 3000)` 的預設參數改成 2000，`wake.rs` 的單元測試會全綠（它們傳自己的
+/// 數字），`tests/wake_delivery.rs` 也會全綠（它在 daemon 上設了環境變數），
+/// 只有真的 operator 才會發現提示的延後時間變了。
+///
+/// 這個模組把那幾個數字釘住，讓「改預設值」變成一件必須連同契約討論的事。
+///
+/// **測試隔離**：`from_env` 讀的是行程級環境變數，而測試 runner 是多執行緒
+/// 的——若用 `std::env::set_var` 清掉某個變數再呼叫 `from_env`，同時有其他
+/// 測試在讀同一個變數，就是 T4 踩過的 process-global 污染。因此這個模組
+/// **不設任何環境變數**：它只斷言「在沒有任何 `OTTERHIVE_TEST_*` 被設進這個
+/// 行程的情況下」的預設值，並且用 [`is_tuning_default_env_clean`] 做前提檢查。
+#[cfg(test)]
+mod t5_tuning_tests {
+    use super::Tuning;
+    use std::time::Duration;
+
+    /// 前提：這個測試行程沒有被注入任何 `OTTERHIVE_TEST_*`。
+    ///
+    /// 成立時直接用 `from_env` 的預設值；不成立時跳過並說明原因，而不是
+    /// 假裝通過——T4 的教訓是「前提不成立時要讓人看見」。
+    fn default_tuning() -> Option<Tuning> {
+        let polluted: Vec<&str> = [
+            "OTTERHIVE_TEST_STARTUP_GRACE_MS",
+            "OTTERHIVE_TEST_STOP_TERM_MS",
+            "OTTERHIVE_TEST_STOP_KILL_MS",
+            "OTTERHIVE_TEST_SUBSCRIBER_QUEUE",
+            "OTTERHIVE_TEST_LEASE_MS",
+            "OTTERHIVE_TEST_WAKE_INPUT_MS",
+            "OTTERHIVE_TEST_WAKE_QUIET_MS",
+        ]
+        .into_iter()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect();
+        if polluted.is_empty() {
+            return Some(Tuning::from_env());
+        }
+        eprintln!(
+            "繁中說明：這個測試行程已被注入 {:?}，預設值斷言不成立（略過，勿誤判為通過）",
+            polluted
+        );
+        None
+    }
+
+    #[test]
+    fn tuning_defaults_match_the_contract() {
+        let Some(tuning) = default_tuning() else {
+            return;
+        };
+        // §4.2 的啟動寬限期（daemon 啟動自檢用）。
+        assert_eq!(
+            tuning.startup_grace,
+            Duration::from_millis(3000),
+            "繁中說明：未設環境變數時啟動寬限期應為契約預設 3000ms"
+        );
+        // §4.3 的停止升級時序。
+        assert_eq!(
+            tuning.stop_term,
+            Duration::from_millis(5000),
+            "繁中說明：未設環境變數時 TERM 等待應為契約預設 5000ms"
+        );
+        assert_eq!(
+            tuning.stop_kill,
+            Duration::from_millis(2000),
+            "繁中說明：未設環境變數時 KILL 等待應為契約預設 2000ms"
+        );
+        // §7.1 的每 client 佇列上限。
+        assert_eq!(
+            tuning.subscriber_queue, 256,
+            "繁中說明：未設環境變數時每個 client 的 Output 佇列應為契約預設 256"
+        );
+        // §6.3 的投遞 lease。
+        assert_eq!(
+            tuning.lease,
+            Duration::from_millis(600_000),
+            "繁中說明：未設環境變數時 lease 應為契約 §6.3 的 600 秒"
+        );
+        // §6.4 的兩個喚醒視窗——這兩個是本模組存在的**主要理由**：
+        // `wake.rs` 不再持有這兩個數字，這裡是它們唯一的所在。
+        assert_eq!(
+            tuning.wake_input,
+            Duration::from_secs(3),
+            "繁中說明：未設環境變數時 client 輸入視窗應為契約 §6.4 的 3 秒"
+        );
+        assert_eq!(
+            tuning.wake_quiet,
+            Duration::from_millis(500),
+            "繁中說明：未設環境變數時輸出靜默視窗應為契約 §6.4 的 500 毫秒"
+        );
+    }
+
+    #[test]
+    fn the_wake_windows_are_ordered_so_a_typing_operator_always_wins() {
+        // 不是契約要求，是實作上必須成立的不變量：§6.4 的兩個條件是「或」，
+        // 但 client 輸入視窗（3s）必須**大於**輸出靜默視窗（500ms），否則
+        // 一個正在輸出的 agent 會讓 operator 的輸入視窗形同失效——輸入視窗
+        // 剛過期時，輸出視窗卻還開著，於是「operator 停止打字」這個事實
+        // 永遠換不到一次插話機會。
+        let Some(tuning) = default_tuning() else {
+            return;
+        };
+        assert!(
+            tuning.wake_input > tuning.wake_quiet,
+            "繁中說明：client 輸入視窗（{}ms）應大於輸出靜默視窗（{}ms），\
+             否則 operator 停止打字後仍會被持續輸出的 agent 擋住",
+            tuning.wake_input.as_millis(),
+            tuning.wake_quiet.as_millis()
+        );
+    }
+}
+
 /// daemon 的啟動／運行錯誤。
 #[derive(Debug)]
 pub struct DaemonError {

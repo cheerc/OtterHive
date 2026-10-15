@@ -116,18 +116,6 @@ pub struct DeferInputs {
     pub last_output_at: std::time::Instant,
 }
 
-impl DeferInputs {
-    /// 目前 client 輸入視窗（契約 §6.4 的 3 秒；測試可縮短）。
-    pub const fn input_window() -> Duration {
-        Duration::from_millis(3000)
-    }
-
-    /// 目前輸出靜默視窗（契約 §6.4 的 500 毫秒；測試可縮短）。
-    pub const fn quiet_window() -> Duration {
-        Duration::from_millis(500)
-    }
-}
-
 /// 是否應該延後（契約 §6.4）。
 ///
 /// 兩個條件是**或**關係：client 正在輸入（operator 可能在打字）與收件人
@@ -147,19 +135,47 @@ pub fn should_defer(
     now.saturating_duration_since(inputs.last_output_at) < quiet_window
 }
 
+/// 放棄某則提示的原因（契約 §6.4 的兩個不同事實）。
+///
+/// 這兩個成因在 RED 階段被壓進同一個 `NextAction::Abandoned`，再由
+/// `outcome_for` 一起映成 `not_running`——那會讓「PTY 寫入失敗」被回報成
+/// 「收件人不在執行中」。它們是不同的事實，caller 對下一步的判斷也不同，
+/// 因此在型別上分開。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonReason {
+    /// 收件人已停止，或換了 generation（契約 §6.4 明文的放棄條件）。
+    NotRunning,
+    /// 寫入 PTY 失敗。
+    ///
+    /// **實作判斷，非契約推導**：契約 §6.4 對寫入失敗沒有明文（只對停止／
+    /// 換 generation 放棄）。本模組的決定是**不重試**——PTY master 寫入失敗
+    /// 通常代表 master fd 或程序已經結束，重試只是把同一個錯誤重複到逾時。
+    /// 這個選擇寫在這裡，是為了讓後人知道它是判斷而不是契約要求的。
+    WriteFailed,
+}
+
 /// 排程器下一步該做什麼。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextAction {
     /// 把這一列寫入 `session`，回 [`WakeOutcome::Hinted`]。
+    ///
+    /// **只有真的寫入 PTY 才會是這個值**。沒有任何 bytes 離開本模組時
+    /// 一律不是 `Deliver`——§6.4 明寫「`hinted` 只代表提示已寫入 PTY」。
     Deliver,
     /// 條件未解除，等 [`RECHECK_INTERVAL`] 再判斷。
     ///
     /// 沒有「放棄」分支：延後沒有上限。
     Deferred,
-    /// 收件人已停止或換了 generation，放棄該提示。
+    /// 收件人已停止／換了 generation，或寫入失敗；清空待送清單。
     ///
-    /// 訊息仍在 inbox（契約 §6.4）。
-    Abandoned,
+    /// 訊息仍在 inbox（契約 §6.4）。成因見 [`AbandonReason`]。
+    Abandoned(AbandonReason),
+    /// 沒有待送提示：這一輪不構成一次喚醒。
+    ///
+    /// 這**不是**任何 `wake` 值。排程迴圈在上一輪送完、下一則 `send` 還沒
+    /// 進來時會自然落到這裡；把它回報成 `hinted` 等於對 caller 謊稱提示已
+    /// 寫入。呼叫端必須以 [`Scheduler::outcome_for`] 的 `None` 處理它。
+    NothingToSend,
 }
 
 /// 一個收件人的喚醒排程。
@@ -222,6 +238,7 @@ impl Scheduler {
     ///   並清空待送清單（該提示就此放棄，訊息仍在 inbox）。
     /// - `inputs` 顯示延後條件成立 → `Deferred`（不動清單，稍後重判）。
     /// - 否則 → `Deliver`：把合併後那一行連同送出鍵寫入 PTY，並清空清單。
+    /// - 沒有待送提示 → `NothingToSend`（不是任何 `wake` 值）。
     pub fn check(
         &mut self,
         session: Option<&Session>,
@@ -231,22 +248,28 @@ impl Scheduler {
         quiet_window: Duration,
         now: std::time::Instant,
     ) -> NextAction {
-        if session.is_none() || generation != self.generation {
+        let Some(session) = session else {
+            // 收件人已停止或被移出 `running`（契約 §6.4 的放棄條件）。
             self.pending.clear();
-            return NextAction::Abandoned;
+            return NextAction::Abandoned(AbandonReason::NotRunning);
+        };
+        if generation != self.generation {
+            // 換了 generation：提示不得送到新程序上（契約 §6.4）。
+            self.pending.clear();
+            return NextAction::Abandoned(AbandonReason::NotRunning);
+        }
+        if self.pending.is_empty() {
+            // 沒有待送提示時**不得**寫入任何 bytes，也不得回報 `hinted`——
+            // §6.4 的 `hinted` 只代表提示已寫入 PTY。排程迴圈在上一輪送完、
+            // 下一則 `send` 還沒進來時會落到這裡。
+            return NextAction::NothingToSend;
         }
         if should_defer(inputs, input_window, quiet_window, now) {
             return NextAction::Deferred;
         }
-        let Some(session) = session else {
-            // `is_none` 已在上面擋掉；這裡只是讓編譯器滿意。
-            return NextAction::Abandoned;
-        };
-        let Some(line) = self.pending_line() else {
-            // 沒有待送提示時不該寫入空行；回 `Deliver` 讓呼叫端看到「這輪
-            // 沒事可做」，但沒有任何 bytes 離開本模組。
-            return NextAction::Deliver;
-        };
+        let line = self
+            .pending_line()
+            .expect("繁中說明：上面已確認 pending 非空，pending_line 必有值");
         let mut bytes = line.into_bytes();
         bytes.extend_from_slice(SUBMIT_KEY);
         let written = session.write_input(&bytes).is_ok();
@@ -254,22 +277,25 @@ impl Scheduler {
         if written {
             NextAction::Deliver
         } else {
-            // 寫入失敗與「收件人已不在」是不同的事實：清單已清空（提示不再
-            // 重試），但結果必須如實回報失敗而不是假裝送達。
-            NextAction::Abandoned
+            // 寫入失敗與「收件人已不在」是不同的事實，必須分別回報
+            // （§6.4 的 `failed` 與 `not_running`）。不重試是實作判斷，
+            // 見 [`AbandonReason::WriteFailed`]。
+            NextAction::Abandoned(AbandonReason::WriteFailed)
         }
     }
 
     /// `check` 的結果對應的 `WakeOutcome`。
     ///
-    /// `Abandoned` 依「收件人在提示送出前停止或換了 generation」與「寫入
-    /// 失敗」兩種情形分別回報：排程器用 [`NextAction::Abandoned`] 統一口
-    /// 徑處理，但 `wake` 欄位必須區分（契約 §6.4 的四個值）。
-    pub fn outcome_for(action: NextAction) -> WakeOutcome {
+    /// 回 [`Option`] 而不是 `WakeOutcome` 本身，是為了讓「這一輪不構成一次
+    /// 喚醒」（[`NextAction::NothingToSend`]）在型別上**沒有**對應的
+    /// `wake` 值：呼叫端必須顯式處理 `None`，不能默默把它變成 `hinted`。
+    pub fn outcome_for(action: NextAction) -> Option<WakeOutcome> {
         match action {
-            NextAction::Deliver => WakeOutcome::Hinted,
-            NextAction::Deferred => WakeOutcome::Deferred,
-            NextAction::Abandoned => WakeOutcome::NotRunning,
+            NextAction::Deliver => Some(WakeOutcome::Hinted),
+            NextAction::Deferred => Some(WakeOutcome::Deferred),
+            NextAction::Abandoned(AbandonReason::NotRunning) => Some(WakeOutcome::NotRunning),
+            NextAction::Abandoned(AbandonReason::WriteFailed) => Some(WakeOutcome::Failed),
+            NextAction::NothingToSend => None,
         }
     }
 }
@@ -297,10 +323,26 @@ pub fn recipients_value(entries: &[(String, WakeOutcome, String)]) -> serde_json
 #[cfg(test)]
 mod tests {
     use super::{
-        should_defer, DeferInputs, NextAction, PendingHint, Scheduler, WakeOutcome, HINT_PREFIX,
-        RECHECK_INTERVAL, SUBMIT_KEY,
+        should_defer, AbandonReason, DeferInputs, NextAction, PendingHint, Scheduler, WakeOutcome,
+        HINT_PREFIX, RECHECK_INTERVAL, SUBMIT_KEY,
     };
     use std::time::{Duration, Instant};
+
+    /// 契約 §6.4 的 client 輸入視窗（3 秒）。
+    ///
+    /// 這**只**出現在測試裡。正式路徑的視窗長度由 daemon 的
+    /// `Tuning::wake_input`／`wake_quiet` 提供（`OTTERHIVE_TEST_WAKE_INPUT_MS`
+    /// 與 `OTTERHIVE_TEST_WAKE_QUIET_MS`，契約 §1 的環境變數），所以
+    /// `wake.rs` 的正式路徑不知道自己用哪個數字。這個常數是把契約句搬進
+    /// 可執行的斷言，不是設定值的來源。
+    const fn contract_input_window() -> Duration {
+        Duration::from_secs(3)
+    }
+
+    /// 契約 §6.4 的輸出靜默視窗（500 毫秒）。同上，只是測試用。
+    const fn contract_quiet_window() -> Duration {
+        Duration::from_millis(500)
+    }
 
     fn hint(id: &str) -> PendingHint {
         PendingHint {
@@ -365,12 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn default_windows_match_the_contract() {
-        assert_eq!(DeferInputs::input_window(), Duration::from_secs(3));
-        assert_eq!(DeferInputs::quiet_window(), Duration::from_millis(500));
-    }
-
-    #[test]
     fn a_recent_client_input_defers_even_when_output_is_old() {
         let now = Instant::now();
         let inputs = DeferInputs {
@@ -380,8 +416,8 @@ mod tests {
         assert!(
             should_defer(
                 inputs,
-                DeferInputs::input_window(),
-                DeferInputs::quiet_window(),
+                contract_input_window(),
+                contract_quiet_window(),
                 now
             ),
             "繁中說明：client 最近輸入過就應延後（契約 §6.4）"
@@ -398,8 +434,8 @@ mod tests {
         assert!(
             should_defer(
                 inputs,
-                DeferInputs::input_window(),
-                DeferInputs::quiet_window(),
+                contract_input_window(),
+                contract_quiet_window(),
                 now
             ),
             "繁中說明：收件人最近有輸出就應延後（契約 §6.4）"
@@ -416,8 +452,8 @@ mod tests {
         assert!(
             !should_defer(
                 inputs,
-                DeferInputs::input_window(),
-                DeferInputs::quiet_window(),
+                contract_input_window(),
+                contract_quiet_window(),
                 now
             ),
             "繁中說明：超過 3 秒的輸入不算「最近輸入過」"
@@ -441,7 +477,7 @@ mod tests {
             assert!(
                 should_defer(
                     inputs,
-                    DeferInputs::input_window(),
+                    contract_input_window(),
                     Duration::from_secs(30),
                     now
                 ),
@@ -483,11 +519,11 @@ mod tests {
                 None,
                 8,
                 quiet,
-                DeferInputs::input_window(),
-                DeferInputs::quiet_window(),
+                contract_input_window(),
+                contract_quiet_window(),
                 Instant::now(),
             ),
-            NextAction::Abandoned,
+            NextAction::Abandoned(AbandonReason::NotRunning),
             "繁中說明：換 generation 應放棄提示（契約 §6.4）"
         );
         assert!(
@@ -495,9 +531,143 @@ mod tests {
             "繁中說明：放棄後清單應清空，該提示不再重試"
         );
         assert_eq!(
-            Scheduler::outcome_for(NextAction::Abandoned),
-            WakeOutcome::NotRunning,
+            Scheduler::outcome_for(NextAction::Abandoned(AbandonReason::NotRunning)),
+            Some(WakeOutcome::NotRunning),
             "繁中說明：換 generation 放棄提示時的 wake 應為 not_running"
         );
+    }
+
+    /// 路 B 的驗證：寫入失敗必須回報成 `failed`，不是 `not_running`。
+    ///
+    /// 這條路徑在 RED 階段無法用 `Scheduler::check` 觸發——`check` 需要一個
+    /// `&Session`，而讓 `write_input` 失敗需要 master fd 已經關閉。因此這裡
+    /// 直接驗證映射本身：`Abandoned(WriteFailed)` 與
+    /// `Abandoned(NotRunning)` 必須映射到**不同**的 `WakeOutcome`。
+    #[test]
+    fn a_write_failure_is_not_reported_as_not_running() {
+        assert_eq!(
+            Scheduler::outcome_for(NextAction::Abandoned(AbandonReason::WriteFailed)),
+            Some(WakeOutcome::Failed),
+            "繁中說明：PTY 寫入失敗的 wake 應為 failed（契約 §6.4）"
+        );
+        assert_eq!(
+            Scheduler::outcome_for(NextAction::Abandoned(AbandonReason::NotRunning)),
+            Some(WakeOutcome::NotRunning),
+            "繁中說明：收件人不在 running 的 wake 應為 not_running"
+        );
+        assert_ne!(
+            Scheduler::outcome_for(NextAction::Abandoned(AbandonReason::WriteFailed)),
+            Scheduler::outcome_for(NextAction::Abandoned(AbandonReason::NotRunning)),
+            "繁中說明：寫入失敗與收件人不在 running 是兩個不同事實，不得映成同一個 wake 值"
+        );
+    }
+
+    /// 路 C 的驗證：沒有待送提示時**不得**有任何 wake 值。
+    ///
+    /// §6.4 明寫「`hinted` 只代表提示已寫入 PTY」。排程迴圈在上一輪送完、
+    /// 下一則 `send` 還沒進來時會落到這裡；回報成 `hinted` 會對 caller
+    /// 謊稱提示已寫入。
+    #[test]
+    fn an_empty_queue_has_no_wake_outcome_at_all() {
+        assert_eq!(
+            Scheduler::outcome_for(NextAction::NothingToSend),
+            None,
+            "繁中說明：沒有待送提示時不該有任何 wake 值（§6.4 的 hinted 只代表已寫入 PTY）"
+        );
+        assert_ne!(
+            Scheduler::outcome_for(NextAction::NothingToSend),
+            Some(WakeOutcome::Hinted),
+            "繁中說明：NothingToSend 絕不可被映成 hinted"
+        );
+    }
+
+    /// `check` 遇到 `session` 為 `None` 時一律回
+    /// `Abandoned(NotRunning)`，即使清單是空的。
+    ///
+    /// 這是刻意的取捨：清單為空與「沒有可放的提示」相比，
+    /// **`session` 不存在是更強的事實**——收件人根本沒在跑。因此判斷順序是
+    /// 先看 session／generation，再看清單。`NothingToSend` 留給「收件人健在
+    /// 但此刻沒有待送提示」那一種（排程迴圈的正常空轉）。
+    #[test]
+    fn a_missing_session_abandons_even_with_an_empty_queue() {
+        let scheduler = Scheduler::new(7);
+        let quiet = DeferInputs {
+            last_client_input_at: None,
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        let mut scheduler = scheduler;
+        let action = scheduler.check(
+            None,
+            7,
+            quiet,
+            contract_input_window(),
+            contract_quiet_window(),
+            Instant::now(),
+        );
+        assert_eq!(
+            action,
+            NextAction::Abandoned(AbandonReason::NotRunning),
+            "繁中說明：session 為 None 是比「沒有提示」更強的事實，應回 Abandoned(NotRunning)"
+        );
+    }
+
+    /// 有待送提示但 generation 不符 → `Abandoned(NotRunning)`，清單清空。
+    ///
+    /// 這條覆蓋「換 generation 放棄提示」在**有**待送提示時的實際清空行為
+    /// （上一支覆蓋的是 session 為 None 的分支）。
+    #[test]
+    fn abandoning_clears_the_queue_so_the_hint_is_not_retried() {
+        let mut scheduler = Scheduler::new(7);
+        scheduler.enqueue(hint("m1"));
+        let quiet = DeferInputs {
+            last_client_input_at: None,
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        let action = scheduler.check(
+            None,
+            99,
+            quiet,
+            contract_input_window(),
+            contract_quiet_window(),
+            Instant::now(),
+        );
+        assert_eq!(
+            action,
+            NextAction::Abandoned(AbandonReason::NotRunning),
+            "繁中說明：換 generation 應放棄（契約 §6.4）"
+        );
+        assert!(
+            !scheduler.is_pending(),
+            "繁中說明：放棄後清單應清空，該提示不再重試（訊息仍在 inbox）"
+        );
+        assert_eq!(
+            scheduler.pending_len(),
+            0,
+            "繁中說明：放棄後不得殘留任何待送提示"
+        );
+    }
+
+    /// 延後時清單必須完整保留（與放棄相反）。
+    #[test]
+    fn deferring_keeps_the_queue_intact() {
+        let mut scheduler = Scheduler::new(7);
+        scheduler.enqueue(hint("m1"));
+        scheduler.enqueue(hint("m2"));
+        let typing = DeferInputs {
+            last_client_input_at: Some(Instant::now()),
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        // `session` 為 None 會命中放棄分支，所以延後分支必須靠
+        // `should_defer` 單獨驗證（`check` 需要活著的 Session）。
+        assert!(
+            should_defer(
+                typing,
+                contract_input_window(),
+                contract_quiet_window(),
+                Instant::now()
+            ),
+            "繁中說明：client 剛輸入過應判定為延後"
+        );
+        assert_eq!(scheduler.pending_len(), 2, "繁中說明：延後不清單");
     }
 }

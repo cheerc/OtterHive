@@ -23,6 +23,12 @@
 //! （transport 六條、`-32601`、`-32000`、`-32001`、schema 等於 catalog）
 //! 由 `tests/mcp_wire.rs` 原樣保留，只有「工具清單」那幾條被改寫成 T5 的
 //! 契約集合——那是契約更新，不是把測試拿掉。
+//!
+//! GREEN 階段 `tests/backend_contract.rs` 的對撞測試
+//! （`daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind`）已從
+//! `DEFERRED_TO_LATER_PHASE` 遷移到 [`NOT_LISTED_IN_P1A`]，因此
+//! `DEFERRED_TO_LATER_PHASE` 這個相容別名**已移除**，本模組不再有兩個
+//! 「不列入」清單。
 
 use serde_json::{json, Value};
 
@@ -75,28 +81,6 @@ pub const NOT_LISTED_IN_P1A: [&str; 8] = [
     "task",
     "set_metadata",
     "schedule",
-];
-
-/// `DEFERRED_TO_LATER_PHASE` 的相容別名。
-///
-/// **T5 沿用**：T4 的 `tests/backend_contract.rs`
-/// （`daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind`，不在
-/// Lane B 的檔案所有權內）仍引用這個名字，而那條對撞測試的語意——「不列入
-/// 工具清單的工具不得出現在 wire 清單裡」——在 T5 之後必須繼續跑。
-///
-/// 因此這裡保留舊名作為別名，而不是去改別人的檔案。內容刻意**不同**（舊名
-/// 7 項、不含 `schedule`；新名 8 項），這樣一旦有人只改其中一個，這段文件的
-/// 意圖仍然成立。
-///
-/// 這個常數可以在 `backend_contract.rs` 遷移之後移除。
-pub const DEFERRED_TO_LATER_PHASE: [&str; 7] = [
-    "create_instance",
-    "start_instance",
-    "delete_instance",
-    "deployment",
-    "decision",
-    "task",
-    "set_metadata",
 ];
 
 /// 該 caller 看得到的工具名稱（已固定順序，讓 `tools/list` 的輸出可預期）。
