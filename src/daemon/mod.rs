@@ -2305,7 +2305,24 @@ fn restart_instance(
                 return refused;
             }
         }
+        // 契約 §4.4 的順序是「`fresh` **先**把該 instance 所有 `delivering`
+        // 訊息退回 `unread`（舊 token 失效）；`resume` 保留 lease」，然後才
+        // 依 §4.3 停止舊程序。所以重新排隊發生在停止之前——舊程序還在跑時
+        // 它的收件匣就已經回到可重送的狀態，不會有「舊程序還在 drain、舊
+        // token 卻已失效」的窗口。
         let mut effects = Vec::new();
+        if mode != "resume" {
+            let requeued = {
+                let mut inner = state.lock();
+                inner
+                    .store
+                    .transaction(|tx| tx.requeue_delivering_on_fresh(&row.id))
+                    .unwrap_or_default()
+            };
+            if requeued > 0 {
+                effects.push(String::from("messages_requeued"));
+            }
+        }
         if row.pid.is_some() {
             match stop_previous(state, &row) {
                 PreviousOutcome::Stopped => effects.push(String::from("process_stopped")),
