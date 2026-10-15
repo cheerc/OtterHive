@@ -839,6 +839,60 @@ fn partial_broadcast_reports_each_recipient() {
     assert_eq!(message_rows(&home, "alpha").len(), 1);
 }
 
+/// §6.1：收件人名單去重是對**所有**收件人選擇子的要求，不只 team 廣播。
+#[test]
+fn an_explicit_recipient_list_is_deduplicated() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+    create_instance(&daemon, &home, "alpha");
+    create_instance(&daemon, &home, "beta");
+
+    let sent = daemon.operator_call(
+        &home,
+        "send",
+        json!({"instances": ["alpha", "alpha", "beta"], "message": "一次就夠"}),
+    );
+    assert_eq!(
+        sent.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：send 應完成，實際為 {sent:?}"
+    );
+
+    let recipients = sent.value["recipients"]
+        .as_array()
+        .unwrap_or_else(|| panic!("繁中說明：send 應回 recipients 陣列，實際 {}", sent.value))
+        .clone();
+    assert_eq!(
+        recipients.len(),
+        2,
+        "繁中說明：重複的 alpha 應去重，實際 {recipients:?}"
+    );
+    assert_eq!(
+        recipients[0]["instance"],
+        json!("alpha"),
+        "繁中說明：去重後應保留第一次出現的位置，實際 {recipients:?}"
+    );
+    assert_eq!(
+        recipients[1]["instance"],
+        json!("beta"),
+        "實際 {recipients:?}"
+    );
+
+    // 每個收件人恰好一則：不是兩則。
+    assert_eq!(
+        message_rows(&home, "alpha").len(),
+        1,
+        "繁中說明：alpha 只應收到一則，實際 {:?}",
+        message_rows(&home, "alpha")
+    );
+    assert_eq!(
+        message_rows(&home, "beta").len(),
+        1,
+        "繁中說明：beta 應收到一則，實際 {:?}",
+        message_rows(&home, "beta")
+    );
+}
+
 /// §6.1：全部收件人失敗回 `refused`（operation 層）。
 #[test]
 fn a_send_with_no_viable_recipient_is_refused() {
@@ -1135,14 +1189,20 @@ fn acking_with_the_wrong_token_is_stale() {
     );
 }
 
-/// §6.3：drain 一次最多取 48 KiB（至少一則）。三則 30 KiB 的訊息，第一次
-/// drain 只取到上限內的筆數，`remaining` 正確。
+/// §6.3：drain 一次最多取 48 KiB 的 body bytes（至少一則），預算不跨批次。
+///
+/// 每則 body 是 1 個 index 字元 + 30×1024 個 `x` = 30 721 bytes。三則依序
+/// drain：每個批次都只能塞下一則（兩則 = 61 442 > 49 152），所以
+/// `remaining` 依序是 2、1、0——這正是「48 KiB 上限不因上一批已取走而放寬」
+/// 的可觀測結果。
 #[test]
 fn drain_batch_respects_the_byte_budget() {
     let home = TestHome::new();
-    let daemon = Daemon::start(&home);
+    // lease 拉長，讓「lease 過期重送」不可能成為批次拆分的理由。
+    let daemon = Daemon::start_with_env(&home, &[("OTTERHIVE_TEST_LEASE_MS", "600000")]);
     create_instance(&daemon, &home, "alpha");
 
+    let body_bytes = 1 + 30 * 1024;
     for index in 0..3 {
         let sent = daemon.operator_call(
             &home,
@@ -1156,57 +1216,66 @@ fn drain_batch_respects_the_byte_budget() {
         );
     }
 
-    let (drained, _, messages) = drain(&daemon, &home, "alpha");
-    assert_eq!(
-        drained.outcome,
-        otterhive::protocol::Outcome::Completed,
-        "繁中說明：drain 應完成，實際為 {drained:?}"
-    );
-    let total: usize = messages
-        .iter()
-        .map(|message| message["body"].as_str().unwrap_or_default().len())
-        .sum();
-    assert!(
-        total <= DRAIN_BUDGET_BYTES,
-        "繁中說明：一次 drain 的 body 總和應不超過 48 KiB，實際 {total} bytes（{} 則）",
-        messages.len()
-    );
-    assert!(
-        !messages.is_empty(),
-        "繁中說明：至少要取到一則（48 KiB 上限不套用於單則）"
-    );
-    assert!(
-        messages.len() < 3,
-        "繁中說明：30 KiB × 3 放不進 48 KiB，實際取到 {} 則",
-        messages.len()
-    );
-    assert_eq!(
-        drained.value["remaining"],
-        json!(3 - messages.len() as u64),
-        "繁中說明：remaining 應是尚未 drain 的筆數，實際 {}",
-        drained.value
-    );
+    // 三批：每批一則，remaining 依序 2、1、0。
+    for (round, expected_remaining) in [2u64, 1, 0].into_iter().enumerate() {
+        let (drained, token, messages) = drain(&daemon, &home, "alpha");
+        assert_eq!(
+            drained.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：第 {} 次 drain 應完成，實際為 {drained:?}",
+            round + 1
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "繁中說明：兩則（{} × 2 = {} bytes）放不進 48 KiB，第 {} 次應只取一則，實際 {messages:?}",
+            body_bytes,
+            body_bytes * 2,
+            round + 1
+        );
+        assert!(
+            !token.is_empty(),
+            "繁中說明：第 {} 次有訊息就應發 delivery_token",
+            round + 1
+        );
+        let total: usize = messages
+            .iter()
+            .map(|message| message["body"].as_str().unwrap_or_default().len())
+            .sum();
+        assert!(
+            total <= DRAIN_BUDGET_BYTES,
+            "繁中說明：第 {} 次的 body 總和應不超過 48 KiB，實際 {total} bytes",
+            round + 1
+        );
+        assert_eq!(
+            drained.value["remaining"],
+            json!(expected_remaining),
+            "繁中說明：第 {} 次 drain 後 remaining 應是 {expected_remaining}，實際 {}",
+            round + 1,
+            drained.value
+        );
+    }
 
-    // 剩下兩則在第二次 drain 全部取回，且 bytes 總和不超過上限。
-    let (second, _, rest) = drain(&daemon, &home, "alpha");
+    // 第四批：全部取完 → 空陣列、不發 token、remaining 仍為 0。
+    let (fourth, token, empty) = drain(&daemon, &home, "alpha");
     assert_eq!(
-        second.outcome,
+        fourth.outcome,
         otterhive::protocol::Outcome::Completed,
-        "繁中說明：第二次 drain 應完成，實際為 {second:?}"
+        "繁中說明：第四次 drain 應完成，實際為 {fourth:?}"
     );
-    let rest_total: usize = rest
-        .iter()
-        .map(|message| message["body"].as_str().unwrap_or_default().len())
-        .sum();
     assert!(
-        rest_total <= DRAIN_BUDGET_BYTES,
-        "繁中說明：第二次 drain 也不應超過 48 KiB，實際 {rest_total} bytes"
+        empty.is_empty(),
+        "繁中說明：第四批應沒有訊息，實際 {empty:?}"
+    );
+    assert!(
+        token.is_empty(),
+        "繁中說明：沒有訊息時不發 token，實際 {token:?}"
     );
     assert_eq!(
-        second.value["remaining"],
+        fourth.value["remaining"],
         json!(0),
-        "繁中說明：全部取完後 remaining 應為 0，實際 {}",
-        second.value
+        "繁中說明：取完後 remaining 應為 0，實際 {}",
+        fourth.value
     );
 }
 
