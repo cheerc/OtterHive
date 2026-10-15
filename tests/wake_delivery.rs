@@ -53,6 +53,9 @@ const WAKE_INPUT_MS: u64 = 700;
 /// 測試用的輸出靜默視窗（毫秒）。
 const WAKE_QUIET_MS: u64 = 150;
 
+/// 提示的識別前綴（契約 §6.4）。
+const HINT_MARKER: &str = "[OTTERHIVE-MSG]";
+
 /// daemon binary 路徑。
 fn daemon_bin() -> &'static str {
     match option_env!("CARGO_BIN_EXE_otterhive") {
@@ -337,13 +340,28 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// 把 frame 序列還原成純文字（Output 的 payload 直接串接）。
+/// 把 frame 序列還原成純文字（Output 的 bytes 直接串接）。
+///
+/// 契約 §7.2：tag `0x02`（Output）的 payload 是 **8 byte big-endian seq ＋
+/// bytes**。那 8 個 seq bytes 不是畫面內容，必須先剝掉——否則 `\0` 會混進
+/// 比對用的字串裡，`[OTTERHIVE-MSG]` 的開頭還會被前一個 seq 的高位元組污染。
+///
+/// chunks 之間**不**去重也不重新分段：seq 遞增、bytes 依序串接就是畫面順序
+/// （§7.1「PTY reader 每取得一個非空 chunk…以此時就是計數點」）。
 fn frame_text(frames: &[(u8, Vec<u8>)]) -> String {
     let mut text = String::new();
     for (tag, payload) in frames {
-        if *tag == 0x02 {
-            text.push_str(&String::from_utf8_lossy(payload));
+        if *tag != 0x02 {
+            continue;
         }
+        // payload 短於 8 bytes 的 Output frame 不合法（§7.2）；把它整段當
+        // bytes 收下而不是 panic，讓斷言去報「沒有看到預期的文字」。
+        let bytes = if payload.len() >= 8 {
+            &payload[8..]
+        } else {
+            payload
+        };
+        text.push_str(&String::from_utf8_lossy(bytes));
     }
     text
 }
@@ -416,15 +434,16 @@ fn a_running_recipient_receives_the_hint_line_with_its_submit_key() {
         text.contains("ready>") || text.is_empty(),
         "繁中說明：attach 後應看到 fixture 的 ready 提示或乾淨畫面，實際為 {text:?}"
     );
-    // 送出，讓 fixture 進入安靜期。
-    client.type_bytes(b"quiet\n");
-    let _ = client.drain_frames(Duration::from_millis(WAKE_QUIET_MS + 400));
-    // 離開：attach client 存在時，operator 就算不輸入也仍是「有人盯著」；
-    // detach 讓這個 instance 的閒置語意回到乾淨狀態。
-    client.detach();
-    drop(client);
-    std::thread::sleep(Duration::from_millis(WAKE_QUIET_MS + 200));
-
+    // 這個測試在**提示送出前**就維持 attach：§6.4 的延後條件是「有 client 在
+    // 最近 3 秒內輸入過」，detach 不會消除 client 的存在。若在這裡先 detach 再
+    // send，daemon 會回 `hinted` 而提示仍真的寫進 PTY——但那時畫面上已經沒有
+    // 人在看，要證明「提示送達」就只能事後重新 attach，而新連線的 Snapshot 是
+    // 重繪的**當下畫面**（§7.2），不是變更紀錄，先前的輸出不一定還在裡面。
+    // 留在線上才觀察得到真正的 PTY 輸出串流。
+    //
+    // 不送出任何輸入：輸入會觸發「最近輸入過」的延後條件，那是下一支測試的事。
+    // `echo_agent.sh` 印完 `ready>` 之後就是靜默的，沒有輸入就不會有輸出，
+    // `send` 時兩個延後條件都不成立。
     let sent = daemon.operator_call(
         &home,
         "send",
@@ -443,10 +462,9 @@ fn a_running_recipient_receives_the_hint_line_with_its_submit_key() {
     );
 
     // 提示真的走 PTY 進了 agent：`echo_agent.sh` 會把它回印成 `echo: …`。
-    let mut client = AttachClient::attach(&home, "worker", worker);
     let observed = frame_text(&client.drain_frames(HINT_TIMEOUT));
     assert!(
-        observed.contains("[OTTERHIVE-MSG]"),
+        observed.contains(HINT_MARKER),
         "繁中說明：提示應經 PTY 送達收件人（契約 §6.4），實際觀察到 {observed:?}"
     );
     assert!(
@@ -572,11 +590,42 @@ fn two_deferred_hints_are_merged_into_one_line_with_a_count() {
         merged.contains(second_id),
         "繁中說明：合併行的 id 應是最後一則的 message id（契約 §6.4），預期包含 {second_id}，實際觀察到 {merged:?}"
     );
-    // 只有一行提示：兩個獨立的 `[OTTERHIVE-MSG]` 前綴代表沒合併。
+    // 剛好**一格**提示寫進 PTY：兩個獨立的 `[OTTERHIVE-MSG]` 前綴代表兩則沒有
+    // 被合併（每則各寫一格）。`echo_agent.sh` 會把收到的一行原樣回印成
+    // `echo: <行>`，所以同一格提示在畫面上出現兩次是**必然**的——一次是提示本身
+    // （agent 讀到的輸入），一次是回聲。數前綴而不是數行才是在數「寫入了幾格」。
+    //
+    // 這是 GREEN 階段修好 `wake_targets` 恆空之後才浮現的問題：先前那兩則各自
+    // 送出時前綴也是兩個，測試因為「數到 2 就紅」而沒能分辨「沒合併」與「回聲」。
+    let hint_lines: Vec<&str> = merged
+        .lines()
+        .filter(|line| line.starts_with(HINT_MARKER))
+        .filter(|line| !line.starts_with(&format!("echo: {HINT_MARKER}")))
+        .collect();
     assert_eq!(
-        merged.matches("[OTTERHIVE-MSG]").count(),
+        hint_lines.len(),
         1,
-        "繁中說明：兩則延後的提示應合併為**一行**（契約 §6.4），實際觀察到 {merged:?}"
+        "繁中說明：兩則延後的提示應合併為**一格**（契約 §6.4 的 count=<n>），\
+         實際寫入的提示格數為 {hint_lines:?}"
+    );
+    let delivered = hint_lines[0];
+    assert!(
+        delivered.contains("count=2"),
+        "繁中說明：合併後寫入的那一格應帶 count=2（契約 §6.4），實際為 {delivered:?}"
+    );
+    assert_eq!(
+        delivered.matches(HINT_MARKER).count(),
+        1,
+        "繁中說明：一格之內不該出現第二個提示前綴（那就是兩格了），實際為 {delivered:?}"
+    );
+    let still_pending: Vec<&str> = merged
+        .lines()
+        .filter(|line| line.starts_with(&format!("echo: {HINT_MARKER}")))
+        .collect();
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "繁中說明：agent 回聲的格數應與寫入的格數一致（用來確認沒有第二格漏寫），實際為 {still_pending:?}"
     );
 }
 
