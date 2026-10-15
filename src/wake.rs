@@ -27,8 +27,6 @@
 
 use std::time::Duration;
 
-use crate::terminal::session::Session;
-
 /// 重新判斷延後條件的間隔（契約 §6.4 的「每 250 毫秒」）。
 ///
 /// 不是逾時：不達到就重判。它是節拍，所以不隨測試調整——把節拍做成可調
@@ -155,13 +153,16 @@ pub enum AbandonReason {
 }
 
 /// 排程器下一步該做什麼。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextAction {
-    /// 把這一列寫入 `session`，回 [`WakeOutcome::Hinted`]。
+    /// 要把這一列寫入 PTY（payload 是提示行 ＋ 送出鍵），回
+    /// [`WakeOutcome::Hinted`]。
     ///
-    /// **只有真的寫入 PTY 才會是這個值**。沒有任何 bytes 離開本模組時
-    /// 一律不是 `Deliver`——§6.4 明寫「`hinted` 只代表提示已寫入 PTY」。
-    Deliver,
+    /// **`check` 只做決策、不做 I/O**：bytes 由呼叫端在鎖外寫入後，才呼叫
+    /// [`Scheduler::commit_delivery`] 清單並回報結果。寫入失敗時呼叫端回
+    /// `Abandoned(WriteFailed)` 而**不**是這個值——§6.4 明寫「`hinted` 只
+    /// 代表提示已寫入 PTY」，所以「決定要送」不等於「送到了」。
+    Deliver(Vec<u8>),
     /// 條件未解除，等 [`RECHECK_INTERVAL`] 再判斷。
     ///
     /// 沒有「放棄」分支：延後沒有上限。
@@ -231,37 +232,54 @@ impl Scheduler {
             .last()
             .map(|last| last.render(self.pending.len()))
     }
-
-    /// 依目前狀態決定下一步。
+    /// 依目前狀態決定下一步。**不做任何 I/O。**
     ///
-    /// - `session` 為 `None`（收件人已停止或換 generation）→ `Abandoned`，
-    ///   並清空待送清單（該提示就此放棄，訊息仍在 inbox）。
-    /// - `inputs` 顯示延後條件成立 → `Deferred`（不動清單，稍後重判）。
-    /// - 否則 → `Deliver`：把合併後那一行連同送出鍵寫入 PTY，並清空清單。
+    /// - `session` 為 `None`（收件人已停止或被移出 `running`）→ `Abandoned`
+    ///   (NotRunning)，並清空待送清單（該提示就此放棄，訊息仍在 inbox）。
+    /// - `generation` 不符 → 同上（契約 §6.4 的放棄條件）。
     /// - 沒有待送提示 → `NothingToSend`（不是任何 `wake` 值）。
+    /// - 延後條件成立 → `Deferred`（不動清單，稍後重判；**延後沒有上限**）。
+    /// - 否則 → `Deliver(bytes)`：把要寫入 PTY 的那一行連同送出鍵交給呼叫端。
+    ///
+    /// ## 為什麼把寫入移出本函式
+    ///
+    /// 呼叫端（daemon 的 dispatch）在持有 daemon 全域鎖的情況下呼叫本函式，
+    /// 而 PTY master fd 是**阻塞式**的（`portable-pty` 的 `openpty` 不設
+    /// `O_NONBLOCK`）。若本函式自己寫入，一個不讀 stdin 的 agent 就可能讓
+    /// `write_all` 阻塞，而鎖被持有——那會讓整個 daemon 的所有操作停擺。
+    /// §6.4 的「延後沒有上限」加上 250ms 的重判節拍讓這個路徑可以無限重複，
+    /// 所以它是全域鎖上的阻塞 I/O，必須由呼叫端在鎖外完成。
+    ///
+    /// ## 為什麼這裡不清空 `pending`
+    ///
+    /// 清空必須發生在**寫入之後**，否則「寫入失敗」會被誤報成 `hinted`：
+    /// 呼叫端拿到 `Deliver` 但寫入失敗時，若清單已被清空，重判迴圈就沒有東西
+    /// 可以重試；若沒清空，它會在下一次重判時重複送出同一格。呼叫端必須在
+    /// 寫入之後呼叫 [`Scheduler::commit_delivery`]（成功時）或 `check` 的
+    /// 放棄分支（失敗時，回 `Abandoned(WriteFailed)`）來決定。
     pub fn check(
         &mut self,
-        session: Option<&Session>,
+        session_present: bool,
         generation: u64,
         inputs: DeferInputs,
         input_window: Duration,
         quiet_window: Duration,
         now: std::time::Instant,
     ) -> NextAction {
-        let Some(session) = session else {
+        if !session_present {
             // 收件人已停止或被移出 `running`（契約 §6.4 的放棄條件）。
             self.pending.clear();
             return NextAction::Abandoned(AbandonReason::NotRunning);
-        };
+        }
         if generation != self.generation {
             // 換了 generation：提示不得送到新程序上（契約 §6.4）。
             self.pending.clear();
             return NextAction::Abandoned(AbandonReason::NotRunning);
         }
         if self.pending.is_empty() {
-            // 沒有待送提示時**不得**寫入任何 bytes，也不得回報 `hinted`——
-            // §6.4 的 `hinted` 只代表提示已寫入 PTY。排程迴圈在上一輪送完、
-            // 下一則 `send` 還沒進來時會落到這裡。
+            // 沒有待送提示時**不得**有任何 bytes 離開本模組，也不得回報
+            // `hinted`——§6.4 的 `hinted` 只代表提示已寫入 PTY。排程迴圈在
+            // 上一輪送完、下一則 `send` 還沒進來時會落到這裡。
             return NextAction::NothingToSend;
         }
         if should_defer(inputs, input_window, quiet_window, now) {
@@ -272,18 +290,18 @@ impl Scheduler {
             .expect("繁中說明：上面已確認 pending 非空，pending_line 必有值");
         let mut bytes = line.into_bytes();
         bytes.extend_from_slice(SUBMIT_KEY);
-        let written = session.write_input(&bytes).is_ok();
-        self.pending.clear();
-        if written {
-            NextAction::Deliver
-        } else {
-            // 寫入失敗與「收件人已不在」是不同的事實，必須分別回報
-            // （§6.4 的 `failed` 與 `not_running`）。不重試是實作判斷，
-            // 見 [`AbandonReason::WriteFailed`]。
-            NextAction::Abandoned(AbandonReason::WriteFailed)
-        }
+        NextAction::Deliver(bytes)
     }
 
+    /// 寫入完成後清空待送清單。
+    ///
+    /// 由呼叫端在**寫入之後**呼叫：成功時這一格提示已進入 PTY，呼叫端回
+    /// `hinted`；失敗時呼叫端回 `failed`（`AbandonReason::WriteFailed`）——
+    /// 兩種情況都不重試（實作判斷，非契約推導，見
+    /// [`AbandonReason::WriteFailed`]）。
+    pub fn commit_delivery(&mut self) {
+        self.pending.clear();
+    }
     /// `check` 的結果對應的 `WakeOutcome`。
     ///
     /// 回 [`Option`] 而不是 `WakeOutcome` 本身，是為了讓「這一輪不構成一次
@@ -291,33 +309,13 @@ impl Scheduler {
     /// `wake` 值：呼叫端必須顯式處理 `None`，不能默默把它變成 `hinted`。
     pub fn outcome_for(action: NextAction) -> Option<WakeOutcome> {
         match action {
-            NextAction::Deliver => Some(WakeOutcome::Hinted),
+            NextAction::Deliver(_) => Some(WakeOutcome::Hinted),
             NextAction::Deferred => Some(WakeOutcome::Deferred),
             NextAction::Abandoned(AbandonReason::NotRunning) => Some(WakeOutcome::NotRunning),
             NextAction::Abandoned(AbandonReason::WriteFailed) => Some(WakeOutcome::Failed),
             NextAction::NothingToSend => None,
         }
     }
-}
-
-/// 產生 `send` 結果中每個收件人的 `wake` 欄位（契約 §6.1／§6.4）。
-///
-/// 這裡只負責把排程結果放進 `value.recipients[]` 的形狀裡；訊息本體的交易
-/// 由呼叫端在**提交之後**才呼叫本函式，確保「喚醒失敗不撤回訊息」。
-pub fn recipients_value(entries: &[(String, WakeOutcome, String)]) -> serde_json::Value {
-    serde_json::Value::Array(
-        entries
-            .iter()
-            .map(|(instance, wake, message_id)| {
-                serde_json::json!({
-                    "instance": instance,
-                    "outcome": "queued",
-                    "message_id": message_id,
-                    "wake": wake.as_wire(),
-                })
-            })
-            .collect(),
-    )
 }
 
 #[cfg(test)]
@@ -512,11 +510,11 @@ mod tests {
             last_client_input_at: None,
             last_output_at: Instant::now() - Duration::from_secs(60),
         };
-        // 收件人還活著（`session` 是 `Some`），但 generation 從 7 變成 8：
+        // 收件人還活著（`session_present` 為 true），但 generation 從 7 變成 8：
         // 提示必須放棄，不能被送到新程序上（契約 §6.4）。
         assert_eq!(
             scheduler.check(
-                None,
+                true,
                 8,
                 quiet,
                 contract_input_window(),
@@ -597,7 +595,7 @@ mod tests {
         };
         let mut scheduler = scheduler;
         let action = scheduler.check(
-            None,
+            false,
             7,
             quiet,
             contract_input_window(),
@@ -624,7 +622,7 @@ mod tests {
             last_output_at: Instant::now() - Duration::from_secs(60),
         };
         let action = scheduler.check(
-            None,
+            false,
             99,
             quiet,
             contract_input_window(),
@@ -657,7 +655,7 @@ mod tests {
             last_client_input_at: Some(Instant::now()),
             last_output_at: Instant::now() - Duration::from_secs(60),
         };
-        // `session` 為 None 會命中放棄分支，所以延後分支必須靠
+        // `session_present` 為 false 會命中放棄分支，所以延後分支必須靠
         // `should_defer` 單獨驗證（`check` 需要活著的 Session）。
         assert!(
             should_defer(
@@ -669,5 +667,143 @@ mod tests {
             "繁中說明：client 剛輸入過應判定為延後"
         );
         assert_eq!(scheduler.pending_len(), 2, "繁中說明：延後不清單");
+    }
+    /// D-1 的驗證：`check` **不持有** `Session` 的引用，因此不可能呼叫
+    /// `write_input`。
+    ///
+    /// 這是對「決策與寫入分離」最直接的證據——如果 `check` 的簽章收
+    /// `Option<&Session>`，它就**有能力**在呼叫端持有 daemon 鎖時阻塞寫入；
+    /// 現在它連 `Session` 的型別都看不到，所以那個阻塞 I/O 在型別上不可達。
+    ///
+    /// 函式指標的型別即證明：簽章要匹配，`check` 只能接受這六個參數。
+    #[test]
+    fn check_cannot_even_name_a_session_so_it_cannot_block_on_a_write() {
+        type CheckFn =
+            fn(&mut Scheduler, bool, u64, DeferInputs, Duration, Duration, Instant) -> NextAction;
+        let _check: CheckFn = Scheduler::check;
+        assert!(
+            !std::any::type_name::<Scheduler>().contains("Session"),
+            "繁中說明：Scheduler 不該持有 Session（持有會讓寫入路徑可達）"
+        );
+    }
+
+    /// `Deliver` 帶的是「提示行 ＋ 送出鍵」，且**不含**任何待送清單之外的
+    /// 內容——呼叫端寫入的 bytes 完全由排程器決定。
+    #[test]
+    fn deliver_carries_the_merged_line_plus_the_submit_key() {
+        let mut scheduler = Scheduler::new(7);
+        scheduler.enqueue(hint("m1"));
+        scheduler.enqueue(hint("m2"));
+        let quiet = DeferInputs {
+            last_client_input_at: None,
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        let decision = scheduler.check(
+            true,
+            7,
+            quiet,
+            contract_input_window(),
+            contract_quiet_window(),
+            Instant::now(),
+        );
+        let NextAction::Deliver(bytes) = decision else {
+            panic!("繁中說明：安靜且有待送提示時應回 Deliver，實際為 {decision:?}");
+        };
+        let text = String::from_utf8(bytes).expect("繁中說明：提示 bytes 應是合法 UTF-8");
+        assert_eq!(
+            text,
+            format!(
+                "{}[OTTERHIVE-MSG] count=2 from=operator kind=query id=m2\r",
+                ""
+            ),
+            "繁中說明：Deliver 的 payload 是合併後那一行加上送出鍵（契約 §6.4）"
+        );
+        assert!(
+            text.ends_with("\r"),
+            "繁中說明：送出鍵必須在同一次寫入內，否則 agent 讀到一半的提示會當成完整訊息"
+        );
+    }
+
+    /// `check` 回 `Deliver` 之後**不**清空清單——清空必須由呼叫端在寫入之後
+    /// 用 [`Scheduler::commit_delivery`] 完成。
+    ///
+    /// 這是 D-1 分離的關鍵不變量：若 `check` 自行清空，呼叫端寫入失敗時就沒有
+    /// 任何東西可以重試，而「寫入失敗」又不能回報成 `hinted`（§6.4）。
+    #[test]
+    fn deliver_does_not_clear_the_queue_until_the_caller_commits() {
+        let mut scheduler = Scheduler::new(7);
+        scheduler.enqueue(hint("m1"));
+        let quiet = DeferInputs {
+            last_client_input_at: None,
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        let decision = scheduler.check(
+            true,
+            7,
+            quiet,
+            contract_input_window(),
+            contract_quiet_window(),
+            Instant::now(),
+        );
+        assert!(
+            matches!(decision, NextAction::Deliver(_)),
+            "繁中說明：應回 Deliver，實際為 {decision:?}"
+        );
+        assert_eq!(
+            scheduler.pending_len(),
+            1,
+            "繁中說明：check 回 Deliver 後清單不得被清空（清空是呼叫端在寫入之後的責任）"
+        );
+        scheduler.commit_delivery();
+        assert_eq!(
+            scheduler.pending_len(),
+            0,
+            "繁中說明：commit_delivery 之後才清空"
+        );
+        assert!(
+            !scheduler.is_pending(),
+            "繁中說明：commit_delivery 後不得殘留待送提示（否則會被重複送出）"
+        );
+    }
+
+    /// 寫入失敗時不重試（延續先前的裁決）：呼叫端在寫入失敗後**不**呼叫
+    /// `commit_delivery`、而是直接把該提示當成放棄處理。
+    ///
+    /// 這條測試記錄的是**呼叫端必須遵守的契約**，不是 `check` 的行為——
+    /// 所以它在 `wake.rs` 裡是以文件形式存在的斷言：清單仍在，
+    /// 代表重判迴圈的下一輪會再看到它，呼叫端要嘛重試、要嘛在鎖內把它清掉。
+    #[test]
+    fn a_failed_write_leaves_the_queue_for_the_caller_to_decide() {
+        let mut scheduler = Scheduler::new(7);
+        scheduler.enqueue(hint("m1"));
+        let quiet = DeferInputs {
+            last_client_input_at: None,
+            last_output_at: Instant::now() - Duration::from_secs(60),
+        };
+        // 模擬「呼叫端寫入失敗」：拿到 Deliver、不 commit。
+        let decision = scheduler.check(
+            true,
+            7,
+            quiet,
+            contract_input_window(),
+            contract_quiet_window(),
+            Instant::now(),
+        );
+        assert!(matches!(decision, NextAction::Deliver(_)));
+        assert_eq!(
+            scheduler.pending_len(),
+            1,
+            "繁中說明：寫入失敗時排程器**不**自行決定重試或放棄——那是呼叫端的裁決"
+        );
+        // 呼叫端選擇不放棄（清單由重判迴圈的收尾路徑清掉）：回 Abandoned(WriteFailed)。
+        assert_eq!(
+            Scheduler::outcome_for(wake_abandoned_write_failed()),
+            Some(WakeOutcome::Failed),
+            "繁中說明：寫入失敗要能回報 failed（契約 §6.4）"
+        );
+    }
+
+    fn wake_abandoned_write_failed() -> NextAction {
+        NextAction::Abandoned(AbandonReason::WriteFailed)
     }
 }
