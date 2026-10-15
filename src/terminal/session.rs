@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,12 @@ use crate::terminal::screen::Screen;
 use crate::terminal::Snapshot;
 
 /// spawn 參數。`subscriber_queue` 必須大於 0；production 預設 256。
+///
+/// `env` 是子程序的**完整環境**，不是「額外加上去的變數」：daemon 端
+/// （契約 §5.3）先繼承自己的環境、移除 `OTTERHIVE_OPERATOR` 前綴的變數，再
+/// 加上 instance 專屬的變數，把結果整份交過來。若這裡改成「在繼承的環境上
+/// 疊加」，被移除的 operator 變數會因為 `CommandBuilder` 的繼承行為重新
+/// 出現——operator 憑證就會漏進 agent 的環境（契約 §2 明文禁止）。
 pub struct SessionConfig {
     pub program: String,
     pub args: Vec<String>,
@@ -108,6 +115,11 @@ struct Core {
     /// stop 核心完成回收後設 true。此後任何觸及 Child 的路徑都必須先經
     /// [`Session::with_child`] 檢查，避免在 Child 已釋放後再碰它。
     child_released: Mutex<bool>,
+    /// observer 失去 exit 觀測權（`waitid` 回 `ECHILD`）。此時沒有觀測到退出
+    /// **不等於**沒有退出——呼叫端不可把它當成「還活著」或「已乾淨退出」。
+    exit_ownership_lost: Mutex<bool>,
+    /// observer 已停止觀測（成功觀測到退出，或失去觀測權）。
+    stop: Mutex<bool>,
 }
 
 /// Session：PTY、子程序、讀取／觀測執行緒的擁有者。
@@ -119,6 +131,19 @@ pub struct Session {
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// 保存的 JoinHandle（reader＋observer）；Drop 時有界 join。
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+/// 因 join 逾時而被 detach 的執行緒數（決策條件 4：可觀察計數）。
+///
+/// detach 代表該執行緒可能仍在跑（reader 卡在 `read()` 等 PTY 資料），它的
+/// `Arc<Core>` 因此會活得比 Session 久。Session 的鎖設計讓這種殘留不會破壞
+/// 狀態，但呼叫端需要知道「這次停止的 join 並未真正收斂」——所以 [`DroppedThread`]
+/// 之類的觀察點以本計數為依據。
+pub static DETACHED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// 本次 join 逾時而被 detach 的執行緒數。
+pub fn detached_threads() -> usize {
+    DETACHED_THREADS.load(Ordering::SeqCst)
 }
 
 impl Session {
@@ -145,6 +170,13 @@ impl Session {
         builder.cwd(&cfg.cwd);
         for (key, value) in &cfg.env {
             builder.env(key, value);
+        }
+        // 契約 §5.3：子程序不得看到名稱以 `OTTERHIVE_OPERATOR` 開頭的變數。
+        // `CommandBuilder` 預設繼承本程序環境，因此這裡逐一移除繼承來的那些
+        // key（daemon 端也過濾一次；這裡是 spawn 層的最後一道，確保任何呼叫端
+        // ——包括直接用 `SessionConfig` 的測試——都不會把 operator 憑證漏進去）。
+        for key in operator_prefixed_keys() {
+            builder.env_remove(key);
         }
         let writer = pair
             .master
@@ -187,6 +219,8 @@ impl Session {
             last_output: Mutex::new(Instant::now()),
             ended: Mutex::new(false),
             child_released: Mutex::new(false),
+            exit_ownership_lost: Mutex::new(false),
+            stop: Mutex::new(false),
         });
         let threads = vec![
             spawn_reader(reader, Arc::clone(&core)),
@@ -341,32 +375,83 @@ impl Session {
             if let Some(exit) = self.exit_status() {
                 return Some(exit);
             }
+            // observer 已停止觀測（成功觀測到退出，或失去觀測權）→ 不會再有
+            // exit status，此時回 `None` 是確定的答案而非「還沒發生」。
+            if self.has_observer_stopped() {
+                return self.exit_status();
+            }
             if begin.elapsed() >= timeout {
                 return self.exit_status();
             }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// observer 是否已停止觀測 exit（觀測到退出，或失去觀測權）。
+    pub fn has_observer_stopped(&self) -> bool {
+        *self
+            .core
+            .stop
+            .lock()
+            .expect("繁中說明：Session stop 槽不應中毒")
+    }
+
+    /// observer 是否因 `ECHILD` 失去 exit 觀測權。
+    ///
+    /// 為 true 代表「沒有觀測到退出」**不能**推論成「還活著」或「已乾淨退出」——
+    /// child 已不由本程序持有，exit status 與 waitable 狀態都取不到。
+    pub fn exit_ownership_lost(&self) -> bool {
+        *self
+            .core
+            .exit_ownership_lost
+            .lock()
+            .expect("繁中說明：Session exit_ownership_lost 槽不應中毒")
+    }
 }
 
 impl Drop for Session {
-    /// 有界 join 執行緒（不無限等待）；不做 OS 清理（程序清理走 `stop_group`）。
+    /// **真・有界** join（決策條件 1、2）：deadline 只設一次，以 `is_finished`
+    /// 輪詢到 deadline 為止；逾時的 handle 直接 detach（不 join），並累加
+    /// [`DETACHED_THREADS`] 計數。
+    ///
+    /// 先用 `mem::take` 取出 handle 清單再 join，因此整段 join 過程**不持有**
+    /// `threads` 的鎖——持有鎖 join 會讓同時 drop 兩個 Session 的執行緒互相
+    /// 等待。
+    ///
+    /// 為什麼需要 detach：reader 執行緒會卡在 `read()` 等 PTY 資料，而 PTY 只在
+    /// 子程序結束時才會 EOF。若停止一個仍存活、忽略 SIGTERM 的程序，
+    /// `handle.join()` 會永久阻塞——那正是契約 §4.3-2 禁止的「以無限等待 join
+    /// 冒充有界停止」。
     fn drop(&mut self) {
-        let mut threads = self
-            .threads
-            .lock()
-            .unwrap_or_else(|guard| guard.into_inner());
-        let begin = Instant::now();
-        let limit = Duration::from_secs(2);
-        // reader 因 PTY EOF 自行結束；observer 因 ECHILD 或已觀測退出而結束。
-        // 有界 join：逾時即放棄（執行緒為 daemon 生命週期服務，不無限等待）。
+        let mut threads = std::mem::take(
+            &mut *self
+                .threads
+                .lock()
+                .unwrap_or_else(|guard| guard.into_inner()),
+        );
+        // deadline 只設一次（決策條件 1）：第二個 handle 不因第一個已耗時而
+        // 各自取得完整期限。
+        let deadline = Instant::now() + Duration::from_secs(2);
         for handle in threads.drain(..) {
-            if begin.elapsed() >= limit {
-                break;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    // 逾時：放棄這個 handle（detach），不阻塞。
+                    drop(handle);
+                    DETACHED_THREADS.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            let _ = handle.join();
         }
     }
+}
+
+/// 繼承環境中名稱以 `OTTERHIVE_OPERATOR` 開頭的變數鍵（契約 §5.3）。
+fn operator_prefixed_keys() -> Vec<String> {
+    std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("OTTERHIVE_OPERATOR"))
+        .collect()
 }
 
 /// PTY 讀取執行緒：每取一個非空 chunk，在鎖內餵 VT→seq 加一→廣播。
@@ -414,11 +499,22 @@ fn spawn_observer(pid: i32, core: Arc<Core>) -> std::thread::JoinHandle<()> {
                 },
             };
             *core.exit.lock().expect("繁中說明：Session exit 槽不應中毒") = Some(exit);
+            *core.stop.lock().expect("繁中說明：Session stop 槽不應中毒") = true;
             break;
         }
         if ret != 0 {
             let errno = unsafe { *libc::__error() };
             if errno == libc::ECHILD {
+                // `ECHILD`：這個 child 已不由本程序擁有（被外部回收，或 parent
+                // 關係已改變）。exit 觀測的前提消失——無法再取得 exit status，
+                // 也不能再證明 child 未被 reap。標記 `exit_ownership_lost` 讓
+                // 呼叫端知道「沒有觀測到退出不等於沒有退出」，並補上 stop flag
+                // 讓 wait_exit 不再無限等待。
+                *core
+                    .exit_ownership_lost
+                    .lock()
+                    .expect("繁中說明：Session exit_ownership_lost 槽不應中毒") = true;
+                *core.stop.lock().expect("繁中說明：Session stop 槽不應中毒") = true;
                 break;
             }
         }
@@ -489,6 +585,9 @@ fn push_output(core: &Core, bytes: &[u8]) {
 fn mark_ended(core: &Core) {
     let mut state = core.state.lock().expect("繁中說明：Session 鎖不應中毒");
     *core.ended.lock().unwrap_or_else(|guard| guard.into_inner()) = true;
+    // reader 看到 EOF：PTY 已關閉，沒有更多輸出。標記 stop 讓 observer 與
+    // `wait_exit` 的等待有明確終點。
+    *core.stop.lock().unwrap_or_else(|guard| guard.into_inner()) = true;
     // 先算好最新 Snapshot（借用結束後再進可變迴圈），供待 Resync 的訂閱者使用。
     let final_snapshot = Snapshot {
         generation: core.generation,

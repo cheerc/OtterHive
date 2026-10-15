@@ -436,7 +436,7 @@ pub(crate) fn stop_group_with_adapter(
             }
         }
     }
-    if os.kill_group(pgid, libc::SIGTERM).is_err() {
+    if !signal_is_expected(owned, pid, pgid, expected_start, probe, os) {
         if let Some(lease) = owned {
             lease.invalidate();
         }
@@ -537,7 +537,17 @@ pub(crate) fn stop_group_with_adapter(
             }
         }
     }
-    if os.kill_group(pgid, libc::SIGKILL).is_err() {
+    // KILL 與 TERM 同樣套用預期判定：若 group 裡只剩已退出的 leader，
+    // `kill` 對它回 `EPERM` 屬預期（見 `signal_is_expected`）。
+    let kill_ok = match os.kill_group(pgid, libc::SIGKILL) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            let latest = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+            eperm_is_expected_for_exited_leader(owned, pid, pgid, expected_start, latest, os)
+        }
+        Err(_) => false,
+    };
+    if !kill_ok {
         if let Some(lease) = owned {
             lease.invalidate();
         }
@@ -570,6 +580,64 @@ pub(crate) fn stop_group_with_adapter(
         };
     }
     finish_stopped(owned, pid, os, escalated)
+}
+
+/// `kill` 回 `EPERM` 是否只是「leader 已退出、無法再送訊號」的預期形態。
+///
+/// 對已退出但尚未回收的 zombie，macOS 的 `kill` 回 `EPERM`——該 pid 沒有可
+/// 接收訊號的執行主體。這不是「停止失敗」，而是契約 §4.3-3 所說的「保留的
+/// 已退出 leader」。
+///
+/// 三道獨立條件都要成立才視為預期，任何一道不成立都照舊 `Unproven`：
+/// 1. errno 為 `EPERM`（其他 errno 含 ESRCH／ECHILD 仍是不利證據）；
+/// 2. `probe` 確認 leader 已 `Exited`（活體程序的 `EPERM` 才是真的權限問題）；
+/// 3. 身分獨立確認：`arg=1` 的啟動時間仍與 lease 相符，且該 pid 仍佔著
+///    `pgid`（不是已被 pid 重用取代的另一個程序）。
+fn eperm_is_expected_for_exited_leader(
+    owned: Option<&OwnedLeaderLease>,
+    pid: i32,
+    pgid: i32,
+    expected_start: u64,
+    probe: ChildProbe,
+    os: &dyn OsAdapter,
+) -> bool {
+    if !matches!(probe, ChildProbe::Exited { .. }) {
+        return false;
+    }
+    if !matches!(os.start_time(pid), Ok(current) if current == expected_start) {
+        return false;
+    }
+    match os.pgid(pid) {
+        // zombie 的 `getpgid` 回 ESRCH 是預期；此時以綁定的 pgid 為準（與步驟 3
+        // 的 zombie 分支同構）。能查到就必須相符，否則可能是 pid 重用。
+        Ok(current) if current == pgid => {}
+        Ok(_) => return false,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+        Err(_) => return false,
+    }
+    let _ = owned;
+    true
+}
+
+/// 對 group 送一次 signal，回傳「這次失敗是否只是預期中的 `EPERM`」。
+///
+/// `signal_ok` 為 false 時呼叫端才把 lease 作廢並回 `Unproven`，因此
+/// `EPERM` 分支與既有失敗路徑的 fail-closed 行為一致。
+fn signal_is_expected(
+    owned: Option<&OwnedLeaderLease>,
+    pid: i32,
+    pgid: i32,
+    expected_start: u64,
+    probe: ChildProbe,
+    os: &dyn OsAdapter,
+) -> bool {
+    match os.kill_group(pgid, libc::SIGTERM) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            eperm_is_expected_for_exited_leader(owned, pid, pgid, expected_start, probe, os)
+        }
+        Err(_) => false,
+    }
 }
 
 /// 清空確認後：撤銷 lease（如有）→ owned 路徑再 reap。reap 失敗即
@@ -639,6 +707,8 @@ mod ownership_tests {
     enum StepErr {
         Echild,
         Esrch,
+        /// `kill` 對已退出的 zombie 回 EPERM（macOS 行為）。
+        Eperm,
         Transient,
     }
 
@@ -647,6 +717,7 @@ mod ownership_tests {
             match self {
                 StepErr::Echild => std::io::Error::from_raw_os_error(libc::ECHILD),
                 StepErr::Esrch => std::io::Error::from_raw_os_error(libc::ESRCH),
+                StepErr::Eperm => std::io::Error::from_raw_os_error(libc::EPERM),
                 StepErr::Transient => std::io::Error::new(ErrorKind::TimedOut, ctx),
             }
         }
@@ -725,6 +796,9 @@ mod ownership_tests {
         reap_calls: AtomicUsize,
         /// 在第 `gate_at` 次 `kill_group` 前等待 gate（併發測試用）。
         gate: Mutex<Option<(Arc<Gate>, usize)>>,
+        /// 第 N 次 `kill_group` 的腳本化失敗（`None` 表示成功）；索引對應
+        /// `kill_count` 的序號。
+        kill_errors: Mutex<Vec<StepErr>>,
         kill_count: AtomicUsize,
         /// 到達 signal 擋點的次數（阻塞之前累計；與「已發 signal」分開記，
         /// 不混淆事件語意）。
@@ -749,6 +823,7 @@ mod ownership_tests {
                 kill_calls: AtomicUsize::new(0),
                 reap_calls: AtomicUsize::new(0),
                 gate: Mutex::new(None),
+                kill_errors: Mutex::new(Vec::new()),
                 kill_count: AtomicUsize::new(0),
                 entered_gate: AtomicUsize::new(0),
             }
@@ -828,7 +903,21 @@ mod ownership_tests {
                 .lock()
                 .expect("繁中說明：fake adapter 鎖不應中毒")
                 .push(format!("signal {name} pgid={pgid}"));
-            Ok(())
+            // 腳本可指定這次 signal 的失敗形态（`kill` 對已退出 zombie 回 EPERM）。
+            let scripted = {
+                let guard = self
+                    .kill_errors
+                    .lock()
+                    .expect("繁中說明：fake adapter 鎖不應中毒");
+                guard.get(count).copied()
+            };
+            match scripted {
+                Some(StepErr::Eperm) => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                Some(StepErr::Esrch) => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+                Some(StepErr::Echild) => Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
+                Some(StepErr::Transient) => Err(std::io::Error::new(ErrorKind::TimedOut, "kill")),
+                None => Ok(()),
+            }
         }
 
         fn reap(&self, _pid: i32) -> std::io::Result<()> {
@@ -1426,6 +1515,126 @@ mod ownership_tests {
             os.reap_calls.load(Ordering::SeqCst),
             0,
             "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
+        );
+    }
+
+    #[test]
+    fn eperm_signal_on_exited_leader_still_reaches_stopped() {
+        // `kill` 對已退出但未回收的 zombie 回 EPERM（macOS 實測 errno=1）。
+        // 這是契約 §4.3-3 的「保留的已退出 leader」，不是停止失敗：probe 已確認
+        // Exited、arg=1 啟動時間仍相符 → 繼續走完流程並回 Stopped。
+        assert_eq!(
+            StepErr::Eperm.into_io("kill").raw_os_error(),
+            Some(libc::EPERM),
+            "繁中說明：EPERM 測試映射必須攜帶 raw errno"
+        );
+        let os = FakeOs::new(
+            vec![
+                Script::Ok(9_999_000_000),
+                Script::Ok(9_999_000_000),
+                Script::Ok(9_999_000_000),
+            ],
+            vec![Script::Ok(4242), Script::Ok(4242), Script::Ok(4242)],
+            // 第一次 probe（signal 前）確認 Exited；signal 失敗後 EPERM 分支會
+            // 再確認一次；最後 finish 前一次。
+            vec![
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+            ],
+            vec![Script::Ok(vec![4242]), Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        *os.kill_errors
+            .lock()
+            .expect("繁中說明：fake adapter 鎖不應中毒") = vec![StepErr::Eperm];
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：leader 已退出時的 EPERM 應視為預期並回 Stopped，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            1,
+            "繁中說明：停止確認後應 reap 恰一次"
+        );
+    }
+
+    #[test]
+    fn eperm_signal_on_live_leader_is_unproven() {
+        // 對照組：probe 仍是 Alive 時，EPERM 是真的權限問題，不得當成預期。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        *os.kill_errors
+            .lock()
+            .expect("繁中說明：fake adapter 鎖不應中毒") = vec![StepErr::Eperm];
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：leader 仍存活時的 EPERM 應回 Unproven（不可當成預期），實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：EPERM 失敗路徑不得 reap"
+        );
+    }
+
+    #[test]
+    fn eperm_signal_with_mismatched_identity_is_unproven() {
+        // 第三道防線：即使 probe 回 Exited，若 pgid 的獨立身分確認回的是**不符**的
+        // 值（而非 zombie 預期的 ESRCH），EPERM 仍不得當成預期——這代表該 pid
+        // 已被重用取代。
+        let os = FakeOs::new(
+            // step 2 與 step 5 發前重驗都相符；EPERM 分支的 start 確認也相符。
+            vec![
+                Script::Ok(9_999_000_000),
+                Script::Ok(9_999_000_000),
+                Script::Ok(9_999_000_000),
+            ],
+            // step 3 相符；EPERM 分支的獨立 pgid 確認回不符值。
+            vec![Script::Ok(4242), Script::Ok(9999)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        *os.kill_errors
+            .lock()
+            .expect("繁中說明：fake adapter 鎖不應中毒") = vec![StepErr::Eperm];
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：身分不符時的 EPERM 應回 Unproven，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：身分不符時不得 reap"
         );
     }
 
