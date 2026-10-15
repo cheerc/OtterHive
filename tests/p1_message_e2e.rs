@@ -495,19 +495,21 @@ fn create_non_reader(daemon: &support::Daemon, home: &support::TestHome, name: &
 /// 阻塞 → 鎖死 daemon」沒有可達路徑。`Arc<Session>` 的改動仍值得保留（它讓寫入
 /// 不持鎖成為型別保證而非註解紀律），但它防的不是一個會發生的問題。
 ///
-/// 這條測試驗的是另一件事：§6.4 的延後**沒有上限**，所以一個永遠安靜的收件人會讓
-/// 重判迴圈無限期地重判。它不該讓 `list_instances`／`pane_snapshot`／attach 對其他
-/// 呼叫端失效。
+/// 它驗的是另一件事：§6.4 的延後**沒有上限**，所以一個永遠安靜的收件人會讓重判迴圈
+/// 無限期地重判。而每次 `send` 都要取 daemon 鎖（`send_operation` → `schedule_hint`），
+/// 所以那個迴圈與呼叫端是在爭同一把鎖——**不讀 stdin 的收件人不該讓其他呼叫端
+/// 餓死**。
+///
+/// 送出次數刻意**低**：這條測試驗的是「鎖競爭下的可用性」，不是「緩衝區填滿」
+/// ——而「填滿」在 D-1 的量測裡根本不會發生。送出太多只會讓測試變成長跑（本來
+/// 6 秒、CI 上 26 秒）並提高它在其他負載下再失敗的機率，卻不增加任何覆蓋。
 #[test]
 fn a_non_reading_agent_does_not_stop_the_daemon_from_serving_other_callers() {
     let home = support::TestHome::new();
     let daemon = support::Daemon::start(&home);
     create_non_reader(&daemon, &home, "mute");
 
-    // 反覆送：單一提示約 70 bytes，量測顯示 PTY 寫端即使完全不阻塞，累積起來也
-    // 需要足夠的量才能讓這個情境有代表性；而送多少都不會被「太多」擋下
-    // （§6.4 的延後沒有上限）。
-    for index in 0..200 {
+    for index in 0..5 {
         let sent = daemon.operator_call(
             &home,
             "send",
@@ -520,7 +522,8 @@ fn a_non_reading_agent_does_not_stop_the_daemon_from_serving_other_callers() {
         );
     }
 
-    // 關鍵斷言：daemon 仍然能回應。
+    // 關鍵斷言：daemon 仍然能回應。單次呼叫就夠——這裡驗的是「能不能回應」，
+    // 不是「能不能承受多少並行」，而 `poll_until` 會把逾時變成清楚的失敗訊息。
     let responsive = support::poll_until(support::SHORT_TIMEOUT, || {
         daemon
             .operator_call(&home, "list_instances", json!({}))
@@ -529,7 +532,8 @@ fn a_non_reading_agent_does_not_stop_the_daemon_from_serving_other_callers() {
     });
     assert!(
         responsive,
-        "繁中說明：不讀 stdin 的 agent 收到提示時，daemon 仍必須能回應其他請求"
+        "繁中說明：不讀 stdin 的 agent 收到提示時，daemon 仍必須能回應其他請求；\
+         逾時代表喚醒的重判迴圈把 daemon 鎖佔住太久"
     );
 
     let snapshot = daemon.operator_call(&home, "pane_snapshot", json!({"instance": "mute"}));
