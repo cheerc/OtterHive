@@ -24,7 +24,7 @@ use crate::procs;
 
 pub use crate::procs::stop_group;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -42,13 +42,131 @@ use crate::daemon::lifecycle::{InstanceState, SpecError, ValidatedSpec};
 use crate::daemon::recovery::RESTART_REASON;
 use crate::home::Home;
 use crate::mcp;
+use crate::messaging;
 use crate::procs::{process_start_time, GroupEvidence, StopOutcome};
 use crate::protocol::{
     Auth, ErrorCode, OpError, OperationResult, Outcome, Request, Subject as ResultSubject,
 };
 use crate::store::{InstanceRow, NewInstance, Store, StoreError};
+use crate::teams;
 use crate::terminal::frame;
 use crate::terminal::session::{Session, SessionConfig, StreamEvent};
+use crate::wake;
+
+/// T5 Lane B GREEN：契約預設值的守門測試（§1 的環境變數、§6.3、§6.4）。
+///
+/// 為什麼需要這個模組：`Tuning::from_env` 是所有「測試可縮短的時間常數」的
+/// **唯一**真相來源。`src/wake.rs` 的排程器刻意不知道契約預設是多少——它只
+/// 接受呼叫端傳入的視窗。因此若有人把 `millis("OTTERHIVE_TEST_WAKE_INPUT_MS",
+/// 3000)` 的預設參數改成 2000，`wake.rs` 的單元測試會全綠（它們傳自己的
+/// 數字），`tests/wake_delivery.rs` 也會全綠（它在 daemon 上設了環境變數），
+/// 只有真的 operator 才會發現提示的延後時間變了。
+///
+/// 這個模組把那幾個數字釘住，讓「改預設值」變成一件必須連同契約討論的事。
+///
+/// **測試隔離**：`from_env` 讀的是行程級環境變數，而測試 runner 是多執行緒
+/// 的——若用 `std::env::set_var` 清掉某個變數再呼叫 `from_env`，同時有其他
+/// 測試在讀同一個變數，就是 T4 踩過的 process-global 污染。因此這個模組
+/// **不設任何環境變數**：它只斷言「在沒有任何 `OTTERHIVE_TEST_*` 被設進這個
+/// 行程的情況下」的預設值，並且用 [`is_tuning_default_env_clean`] 做前提檢查。
+#[cfg(test)]
+mod t5_tuning_tests {
+    use super::Tuning;
+    use std::time::Duration;
+
+    /// 前提：這個測試行程沒有被注入任何 `OTTERHIVE_TEST_*`。
+    ///
+    /// 成立時直接用 `from_env` 的預設值；不成立時跳過並說明原因，而不是
+    /// 假裝通過——T4 的教訓是「前提不成立時要讓人看見」。
+    fn default_tuning() -> Option<Tuning> {
+        let polluted: Vec<&str> = [
+            "OTTERHIVE_TEST_STARTUP_GRACE_MS",
+            "OTTERHIVE_TEST_STOP_TERM_MS",
+            "OTTERHIVE_TEST_STOP_KILL_MS",
+            "OTTERHIVE_TEST_SUBSCRIBER_QUEUE",
+            "OTTERHIVE_TEST_LEASE_MS",
+            "OTTERHIVE_TEST_WAKE_INPUT_MS",
+            "OTTERHIVE_TEST_WAKE_QUIET_MS",
+        ]
+        .into_iter()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect();
+        if polluted.is_empty() {
+            return Some(Tuning::from_env());
+        }
+        eprintln!(
+            "繁中說明：這個測試行程已被注入 {:?}，預設值斷言不成立（略過，勿誤判為通過）",
+            polluted
+        );
+        None
+    }
+
+    #[test]
+    fn tuning_defaults_match_the_contract() {
+        let Some(tuning) = default_tuning() else {
+            return;
+        };
+        // §4.2 的啟動寬限期（daemon 啟動自檢用）。
+        assert_eq!(
+            tuning.startup_grace,
+            Duration::from_millis(3000),
+            "繁中說明：未設環境變數時啟動寬限期應為契約預設 3000ms"
+        );
+        // §4.3 的停止升級時序。
+        assert_eq!(
+            tuning.stop_term,
+            Duration::from_millis(5000),
+            "繁中說明：未設環境變數時 TERM 等待應為契約預設 5000ms"
+        );
+        assert_eq!(
+            tuning.stop_kill,
+            Duration::from_millis(2000),
+            "繁中說明：未設環境變數時 KILL 等待應為契約預設 2000ms"
+        );
+        // §7.1 的每 client 佇列上限。
+        assert_eq!(
+            tuning.subscriber_queue, 256,
+            "繁中說明：未設環境變數時每個 client 的 Output 佇列應為契約預設 256"
+        );
+        // §6.3 的投遞 lease。
+        assert_eq!(
+            tuning.lease,
+            Duration::from_millis(600_000),
+            "繁中說明：未設環境變數時 lease 應為契約 §6.3 的 600 秒"
+        );
+        // §6.4 的兩個喚醒視窗——這兩個是本模組存在的**主要理由**：
+        // `wake.rs` 不再持有這兩個數字，這裡是它們唯一的所在。
+        assert_eq!(
+            tuning.wake_input,
+            Duration::from_secs(3),
+            "繁中說明：未設環境變數時 client 輸入視窗應為契約 §6.4 的 3 秒"
+        );
+        assert_eq!(
+            tuning.wake_quiet,
+            Duration::from_millis(500),
+            "繁中說明：未設環境變數時輸出靜默視窗應為契約 §6.4 的 500 毫秒"
+        );
+    }
+
+    #[test]
+    fn the_wake_windows_are_ordered_so_a_typing_operator_always_wins() {
+        // 不是契約要求，是實作上必須成立的不變量：§6.4 的兩個條件是「或」，
+        // 但 client 輸入視窗（3s）必須**大於**輸出靜默視窗（500ms），否則
+        // 一個正在輸出的 agent 會讓 operator 的輸入視窗形同失效——輸入視窗
+        // 剛過期時，輸出視窗卻還開著，於是「operator 停止打字」這個事實
+        // 永遠換不到一次插話機會。
+        let Some(tuning) = default_tuning() else {
+            return;
+        };
+        assert!(
+            tuning.wake_input > tuning.wake_quiet,
+            "繁中說明：client 輸入視窗（{}ms）應大於輸出靜默視窗（{}ms），\
+             否則 operator 停止打字後仍會被持續輸出的 agent 擋住",
+            tuning.wake_input.as_millis(),
+            tuning.wake_quiet.as_millis()
+        );
+    }
+}
 
 /// daemon 的啟動／運行錯誤。
 #[derive(Debug)]
@@ -78,6 +196,12 @@ pub struct Tuning {
     pub stop_term: Duration,
     pub stop_kill: Duration,
     pub subscriber_queue: usize,
+    /// 契約 §6.3 的投遞 lease（預設 600 秒）。
+    pub lease: Duration,
+    /// 契約 §6.4：client 最近輸入過多久就延後喚醒（預設 3 秒）。
+    pub wake_input: Duration,
+    /// 契約 §6.4：收件人最近輸出過多久就延後喚醒（預設 500 毫秒）。
+    pub wake_quiet: Duration,
 }
 
 impl Tuning {
@@ -91,6 +215,9 @@ impl Tuning {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(256),
+            lease: millis("OTTERHIVE_TEST_LEASE_MS", 600_000),
+            wake_input: millis("OTTERHIVE_TEST_WAKE_INPUT_MS", 3000),
+            wake_quiet: millis("OTTERHIVE_TEST_WAKE_QUIET_MS", 500),
         }
     }
 }
@@ -106,7 +233,32 @@ fn millis(key: &str, default: u64) -> Duration {
 
 /// 一個正在執行的 instance 的記憶體狀態。
 struct Running {
-    session: Session,
+    /// `Arc<Session>` 而不是 owned `Session`（防禦性設計）。
+    ///
+    /// 喚醒排程器在**不持有 daemon 全域鎖**的情況下寫入 PTY。若 `Inner::running`
+    /// 存的是 owned `Session`，要拿到它就只能持有鎖遍歷 `running`，而 `Session`
+    /// 不可 `Clone`（它的 `_child` 欄位持有 child handle、`threads` 欄位在 `Drop`
+    /// 時做有界 join——複製會讓同一個 child 被 drop 兩次）。所以存 `Arc`：鎖內
+    /// `Arc::clone` 取得一個不借用 `inner` 的擁有者，放掉鎖之後才寫入。鎖的生命
+    /// 週期與寫入完全分離，這是型別強制的，不是靠註解提醒。
+    ///
+    /// **這個型別強制解決的是鎖的粒度，不是「寫入不會阻塞」。** `write_input`
+    /// 內部仍要鎖 `core.writer`（`Mutex<Box<dyn Write>>`），而 PTY 的 `write(2)`
+    /// 在收件人不讀 stdin 時**確實會阻塞**——`interrupt`、attach Input 與喚醒
+    /// 三條路徑都走它。證據（CI 兩次因此紅、`sample` 取得的執行緒堆疊、累積門檻）
+    /// 見 [`docs/worklog-t6-pty-write-block.md`](crate::docs)。已裁決的修法是 writer
+    /// 改 `O_NONBLOCK`，作為 T6 開工前的第一項工作包。
+    ///
+    /// 所以保留 `Arc` 的理由是：它讓「寫入不持 daemon 鎖」由型別保證、且
+    /// `Session` 不可 `Clone` 使它成為唯一選項——**不是**因為寫入不會阻塞。
+    session: Arc<Session>,
+    /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
+    ///
+    /// 喚醒排程器用它判斷「收件人已換了 generation」→ 放棄尚未送出的提示
+    /// （§6.4）。`Session` 本身也記著 generation，但沒有公開的存取子；與其為了
+    /// 喚醒去擴大 `Session` 的公開面，不如在 daemon 這裡留一份——它本來就是
+    /// 這個 generation 的權威來源（SQLite 的 `instances.generation`）。
+    generation: u64,
     /// 最近一次 `pane_snapshot` 的畫面；停止後仍可回（標 `live: false`）。
     last_screen: Option<Vec<String>>,
 }
@@ -122,6 +274,30 @@ struct Inner {
     /// daemon 重啟後沒有記憶體畫面；此表讓停止後仍可回最後畫面，直到
     /// process 紀錄被清掉為止。
     last_screens: HashMap<String, Vec<String>>,
+    /// 契約 §6.4：每個 instance 最近一次收到 client Input 的時間。
+    ///
+    /// 「有 client 在最近 3 秒內輸入過」是喚醒的延後條件之一：operator
+    /// 正在打字時插入提示行會打斷他。**只在收到 Input frame 時更新**——
+    /// Resize／Detach 不是輸入。
+    last_client_input: HashMap<String, Instant>,
+    /// 契約 §6.4：每個收件人尚未送出的提示排程。
+    ///
+    /// 必須是**跨 `send` 呼叫**持久的：§6.4 的「同一收件人尚未送出的多個提示
+    /// 合併為一行」只有在排程器活到第二則 `send` 時才成立。每次 `send` 新建
+    /// 一個排程器會讓第一則延後中的提示被遺漏，`count=<n>` 永遠是 1。
+    ///
+    /// 放棄提示不需要額外機制：排程器記住建立時的 generation，restart 後
+    /// 世代不符，`check` 就會清空待送清單並回 `Abandoned`（§6.4）。
+    wakers: HashMap<String, Arc<Mutex<wake::Scheduler>>>,
+    /// D-3：哪些 instance 已經有重判迴圈在跑。
+    ///
+    /// §6.4 的延後沒有上限，而每延後一則訊息若都 spawn 一個迴圈，執行緒會無界
+    /// 累積（operator 反覆送訊給卡住的 agent）。有了這個旗標，每個 instance 同時
+    /// 最多一個迴圈。
+    ///
+    /// **正確性不依賴它**——同一個排程器被鎖序列化，多的迴圈會自然結束。旗標只是
+    /// 資源上限，而沒有它時那個上限是無界的（見 [`spawn_wake_recheck`]）。
+    recheck_running: HashSet<String>,
 }
 
 /// 共用的 daemon 狀態。
@@ -232,6 +408,9 @@ pub fn prepare(
             busy: HashMap::new(),
             managers,
             last_screens: HashMap::new(),
+            last_client_input: HashMap::new(),
+            wakers: HashMap::new(),
+            recheck_running: HashSet::new(),
         })),
         home: home_root.to_path_buf(),
         bridge: bridge.to_path_buf(),
@@ -666,6 +845,9 @@ fn perform(
         "interrupt" => interrupt_instance(state, operation_id, caller, args),
         "pane_snapshot" => pane_snapshot(state, operation_id, caller, args),
         "tools_list" => tools_list(state, operation_id, caller),
+        "team" => team_operation(state, operation_id, caller, args),
+        "send" => send_operation(state, operation_id, caller, args),
+        "inbox" => inbox_operation(state, operation_id, caller, args),
         other => OperationResult {
             operation_id: operation_id.to_owned(),
             outcome: Outcome::Unsupported,
@@ -1192,7 +1374,8 @@ fn spawn_instance(
         inner.running.insert(
             spec.name.clone(),
             Running {
-                session,
+                generation: row.as_ref().map(|row| row.generation).unwrap_or_default(),
+                session: Arc::new(session),
                 last_screen: None,
             },
         );
@@ -1281,6 +1464,10 @@ fn spawn_exit_observer(
                     .last_screens
                     .insert(name.clone(), running.session.plain_text());
             }
+            // §6.4 的「停止即放棄」：程序結束時立刻清掉喚醒狀態，不等重判迴圈
+            // 在最多 250ms 後自己發現（b8 的 B4）。
+            inner.wakers.remove(&name);
+            inner.recheck_running.remove(&name);
             removed.map(|running| running.session)
         };
         let Some(session) = session else {
@@ -1507,10 +1694,13 @@ fn stop_previous(state: &DaemonState, row: &InstanceRow) -> PreviousOutcome {
     // 記憶體中持有（本 daemon 的 owned lease）：走 owned 路徑。
     let session = {
         let mut inner = state.lock();
-        inner
+        let session = inner
             .running
             .remove(&row.name)
-            .map(|running| running.session)
+            .map(|running| running.session);
+        inner.wakers.remove(&row.name);
+        inner.recheck_running.remove(&row.name);
+        session
     };
     if let Some(session) = session {
         let outcome = stop_group(
@@ -1614,6 +1804,491 @@ fn spec_from_row(
     })
 }
 
+/// Unix epoch 毫秒（契約 §1：時間一律是 epoch 毫秒整數，欄位名以 `_ms` 結尾）。
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// 交易失敗時的 `internal` 回應（team／send／inbox 共用）。
+/// 把邏輯層的 `OpError` 展開成 `OperationResult`。
+///
+/// `unsupported_in_phase` 的 outcome 是 `Unsupported` 而非 `Refused`（契約 §3）：
+/// 兩者在 §10 的 bridge 層都會設 `isError: true`，但它們是不同的拒絕理由。
+fn result_from_error(operation_id: &str, error: OpError) -> OperationResult {
+    OperationResult {
+        operation_id: operation_id.to_owned(),
+        outcome: match error.code {
+            ErrorCode::UnsupportedInPhase => Outcome::Unsupported,
+            _ => Outcome::Refused,
+        },
+        subject: None,
+        value: Value::Null,
+        effects: Vec::new(),
+        error: Some(error),
+    }
+}
+
+/// `team`：契約 §8.1 的四個 action。
+///
+/// 授權（§2）：team 異動只有 operator；`list` 對四種身分都開放。
+fn team_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    let action = match teams::TeamAction::parse(args) {
+        Ok(action) => action,
+        Err(op_error) => return result_from_error(operation_id, op_error),
+    };
+    let listing = matches!(action, teams::TeamAction::List);
+    if let Some(denied) = require_permission(
+        state,
+        operation_id,
+        caller,
+        if listing {
+            Action::List
+        } else {
+            Action::Manage
+        },
+        None,
+    ) {
+        return denied;
+    }
+    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+    let request = teams::TeamRequest { action, name, args };
+    let mut inner = state.lock();
+    match teams::team_operation(&mut inner.store, request) {
+        Ok(value) => OperationResult::completed(operation_id, value),
+        Err(op_error) => result_from_error(operation_id, op_error),
+    }
+}
+
+/// `send`：契約 §6.1／§6.2。
+///
+/// 順序是契約 §6.1 明定的：訊息的寫入在同一交易內完成，**喚醒在寫入之後**。
+/// 所以喚醒排在 [`messaging::send`] 回應之後——那時交易已提交、鎖已釋放。
+/// 否則會出現「PTY 已寫入提示但交易回滾」的破窗；喚醒失敗也不撤回訊息。
+fn send_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    // `managers` 用 daemon 啟動時讀入的那份（§1：「`managers` 的變更要重啟
+    // daemon 才生效」），**不是**每次 `send` 重讀設定檔——那會讓一個正在執行的
+    // daemon 因為設定檔被改而接受不同的 manager，違反 §1。`subject_for` 與
+    // `tools_list` 已經用同一份。
+    // 先取出 `managers` 的擁有者再傳引用：`messaging::send` 需要
+    // `&mut inner.store` 與 `&inner.managers` 同時存在，而兩者都在同一個 guard
+    // 後面，所以直接寫 `&inner.managers` 會同時可變借用與不可變借用同一個
+    // struct。先 clone 出一份擁有者就沒有這個衝突。
+    let managers = state.lock().managers.clone();
+    let mut recipients = {
+        let mut inner = state.lock();
+        match messaging::send(&mut inner.store, caller, args, &managers) {
+            Ok(outcome) => outcome,
+            Err(op_error) => return result_from_error(operation_id, op_error),
+        }
+    };
+    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。每一個收件人都有自己的
+    // `wake` 欄位——成功寫入的填排程結果，被拒的填 `not_running`（§6.4 把
+    // `not_running` 定義成「收件人不在 `running`」，而被拒的收件人確實不在）。
+    for recipient in &mut recipients {
+        recipient.wake = Some(match recipient.message_id.as_deref() {
+            Some(message_id) => schedule_hint(state, caller, &recipient.instance, message_id, args),
+            None => wake::WakeOutcome::NotRunning.as_wire().to_owned(),
+        });
+    }
+
+    let queued = recipients
+        .iter()
+        .filter(|recipient| recipient.message_id.is_some())
+        .count();
+    let first_error = recipients
+        .iter()
+        .find_map(|recipient| recipient.error.as_ref())
+        .map(|error| error.code);
+
+    let recipients_json: Vec<Value> = recipients
+        .iter()
+        .map(|recipient| {
+            let wake = recipient.wake.clone();
+            json!({
+                "instance": recipient.instance,
+                "outcome": if recipient.message_id.is_some() { "queued" } else { "refused" },
+                "message_id": recipient.message_id,
+                "error": recipient.error.as_ref().map(|error| json!({
+                    "code": error.code,
+                    "message": error.message,
+                })),
+                "wake": wake,
+            })
+        })
+        .collect();
+
+    let (outcome, error) = match (queued, recipients.is_empty()) {
+        (0, true) => (
+            Outcome::Refused,
+            Some(OpError {
+                code: ErrorCode::InvalidArgument,
+                message: String::from(
+                    "send 沒有解析出任何收件人（instance／instances／team 三擇一）",
+                ),
+                retryable: false,
+                next: None,
+            }),
+        ),
+        (0, false) => (
+            Outcome::Refused,
+            Some(OpError {
+                code: first_error.unwrap_or(ErrorCode::NotFound),
+                message: String::from("沒有任何收件人被接受"),
+                retryable: false,
+                next: None,
+            }),
+        ),
+        (count, _) if count == recipients.len() => (Outcome::Completed, None),
+        _ => (Outcome::Partial, None),
+    };
+
+    OperationResult {
+        operation_id: operation_id.to_owned(),
+        outcome,
+        subject: None,
+        // 全部被拒時 `value.recipients` 仍逐項回報（§6.1「或回報拒絕原因」）。
+        value: json!({ "recipients": recipients_json }),
+        effects: Vec::new(),
+        error,
+    }
+}
+
+/// 排入一則提示並重判一次，回 `wake` 欄位的線上值（契約 §6.4）。
+///
+/// 排入進**持久化**的排程器（[`Inner::wakers`]），所以：
+/// - 這一則與先前尚未送出的提示合併成一行 `count=<n>`（§6.4）。
+/// - 若延後條件成立，本次回 `deferred`，提示留在排程器裡，由
+///   [`spawn_wake_recheck`] 的背景迴圈每 [`wake::RECHECK_INTERVAL`] 重判一次，
+///   **延後沒有上限**（§6.4）。
+///
+/// `sender` 與 `kind` 取自憑證與請求（§2「sender 一律由憑證推導」、§6.1 的
+/// `request_kind` 省略時記為 `message`），不從 store 反查。
+fn schedule_hint(
+    state: &DaemonState,
+    caller: &Caller,
+    instance: &str,
+    message_id: &str,
+    args: &Value,
+) -> String {
+    let sender_name = match caller {
+        Caller::Operator => String::from("operator"),
+        Caller::Instance(id) => {
+            let inner = state.lock();
+            match inner.store.instance(id) {
+                Ok(Some(row)) => row.name,
+                // 認得出呼叫端（`authenticate` 已做過）但讀不到名稱：這時
+                // 不能編一個 `from`，寧可讓提示晚一輪也不能顯示錯誤的送訊者。
+                Ok(None) | Err(_) => {
+                    return wake::WakeOutcome::Failed.as_wire().to_owned();
+                }
+            }
+        }
+    };
+
+    // 延後條件與排程器都必須在**鎖內**讀取／寫入（`last_client_input`、
+    // `last_output_at` 與 `wakers` 都是 daemon 的可變狀態），但 `inner.running`
+    // 的不可變借用活著時就不能再可變借用 `inner`。所以先把 `Session` 從
+    // `running` 裡**移出**（`running.remove` 拿走 owned 值），再往下走。
+    let mut inner = state.lock();
+    let Some(running) = inner.running.remove(instance) else {
+        return wake::WakeOutcome::NotRunning.as_wire().to_owned();
+    };
+    let generation = running.generation;
+    let inputs = wake::DeferInputs {
+        last_client_input_at: inner.last_client_input.get(instance).copied(),
+        last_output_at: running.session.last_output_at(),
+    };
+    let scheduler = inner
+        .wakers
+        .entry(instance.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(wake::Scheduler::new(generation))))
+        .clone();
+    // 把 `Running` 放回去之後才鎖排程器：鎖排程器期間 daemon 鎖仍然持有
+    // （`inner` 的 guard 還活著），所以 `running` 離開這張表不會被任何
+    // 其他執行緒觀察到。
+    inner.running.insert(instance.to_owned(), running);
+    let mut scheduler = scheduler
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 世代換了（restart）：前一世代的排程器整個丟掉重建，否則它會帶著
+    // 舊的 `generation` 讓每一輪都回 `Abandoned`。
+    if scheduler.generation() != generation {
+        *scheduler = wake::Scheduler::new(generation);
+    }
+    scheduler.enqueue(wake::PendingHint {
+        from: sender_name,
+        // §6.1：`request_kind` 省略時記為 `message`；`admit` 已擋掉其他值。
+        kind: args
+            .get("request_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("message")
+            .to_owned(),
+        message_id: message_id.to_owned(),
+    });
+    let decision = scheduler.check(
+        inner.running.contains_key(instance),
+        generation,
+        inputs,
+        state.tuning.wake_input,
+        state.tuning.wake_quiet,
+        Instant::now(),
+    );
+    // **拿到要寫入的 bytes 之後、釋放 daemon 鎖之前**，清空排程器。
+    //
+    // 不變量（簽章分離之後唯一能造成重複寫入的地方）：`Deliver(bytes)` 回傳時
+    // pending **仍在**排程器裡。若這裡不先清掉，另一個執行緒（另一個重判迴圈
+    // 或並發的 `send`）在鎖排程器時會看到非空 pending、拿到**同一格提示**，
+    // 並在 PTY 上再寫一次。§6.4 沒有「重複提示」的語意，所以提示重複本身就是
+    // 契約外的行為。
+    //
+    // 寫入放在鎖外（[`wake::Scheduler::check`] 不做 I-O，見 D-1）：daemon 鎖是
+    // 全域的，阻塞式 PTY 寫入不能持有它。寫入失敗不回滾（已清空），延續「PTY
+    // master 已關時重試沒意義」的裁決。
+    let (to_write, outcome) = match decision {
+        wake::NextAction::Deliver(bytes) => {
+            scheduler.commit_delivery();
+            (Some(bytes), Some(wake::WakeOutcome::Hinted))
+        }
+        other => (None, wake::Scheduler::outcome_for(other)),
+    };
+    let deferred = matches!(outcome, Some(wake::WakeOutcome::Deferred));
+    drop(scheduler);
+    drop(inner);
+
+    // 鎖全部釋放之後才寫入（D-1）：daemon 鎖是全域的，阻塞式 PTY 寫入不能
+    // 持有它——PTY master 的緩衝區填滿時 `write_all` 會阻塞，那會讓 attach 的
+    // frame 串流、`pane_snapshot`、所有 socket 請求與 exit observer 全部停擺。
+    //
+    // 寫入失敗要如實回報 `failed`（§6.4 的四個值），不能因為「排程器已經清空」
+    // 就假裝送達。
+    if let Some(bytes) = to_write {
+        return match write_hint_outside_lock(state, instance, &bytes) {
+            Ok(()) => wake::WakeOutcome::Hinted.as_wire().to_owned(),
+            Err(()) => wake::WakeOutcome::Failed.as_wire().to_owned(),
+        };
+    }
+    if deferred {
+        spawn_wake_recheck(state, instance);
+    }
+    match outcome {
+        // 排程器裡還有東西、但這一輪沒送出：回 `deferred`（§6.4 的四個值
+        // 裡，deferred = 排程中）。
+        None => wake::WakeOutcome::Deferred.as_wire().to_owned(),
+        Some(outcome) => outcome.as_wire().to_owned(),
+    }
+}
+
+/// 把提示行寫入收件人的 PTY。**函式名帶這個副詞是刻意的**：它必須只在
+/// daemon 鎖之外呼叫，���且型別讓這點無法忘記——`Inner::running` 存的是
+/// `Arc<Session>`，所以鎖內能取得的只是一個不借用鎖的擁有者。
+///
+/// 失敗回 [`Result`]：§6.4 的 `failed` 與 `not_running` 是兩個不同的事實，
+/// 必須分別回報。失敗時排程器已被 `commit_delivery` 清空，所以這則提示不會
+/// 重試（實作判斷，非契約推導）。兩種失敗要分開講：
+///
+/// - **master 已關**：PTY master fd 不存在了，重試只是重複同一個錯誤。
+/// - **程序已退出但 master 未關**：此時寫入通常仍成功（PTY 對端已 EOF 前的
+///   寫入多半不報錯），所以這種情形多半不會走到 `Err`。
+///
+/// 兩者合併成一句「寫入失敗不重試」是精確度不足，但方向正確。
+fn write_hint_outside_lock(state: &DaemonState, instance: &str, bytes: &[u8]) -> Result<(), ()> {
+    // **鎖內只做 clone，寫入在鎖外。**
+    //
+    // `Inner::running` 存的是 `Arc<Session>`，所以能在鎖內取得一個不借用 `inner`
+    // 的擁有者；`session` 這個綁定離開區塊時鎖已釋放，之後的 `write_input`
+    // （可能因 PTY 緩衝區滿而阻塞）不再持有 daemon 的全域鎖。
+    //
+    // 這個函式**曾經**寫成「取得鎖 → 在 match 內寫入」。那不會編譯錯誤也不會被
+    // clippy 抓到（鎖的型別沒變），而那時的 `wake_delivery` 8 支也全綠——
+    // 所以「測試綠」不能證明這裡的鎖區間正確。
+    //
+    // 值得記錄的是：**當時那個寫法所防的威脅後來被證實可達**（見
+    // `docs/worklog-t6-pty-write-block.md`：PTY 的 `write(2)` 在收件人不讀 stdin
+    // 時會阻塞，而 `interrupt`／attach Input／喚醒三條路徑都走 `write_input`）。
+    // 但型別強制仍然值得保留——`Session` 不可 clone 使 `Arc` 成為唯一選項，而它
+    // 讓「寫入不持 **daemon** 鎖」不必靠註解紀律維持。
+    //
+    // 注意範圍：型別強制解決的是**鎖的粒度**，不是「寫入不會阻塞」。`write_input`
+    // 內部仍要鎖 `core.writer`，那把鎖仍會被阻塞的寫入佔住。
+    let session = {
+        let inner = state.lock();
+        match inner.running.get(instance) {
+            Some(running) => Arc::clone(&running.session),
+            // 收件人已不在 `running`：提示無處可去。回 `Err` 而不靜靜丟棄——
+            // 呼叫端會把它翻成 `failed`（§6.4），不會假裝送達。
+            None => return Err(()),
+        }
+    };
+    session.write_input(bytes).map_err(|_| ())
+}
+
+/// 啟動背景重判迴圈（§6.4 的「每 250 毫秒重新判斷，直到條件解除才送出」）。
+///
+/// **每個 instance 同時最多一個迴圈**（D-3）：`Inner::recheck_running` 是旗標，
+/// 已存在就不再 spawn。沒有這個旗標時，每延後一則訊息就多一個睡到條件解除的
+/// 執行緒，而 §6.4 的延後**沒有上限**——operator 反覆送訊給一個卡住的 agent
+/// 會讓執行緒無界累積，每 250ms 搶同一把 daemon 鎖。鎖競爭讓延後條件更容易成立
+/// （輸出間隔變長 → `quiet_window` 更容易滿足），形成正回饋：那是資源上限問題，
+/// 不是單純的線性成本。
+///
+/// 冪等性**不**來自「多開的執行緒會自己死掉」（那是我先前的錯誤理解）。它來自
+/// 同一個 `Arc<Mutex<Scheduler>>` 的共享狀態 ＋ `state.lock()` 之後才鎖排程器
+/// 的序列化 ＋ 送出或放棄後清空。已有一個迴圈在跑時，多開的只會讓它們輪流搶同一把
+/// 鎖，最後一個送出時其餘看到 `NothingToSend` 而結束——所以旗標只是資源上限，
+/// 正確性不依賴它。
+///
+/// fire-and-forget: 迴圈只存活到提示送出或放棄（數個重判週期）；daemon 不需
+/// 要它的結果，只需要知道「已排程」。
+fn spawn_wake_recheck(state: &DaemonState, instance: &str) {
+    {
+        let mut inner = state.lock();
+        if !inner.recheck_running.insert(instance.to_owned()) {
+            // 已經有迴圈在跑（D-3）：不重複啟動。
+            return;
+        }
+    }
+    let state = state.clone();
+    let instance = instance.to_owned();
+    std::thread::spawn(move || {
+        // 防禦性：與 [`handle_connection`]、exit observer 的 spawn 路徑一致。
+        //
+        // 這裡**不是**為了修一個會發生的缺陷——`RecheckGuard` 的 `Drop` 會在
+        // panic 時照常執行（旗標因此仍會被清掉），而 `DaemonState::lock` 用
+        // `into_inner()` 處理 poison，所以唯一剩下的風險是 `Drop` 裡的 `lock()`
+        // 本身 panic（需要同一執行緒重複鎖同一把鎖），而目前結構不會發生。
+        // 純為與 codebase 的其他 spawn 路徑一致。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 迴圈結束（送出、放棄或 panic）時一定要清旗標，否則這個 instance 之後
+            // 再也沒有重判迴圈。
+            let _guard = RecheckGuard {
+                state: state.clone(),
+                instance: instance.clone(),
+            };
+            loop {
+                std::thread::sleep(wake::RECHECK_INTERVAL);
+                let (to_write, outcome) = {
+                    let mut inner = state.lock();
+                    let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
+                        return;
+                    };
+                    let (generation, inputs, session_present) = {
+                        let Some(running) = inner.running.get(&instance) else {
+                            inner.recheck_running.remove(&instance);
+                            inner.wakers.remove(&instance);
+                            return;
+                        };
+                        (
+                            running.generation,
+                            wake::DeferInputs {
+                                last_client_input_at: inner
+                                    .last_client_input
+                                    .get(&instance)
+                                    .copied(),
+                                last_output_at: running.session.last_output_at(),
+                            },
+                            true,
+                        )
+                    };
+                    let mut scheduler = scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let decision = scheduler.check(
+                        session_present,
+                        generation,
+                        inputs,
+                        state.tuning.wake_input,
+                        state.tuning.wake_quiet,
+                        Instant::now(),
+                    );
+                    if matches!(decision, wake::NextAction::NothingToSend) {
+                        // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
+                        // 在鎖內收，避免與同時到達的另一個 `send` 交错。
+                        inner.wakers.remove(&instance);
+                        inner.recheck_running.remove(&instance);
+                        return;
+                    }
+                    let (to_write, outcome) = match decision {
+                        wake::NextAction::Deliver(bytes) => {
+                            // 與 `schedule_hint` 同一個不變量：**釋放鎖之前**清空，
+                            // 否則另一個執行緒會拿到同一格提示並再寫一次。
+                            scheduler.commit_delivery();
+                            (Some(bytes), Some(wake::WakeOutcome::Hinted))
+                        }
+                        other => (None, wake::Scheduler::outcome_for(other)),
+                    };
+                    (to_write, outcome)
+                };
+                // 鎖已釋放：寫入與「是否重試」都在鎖外決定（D-1）。
+                if let Some(bytes) = to_write {
+                    let _ = write_hint_outside_lock(&state, &instance, &bytes);
+                    return;
+                }
+                match outcome {
+                    Some(wake::WakeOutcome::Deferred) => continue,
+                    None | Some(_) => return,
+                }
+            }
+        }));
+    });
+}
+
+/// 重判迴圈的結束清理（清 D-3 的旗標）。
+///
+/// 用 RAII 而不是在每個 `return` 前手動清理：迴圈有五個出口，手動清理必然漏掉
+/// 某一個，而漏掉的後果是「這個 instance 之後再也沒有重判迴圈」——那會讓 §6.4
+/// 的提示永遠停在 `deferred`。
+struct RecheckGuard {
+    state: DaemonState,
+    instance: String,
+}
+
+impl Drop for RecheckGuard {
+    fn drop(&mut self) {
+        // 兩張表**一起**清（b8 的 B3）：`RecheckGuard` 原先只清 `recheck_running`，
+        // 留下帶非空 pending 的殘留排程器。`catch_unwind` 逃逸後，下一個 `send`
+        // 會拿到那個排程器；若 generation 未變，已放棄的提示就會與新提示合併，
+        // `count=<n>` 算進不該算的訊息。
+        //
+        // 正常路徑（送出、放棄、`NothingToSend`）仍在迴圈內**顯式**清兩張表——
+        // 那三處比等 guard 更清楚，而且它們在知道原因的地方清理。guard 只負責
+        // panic 逃逸這條沒有人能自己清理的路徑。
+        let mut inner = self.state.lock();
+        inner.recheck_running.remove(&self.instance);
+        inner.wakers.remove(&self.instance);
+    }
+}
+
+/// `inbox`：契約 §6.3。
+///
+/// 授權（§2 表格最後一列）：inbox 只有自己。operator 沒有收件匣（§6.1）——
+/// 這個檢查在 [`messaging::inbox`] 內做，daemon 端不重複。
+fn inbox_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    let lease_ms = state.tuning.lease.as_millis() as u64;
+    let mut inner = state.lock();
+    match messaging::inbox(&mut inner.store, caller, args, lease_ms, now_epoch_ms()) {
+        Ok(value) => OperationResult::completed(operation_id, value),
+        Err(op_error) => result_from_error(operation_id, op_error),
+    }
+}
+
 /// `delete_instance`：依 §4.5 停止後封存。
 fn delete_instance(
     state: &DaemonState,
@@ -1638,6 +2313,28 @@ fn delete_instance(
             Ok(row) => row,
             Err(result) => return *result,
         };
+        // 契約 §4.5：刪除某 team 的 orchestrator 回 `invalid_argument`，要求先
+        // 更換 orchestrator 或刪除 team。**在停止程序之前**拒絕——停止是這個
+        // instance 最重的副作用，讓一個只要換個 orchestrator 就能解決的設定問題
+        // 先把程序殺掉並封存 inbox，會讓呼叫端以為「刪除已完成一半」。
+        let orchestrator_of = {
+            let mut inner = state.lock();
+            inner
+                .store
+                .transaction(|tx| tx.team_of_instance_name(&name))
+                .unwrap_or(None)
+        };
+        if let Some((team, orchestrator)) = orchestrator_of {
+            if orchestrator == name {
+                return OperationResult::refused(
+                    operation_id,
+                    ErrorCode::InvalidArgument,
+                    &format!(
+                        "{name} 是 team {team} 的 orchestrator；請先更換 orchestrator 或刪除該 team"
+                    ),
+                );
+            }
+        }
         let mut effects = Vec::new();
         if row.pid.is_some() {
             match stop_previous(state, &row) {
@@ -1659,9 +2356,13 @@ fn delete_instance(
             inner
                 .store
                 .transaction(|tx| {
-                    tx.clear_process(&row.id)?;
+                    // 契約 §4.5 的三件事，各自一行：停止後封存 inbox、移出所屬
+                    // team、標記為已刪除。三行可數是刻意的——§8.1 的交易邊界靠
+                    // 這個可讀性維護。
                     tx.archive_messages(&row.id)?;
-                    tx.mark_instance_deleted(&row.id)
+                    tx.remove_from_team(&row.id)?;
+                    tx.mark_instance_deleted(&row.id)?;
+                    tx.clear_process(&row.id)
                 })
                 .is_ok()
         };
@@ -1766,7 +2467,24 @@ fn restart_instance(
                 return refused;
             }
         }
+        // 契約 §4.4 的順序是「`fresh` **先**把該 instance 所有 `delivering`
+        // 訊息退回 `unread`（舊 token 失效）；`resume` 保留 lease」，然後才
+        // 依 §4.3 停止舊程序。所以重新排隊發生在停止之前——舊程序還在跑時
+        // 它的收件匣就已經回到可重送的狀態，不會有「舊程序還在 drain、舊
+        // token 卻已失效」的窗口。
         let mut effects = Vec::new();
+        if mode != "resume" {
+            let requeued = {
+                let mut inner = state.lock();
+                inner
+                    .store
+                    .transaction(|tx| tx.requeue_delivering_on_fresh(&row.id))
+                    .unwrap_or_default()
+            };
+            if requeued > 0 {
+                effects.push(String::from("messages_requeued"));
+            }
+        }
         if row.pid.is_some() {
             match stop_previous(state, &row) {
                 PreviousOutcome::Stopped => effects.push(String::from("process_stopped")),
@@ -1983,16 +2701,32 @@ fn pane_snapshot(
 
 /// `tools_list`（契約 §10）：只列 P1a 已實作且該 instance 可執行的工具。
 fn tools_list(state: &DaemonState, operation_id: &str, caller: &Caller) -> OperationResult {
-    let is_manager = match caller {
+    // 契約 §10：「instance 一律看得到 `list_instances`、`restart_instance`、
+    // `send`、`inbox`、`team`、`pane_snapshot`；**manager 與 orchestrator** 另外
+    // 看得到 `interrupt`」。
+    //
+    // 判準是 §2 授權表裡「可對 `interrupt` 執行」的**聯集**：`managers`（設定檔
+    // 列出的 instance 名稱）或某個 team 的 orchestrator。orchestrator 那一支
+    // 必須真的去查 team——只看 `managers` 會讓 orchestrator 看不到該工具，而
+    // agent 看不到就永遠不會呼叫它，於是 §10 那半句等於沒實作（儘管 §2 的授權
+    // 本身是通的）。
+    let privileged = match caller {
         Caller::Operator => true,
         Caller::Instance(id) => {
-            let inner = state.lock();
-            inner
-                .store
-                .instance(id)
-                .unwrap_or(None)
-                .map(|row| inner.managers.contains(&row.name))
-                .unwrap_or(false)
+            let mut inner = state.lock();
+            let Some(row) = inner.store.instance(id).unwrap_or(None) else {
+                return OperationResult::refused(
+                    operation_id,
+                    ErrorCode::Unauthorized,
+                    "無法辨識呼叫端的身分",
+                );
+            };
+            inner.managers.contains(&row.name)
+                || inner
+                    .store
+                    .transaction(|tx| tx.team_of_instance_name(&row.name))
+                    .unwrap_or(None)
+                    .is_some_and(|(_, orchestrator)| orchestrator == row.name)
         }
     };
     OperationResult {
@@ -2000,8 +2734,8 @@ fn tools_list(state: &DaemonState, operation_id: &str, caller: &Caller) -> Opera
         outcome: Outcome::Completed,
         subject: None,
         value: json!({
-            "tools": mcp::tool_definitions(is_manager),
-            "tool_names": mcp::tool_names(is_manager),
+            "tools": mcp::tool_definitions(privileged),
+            "tool_names": mcp::tool_names(privileged),
         }),
         effects: Vec::new(),
         error: None,
@@ -2218,9 +2952,18 @@ fn read_client_frames(
                     }
                     continue;
                 }
-                let inner = state.lock();
-                if let Some(running) = inner.running.get(name) {
-                    let _ = running.session.write_input(&payload[8..]);
+                {
+                    // 只在收到 Input frame 時更新：Resize／Detach 不是輸入。
+                    // 喚醒排程之後會讀這個欄位判斷「operator 正在打字」，
+                    // 而排程器自己送出的提示行不經這裡（那走
+                    // `Session::write_input`），所以不會污染它。
+                    let mut inner = state.lock();
+                    inner
+                        .last_client_input
+                        .insert(name.to_owned(), Instant::now());
+                    if let Some(running) = inner.running.get(name) {
+                        let _ = running.session.write_input(&payload[8..]);
+                    }
                 }
             }
             0x11 => {

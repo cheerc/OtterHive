@@ -27,6 +27,15 @@ fn instance_query(predicate: &str) -> String {
 }
 
 /// Store 層可回報的錯誤。
+///
+/// [`StoreError::Contract`] 讓契約層的拒絕（§6.1／§8.1 的
+/// `invalid_argument`／`not_found`／`name_conflict`／`team_acl_denied`）能穿過
+/// `Store::transaction` 的閉包回傳型別。它們描述的正是「這筆交易不能成立」，
+/// 是 store 交易的一部分，不是外部塞進來的東西——所以不需要任何序列化。
+///
+/// 刻意**不** derive `Clone`／`PartialEq`／`Eq`：`rusqlite::Error` 兩者都沒有，
+/// 而為了讓一個變體可比較去泛化整個型別的 derives 沒有任何好處（現有 call site
+/// 都只做 pattern match）。
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("live instance 名稱已被使用: {0}")]
@@ -39,8 +48,22 @@ pub enum StoreError {
     UnsupportedSchema { found: i64, supported: i64 },
     #[error("{0}")]
     Invalid(String),
+    /// 契約層的拒絕（`ErrorCode` 與契約 §3 一一對應）。
+    ///
+    /// 與 `Invalid(String)` 的差別是**可預期性**：`Invalid` 是本層內部的
+    /// 不變量被破壞（呼叫端給了不該給的東西），而 `Contract` 是「請求本身
+    /// 合法但不成立」（例如 §8.1 的成員已在另一個 team）。兩者都讓交易回滾，
+    /// 但只有 `Contract` 會原樣回到呼叫端。
+    #[error("{0}")]
+    Contract(crate::protocol::OpError),
     #[error("SQLite 錯誤: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+impl From<crate::protocol::OpError> for StoreError {
+    fn from(op_error: crate::protocol::OpError) -> Self {
+        StoreError::Contract(op_error)
+    }
 }
 
 /// 建立 instance 所需的輸入（`spec` 為 JSON 物件）。
@@ -80,6 +103,95 @@ pub struct NewMessage {
     pub correlation_id: Option<String>,
     pub parent_id: Option<String>,
     pub thread_id: Option<String>,
+}
+
+/// `teams` 一列的完整欄位（契約 §8.1）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamRow {
+    pub name: String,
+    /// orchestrator 的 instance ID。
+    pub orchestrator_id: String,
+    pub description: Option<String>,
+    /// `accept_from` 以 JSON 陣列字串存放；用 [`TeamRow::accept_from_names`] 解析。
+    pub accept_from: String,
+    /// 所屬 deployment（`Some` 表示只能由 teardown 刪除，§8.4）。
+    pub deployment: Option<String>,
+}
+
+impl TeamRow {
+    /// `accept_from` 的 instance 名稱清單。
+    ///
+    /// **刻意**把壞掉的 JSON 讀成空 vec，而不是讓 team 讀取整個失敗或降級成
+    /// 「全部允許」：
+    ///
+    /// - `accept_from` 在 §6.2 的作用是**放寬**收件權限（讓跨隊的 sender 能送
+    ///   給 orchestrator）。讀成空清單 = 該 team 的規則 3 永不成立 = 收件權限
+    ///   維持在**最嚴**的那條路徑。
+    /// - 反過來（壞掉時放行全部）會讓一個儲存格式損壞的 team 變成對所有
+    ///   instance 開放，這是 fail-open。
+    ///
+    /// 這個降級是靜默的，所以它只安全到「方向正確」為止——真正的防線是
+    /// `insert_team`／`update_team` 總是寫入合法 JSON，讀到壞值代表資料庫已經
+    /// 被外部改過，那是需要人看的狀況而非能自動修的。
+    pub fn accept_from_names(&self) -> Vec<String> {
+        serde_json::from_str::<Vec<String>>(&self.accept_from).unwrap_or_default()
+    }
+}
+
+/// `messages` 一列的完整欄位（契約 §6.3 的 drain 結果）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageRow {
+    pub id: String,
+    pub recipient_id: String,
+    pub sender_kind: String,
+    pub sender_id: Option<String>,
+    pub sender_name: String,
+    pub kind: String,
+    pub body: String,
+    pub correlation_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+    /// `unread`｜`delivering`｜`acked`｜`archived`。
+    pub state: String,
+    pub delivery_token: Option<String>,
+    pub lease_expires_ms: Option<i64>,
+    pub delivery_count: i64,
+    pub created_ms: i64,
+}
+
+/// `inbox` ack 的結果（契約 §6.3 的四種失敗與兩種成功）。
+///
+/// 對應到契約的錯誤碼由 [`Tx::ack_message`] 的呼叫端翻譯：
+/// `Stale` → `delivery_token_stale`、`NeverDelivered` → `never_delivered`、
+/// `NotFound` → `not_found`、`Internal` → `internal`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// token 相符且 lease 未過期 → `acked`。
+    Acked,
+    /// 同一組 token 對已 ack 的訊息重複 ack → `completed`（`already_acked`）。
+    AlreadyAcked,
+    /// token 不符或 lease 已過期。
+    Stale,
+    /// 該訊息從未被投遞（`state` 仍是 `unread`，沒有 token）。
+    NeverDelivered,
+    /// 訊息 id 不存在，或屬於別人（§6.3「不是自己的訊息回 `not_found`」）。
+    NotFound,
+    /// 訊息已被 `delete_instance` 封存（§4.5：archived 不再可 drain，也不可 ack）。
+    Archived,
+    /// 寫入失敗。
+    Internal,
+}
+
+/// 一次 drain 的結果（契約 §6.3）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrainOutcome {
+    /// 本批被標為 `delivering` 的訊息（`delivery_count` 已是遞增後的值）。
+    pub messages: Vec<MessageRow>,
+    /// 本批的 `delivery_token`；批次為空時 `None`（§6.3「沒有訊息時不發 token」）。
+    pub delivery_token: Option<String>,
+    pub lease_expires_ms: Option<i64>,
+    /// 仍未 drain 的筆數（`unread` 或 lease 已過期的 `delivering`）。
+    pub remaining: u64,
 }
 
 /// `operations` 一列（契約 §3 的去重記錄）。
@@ -443,7 +555,36 @@ impl Tx<'_> {
         self.append_journal(Some(instance_id), Some(generation), kind, Some(detail))
     }
 
+    /// 把 instance 移出所屬 team（契約 §4.5 的「移出所屬 team」）。
+    ///
+    /// §4.5 的三件事（標記刪除／移出 team／封存 inbox）刻意是三個獨立的
+    /// 操作，讓 `delete_instance` 的交易裡三行可數——那個可讀性就是 §8.1
+    /// 「所有檢查在同一交易內」靠什麼維護的。
+    ///
+    /// **不留孤兒列。** §8.1 的「一個 instance 最多屬於一個 team」靠
+    /// `team_members.instance_id` 的 UNIQUE 實作，而孤兒列會讓那條約束對該
+    /// ID **fail-open**：`set_team_members` 的 OR IGNORE 逐行檢查查的是「本
+    /// team 裡有沒有」，孤兒列會讓它回 `already_here == 1` 而靜默接受。
+    ///
+    /// 而且孤兒列在**所有對外查詢裡都是隱形的**——`team_members`、
+    /// `team_name_of_instance`、`team_of_instance_name` 都 join
+    /// `instances.deleted_ms IS NULL`，所以沒有任何 `team list` 層的斷言能
+    /// 抓到它。測試必須直接斷言底層列不存在。
+    pub fn remove_from_team(&self, id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM team_members WHERE instance_id = ?1",
+            params![id],
+        )?;
+        if changed > 0 {
+            self.append_journal(Some(id), None, "team_member_removed", Some(id))?;
+        }
+        Ok(())
+    }
+
     /// 標記 instance 已刪除（契約 §4.5）；列本身保留以維持歷史與名稱重用規則。
+    ///
+    /// §4.5 的另外兩件事由 [`Tx::remove_from_team`] 與
+    /// [`Tx::archive_messages`] 各自負責。
     pub fn mark_instance_deleted(&self, id: &str) -> Result<(), StoreError> {
         let now = now_ms();
         let changed = self.connection.execute(
@@ -554,6 +695,381 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// 依名稱查一列 team（§8.1）。
+    pub fn team(&self, name: &str) -> Result<Option<TeamRow>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT name, orchestrator_id, description, accept_from, deployment \
+                 FROM teams WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(TeamRow {
+                        name: row.get(0)?,
+                        orchestrator_id: row.get(1)?,
+                        description: row.get(2)?,
+                        accept_from: row.get(3)?,
+                        deployment: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 某 team 的成員 instance 名稱（排序後，讓測試與結果可預期）。
+    pub fn team_members(&self, team: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT instances.name FROM team_members \
+             JOIN instances ON instances.id = team_members.instance_id \
+             WHERE team_members.team = ?1 AND instances.deleted_ms IS NULL \
+             ORDER BY instances.name",
+        )?;
+        let rows = statement
+            .query_map(params![team], |row| row.get::<_, String>(0))
+            .map_err(StoreError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    /// 依名稱查 instance 的 ID（`None` 表示不存在或已刪除）。
+    pub fn live_instance_id(&self, name: &str) -> Result<Option<String>, StoreError> {
+        self.existing_live_id(name)
+    }
+
+    /// 某 instance 所屬的 team 名稱（`None` 表示不屬任何 team）。
+    pub fn team_name_of_instance(&self, name: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT team FROM team_members \
+                 JOIN instances ON instances.id = team_members.instance_id \
+                 WHERE instances.name = ?1 AND instances.deleted_ms IS NULL",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 建立一列 team。
+    ///
+    /// 名稱已被使用時回 [`StoreError::NameConflict`]（§3）。成員關係由
+    /// [`Tx::set_team_members`] 在同一交易內寫入——**兩者必須同交易**，否則會
+    /// 留下沒有成員的 team（§8.1 要求檢查先於任何異動）。
+    pub fn insert_team(
+        &self,
+        name: &str,
+        orchestrator_id: &str,
+        description: Option<&str>,
+        accept_from: &[String],
+        deployment: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let encoded = serde_json::to_string(accept_from)
+            .map_err(|error| StoreError::Invalid(format!("序列化 accept_from 失敗: {error}")))?;
+        self.connection
+            .execute(
+                "INSERT INTO teams(name, orchestrator_id, description, accept_from, deployment) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, orchestrator_id, description, encoded, deployment],
+            )
+            .map_err(|error| name_taken(error, name))?;
+        self.append_journal(None, None, "team_created", Some(name))?;
+        Ok(())
+    }
+
+    /// 更新 team 的 orchestrator、description 與 `accept_from`。
+    ///
+    /// 保留 `deployment`（那由 deploy／teardown 擁有，§8.3／§8.4）。
+    pub fn update_team(
+        &self,
+        name: &str,
+        orchestrator_id: &str,
+        description: Option<&str>,
+        accept_from: &[String],
+    ) -> Result<bool, StoreError> {
+        let encoded = serde_json::to_string(accept_from)
+            .map_err(|error| StoreError::Invalid(format!("序列化 accept_from 失敗: {error}")))?;
+        let changed = self.connection.execute(
+            "UPDATE teams SET orchestrator_id = ?2, description = ?3, accept_from = ?4 \
+             WHERE name = ?1",
+            params![name, orchestrator_id, description, encoded],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.append_journal(None, None, "team_updated", Some(name))?;
+        Ok(true)
+    }
+
+    /// 刪除 team 與其成員關係（§8.1：刪 team 不刪 instance）。
+    ///
+    /// 回 `false` 表示 team 不存在。
+    pub fn delete_team(&self, name: &str) -> Result<bool, StoreError> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM teams WHERE name = ?1", params![name])?;
+        // 成員關係隨 team 一起清掉；即使 team 已不存在（`changed == 0`）也要
+        // 清乾淨，避免孤兒列讓 instance 永遠「已屬於某個 team」。
+        self.connection
+            .execute("DELETE FROM team_members WHERE team = ?1", params![name])?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.append_journal(None, None, "team_deleted", Some(name))?;
+        Ok(true)
+    }
+
+    /// 取代某 team 的成員集合。
+    ///
+    /// `team_members.instance_id` 是 UNIQUE（§8.1「一個 instance 最多屬於一個
+    /// team」），所以先把不在新集合裡的關係刪掉，再插入新的。
+    pub fn set_team_members(&self, team: &str, instance_ids: &[String]) -> Result<(), StoreError> {
+        // 順序是**先刪本 team 多餘的列，再插入**，而且刪除只限本 team。
+        //
+        // §8.1「一個 instance 最多屬於一個 team」在這裡有兩條不同的失敗要區分，
+        // 而 `team_members` 的 PRIMARY KEY `(team, instance_id)` 把兩者混成同一個
+        // UNIQUE 違規：插入一個**已經是本 team 成員**的 instance 會撞 PK；而插入一個
+        // **已在別的 team** 的 instance 撞的是「一個 instance 只屬於一個 team」。
+        // `INSERT OR IGNORE` 會把兩者一起吞掉，所以不能單靠它。
+        //
+        // 修法：插入用 `OR IGNORE`（容忍「已經是成員」這個無害的重複），然後
+        // **逐行檢查有沒有真的進來**——沒進來且它不是本 team 的成員，就是它已在
+        // 別的 team，該回 `name_conflict`（§8.1），讓交易回滾。
+        let encoded = serde_json::to_string(instance_ids)
+            .map_err(|error| StoreError::Invalid(format!("序列化成員清單失敗: {error}")))?;
+        // 隱性依賴：`?2` 必須是 **JSON 陣列**的序列化結果，而 `json_each.value` 的
+        // 比較是 SQLite 的型別敏感比較——`text` 欄位比 `integer` 值不會相等。
+        // 這裡傳進去的 `encoded` 由 `serde_json::to_string(&[String])` 產生，所以
+        // 元素一定是字串。**若改成傳別的型別，刪除條件會靜默失配**（沒有列被
+        // 刪除，`set_team_members` 看起來仍然正確）。
+        let mut statement = self.connection.prepare(
+            "DELETE FROM team_members WHERE team = ?1 AND NOT EXISTS ( \
+               SELECT 1 FROM json_each(?2) WHERE json_each.value = team_members.instance_id \
+             )",
+        )?;
+        statement.execute(params![team, encoded])?;
+        drop(statement);
+        for id in instance_ids {
+            let changed = self.connection.execute(
+                "INSERT OR IGNORE INTO team_members(team, instance_id) VALUES (?1, ?2)",
+                params![team, id],
+            )?;
+            if changed == 0 {
+                // 沒插進來：兩種可能——它已是本 team 成員（無害，維持原狀），或
+                // 它已在別的 team（契約違規）。
+                let already_here = self
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team = ?1 AND instance_id = ?2)",
+                        params![team, id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(StoreError::from)?;
+                if already_here == 0 {
+                    // §3：instance 名稱／歸屬已被使用是 `name_conflict`。這裡是
+                    // 「這個 instance 已經屬於某個 team」，語意上同類——它已被
+                    // 別的 team 佔用，不能再被另一個 team 收編。
+                    return Err(StoreError::NameConflict(format!(
+                        "instance {id} 已屬於另一個 team（§8.1 的單一 team 歸屬）"
+                    )));
+                }
+            }
+        }
+        self.append_journal(None, None, "team_members_set", Some(team))?;
+        Ok(())
+    }
+
+    /// 依訊息 ID 查一列（不檢查收件人）。
+    pub fn message_by_id(&self, id: &str) -> Result<Option<MessageRow>, StoreError> {
+        self.connection
+            .query_row(MESSAGE_QUERY, params![id], read_message_row)
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 原子寫入多則訊息（§6.1：對每個收件人寫入一筆 `unread`，全部在同一交易內）。
+    ///
+    /// 回傳與 `messages` 同順序的 ID。任何一筆失敗都讓整批失敗（呼叫端的
+    /// `Tx` 交易會回滾），不會留下半批。
+    pub fn insert_message_batch(&self, messages: &[NewMessage]) -> Result<Vec<String>, StoreError> {
+        let mut ids = Vec::with_capacity(messages.len());
+        for message in messages {
+            ids.push(self.insert_message(message)?);
+        }
+        Ok(ids)
+    }
+
+    /// 依建立順序取一批可投遞的訊息並標為 `delivering`（契約 §6.3 drain）。
+    ///
+    /// 可投遞 = `state = 'unread'`，或 `state = 'delivering'` 但 lease 已過期
+    /// （`lease_expires_ms` 不在未來）。批次至少一則（`budget_bytes` 不套用於
+    /// 單則），且 `body` 的 **UTF-8 bytes** 總和不超過 `budget_bytes`（48 KiB）。
+    ///
+    /// 前一批未 ack 的訊息**不會**被本操作結算（lease 未過期就不選它），
+    /// 這正是「至少一次投遞」所需的語意。
+    pub fn drain_messages(
+        &self,
+        recipient_id: &str,
+        budget_bytes: usize,
+        now_ms: i64,
+        lease_ms: u64,
+    ) -> Result<DrainOutcome, StoreError> {
+        let candidates = self.deliverable_messages(recipient_id, now_ms)?;
+        let mut batch: Vec<MessageRow> = Vec::new();
+        let mut used = 0usize;
+        for row in candidates {
+            let bytes = row.body.len();
+            if !batch.is_empty() && used.saturating_add(bytes) > budget_bytes {
+                break;
+            }
+            // §6.3 的上限是「總和上限」，但它不能把**第一則**也擋掉：批次至少
+            // 一則，否則 drain 會對任何訊息都回空，接收端永遠收不到東西。
+            // 單則本身超過預算時照樣取（`test drain_returns_at_least_one_...`）。
+            used = used.saturating_add(bytes);
+            batch.push(row);
+        }
+
+        let token = if batch.is_empty() {
+            None
+        } else {
+            Some(Uuid::new_v4().to_string())
+        };
+        let lease_expires = token
+            .as_ref()
+            .map(|_| now_ms.saturating_add(lease_ms as i64));
+
+        for row in &batch {
+            self.connection.execute(
+                "UPDATE messages SET state = 'delivering', delivery_token = ?2, \
+                 lease_expires_ms = ?3, delivery_count = delivery_count + 1 WHERE id = ?1",
+                params![row.id, token, lease_expires],
+            )?;
+        }
+
+        let remaining = self.remaining_count(recipient_id, now_ms)?;
+        let messages = batch
+            .into_iter()
+            .map(|mut row| {
+                row.state = String::from("delivering");
+                row.delivery_token = token.clone();
+                row.lease_expires_ms = lease_expires;
+                row.delivery_count += 1;
+                row
+            })
+            .collect();
+
+        Ok(DrainOutcome {
+            messages,
+            delivery_token: token,
+            lease_expires_ms: lease_expires,
+            remaining,
+        })
+    }
+
+    /// 確認一則訊息（契約 §6.3 ack）。
+    ///
+    /// `not_found` 同時涵蓋「訊息不存在」與「不是自己的訊息」——§6.3 對這兩種
+    /// 情況指定同一個碼，不因為呼叫方知道 ID 就洩漏別人的訊息存在性。
+    pub fn ack_message(
+        &self,
+        recipient_id: &str,
+        message_id: &str,
+        token: &str,
+        now_ms: i64,
+    ) -> Result<AckOutcome, StoreError> {
+        let Some(row) = self.message_by_id(message_id)? else {
+            return Ok(AckOutcome::NotFound);
+        };
+        if row.recipient_id != recipient_id {
+            return Ok(AckOutcome::NotFound);
+        }
+        match row.state.as_str() {
+            "acked" => {
+                // 重複 ack 同一組 token 回 `completed`（`already_acked`）；不同
+                // token 對已 ack 的訊息仍是 stale（否則舊 token 會復活）。
+                return if row.delivery_token.as_deref() == Some(token) {
+                    Ok(AckOutcome::AlreadyAcked)
+                } else {
+                    Ok(AckOutcome::Stale)
+                };
+            }
+            "archived" => return Ok(AckOutcome::Archived),
+            "delivering" => {}
+            // 曾被投遞過、又被 `fresh` restart 退回 `unread`（§4.4）→ 舊 token
+            // 失效，所以回 `Stale`。不能回 `NeverDelivered`：§6.3 的
+            // `never_delivered` 是「**從未**投遞」，而這則的接收端可能已經讀到
+            // 過、只是還沒 ack。回 `never_delivered` 會讓 agent 誤以為「這則從沒
+            // 送到過，可以忽略」，而它其實還在 inbox 裡等重送。
+            //
+            // 兩者的差別就是 `delivery_count`：它是為了記錄投遞次數而存在，這裡
+            // 順帶擔任「是否曾被投遞」的判準（`0` = 真的從未投遞）。
+            "unread" if row.delivery_count > 0 => return Ok(AckOutcome::Stale),
+            _ => return Ok(AckOutcome::NeverDelivered),
+        }
+        let lease_valid = row.lease_expires_ms.is_some_and(|expires| expires > now_ms);
+        if row.delivery_token.as_deref() != Some(token) || !lease_valid {
+            return Ok(AckOutcome::Stale);
+        }
+        self.connection.execute(
+            "UPDATE messages SET state = 'acked', acked_ms = ?2 WHERE id = ?1",
+            params![message_id, now_ms],
+        )?;
+        Ok(AckOutcome::Acked)
+    }
+
+    /// §4.4：`fresh` restart 把該 instance 所有 `delivering` 退回 `unread`
+    /// （舊 token 失效）；回傳受影響的筆數。
+    ///
+    /// `acked` 與 `archived` 不動——已送達的不重送，封存的不可 drain（§4.5）。
+    pub fn requeue_delivering_on_fresh(&self, instance_id: &str) -> Result<u64, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE messages SET state = 'unread', delivery_token = NULL, lease_expires_ms = NULL \
+             WHERE recipient_id = ?1 AND state = 'delivering'",
+            params![instance_id],
+        )?;
+        if changed > 0 {
+            self.append_journal(
+                Some(instance_id),
+                None,
+                "messages_requeued",
+                Some(&changed.to_string()),
+            )?;
+        }
+        Ok(changed as u64)
+    }
+
+    /// 可投遞的訊息（`unread` 或 lease 已過期的 `delivering`），依建立順序。
+    fn deliverable_messages(
+        &self,
+        recipient_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<MessageRow>, StoreError> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE recipient_id = ?1 AND ( \
+               state = 'unread' OR (state = 'delivering' AND (lease_expires_ms IS NULL OR lease_expires_ms <= ?2)) \
+             ) ORDER BY seq"
+        ))?;
+        let rows = statement
+            .query_map(params![recipient_id, now_ms], read_message_row)
+            .map_err(StoreError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
+    /// 仍未 drain 的筆數（§6.3 的 `remaining`：口徑與 [`Tx::deliverable_messages`]
+    /// 完全一致——同一個「可投遞」定義，不同批次大小才會讓兩者對不上）。
+    fn remaining_count(&self, recipient_id: &str, now_ms: i64) -> Result<u64, StoreError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recipient_id = ?1 AND ( \
+               state = 'unread' OR (state = 'delivering' AND (lease_expires_ms IS NULL OR lease_expires_ms <= ?2)) \
+             )",
+            params![recipient_id, now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     fn existing_live_id(&self, name: &str) -> Result<Option<String>, StoreError> {
         self.connection
             .query_row(
@@ -606,6 +1122,32 @@ fn read_instance_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
         deleted_ms: row.get(10)?,
         created_ms: row.get(11)?,
         updated_ms: row.get(12)?,
+    })
+}
+
+/// `messages` 的完整欄位清單，兩處查詢共用。
+const MESSAGE_COLUMNS: &str = "id, recipient_id, sender_kind, sender_id, sender_name, kind, body, correlation_id, parent_id, thread_id, state, delivery_token, lease_expires_ms, delivery_count, created_ms";
+
+/// 依主鍵取單列 `messages` 的查詢式（欄位順序對應 [`read_message_row`]）。
+const MESSAGE_QUERY: &str = "SELECT id, recipient_id, sender_kind, sender_id, sender_name, kind, body, correlation_id, parent_id, thread_id, state, delivery_token, lease_expires_ms, delivery_count, created_ms FROM messages WHERE id = ?1";
+
+fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: row.get(0)?,
+        recipient_id: row.get(1)?,
+        sender_kind: row.get(2)?,
+        sender_id: row.get(3)?,
+        sender_name: row.get(4)?,
+        kind: row.get(5)?,
+        body: row.get(6)?,
+        correlation_id: row.get(7)?,
+        parent_id: row.get(8)?,
+        thread_id: row.get(9)?,
+        state: row.get(10)?,
+        delivery_token: row.get(11)?,
+        lease_expires_ms: row.get(12)?,
+        delivery_count: row.get(13)?,
+        created_ms: row.get(14)?,
     })
 }
 

@@ -1164,11 +1164,11 @@ fn instance_pid(home: &TestHome, name: &str) -> Option<i32> {
 /// - 一般 instance：不在 `managers` → `tool_names(false)`。
 ///
 /// 另外驗兩件事：
-/// - 期別工具（`DEFERRED_TO_LATER_PHASE`）不在 wire 結果裡。
+/// - 不列入的 P1a 工具與非 P1a 工具（`NOT_LISTED_IN_P1A`）都不在 wire 結果裡。
 /// - 未列出的工具直呼回 `unsupported_in_phase`（契約 §3「不列出 ≠ 可靜默忽略」）。
 #[test]
 fn daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind() {
-    use otterhive::mcp::{tool_names, DEFERRED_TO_LATER_PHASE};
+    use otterhive::mcp::{tool_names, NOT_LISTED_IN_P1A};
 
     let home = TestHome::new();
     // 設定檔把 `managed` 列入 managers（契約 §2 的權限來源之一）。daemon 在啟動
@@ -1228,10 +1228,10 @@ fn daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind() {
             wire, expected,
             "繁中說明：{label} 的 daemon tools_list 必須與 mcp::tool_names({is_manager}) 相同"
         );
-        for deferred in DEFERRED_TO_LATER_PHASE {
+        for absent in NOT_LISTED_IN_P1A {
             assert!(
-                !wire.iter().any(|name| name == deferred),
-                "繁中說明：期別工具 {deferred} 不應出現在 wire 清單，實際：{wire:?}"
+                !wire.iter().any(|name| name == absent),
+                "繁中說明：不列入的工具 {absent} 不應出現在 wire 清單，實際：{wire:?}"
             );
         }
         // 未列出的工具直呼：unsupported（不是靜默忽略）。用 T4 尚未實作的

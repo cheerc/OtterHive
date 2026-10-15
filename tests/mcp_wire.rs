@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use common::TempHome;
-use otterhive::mcp::{tool_names, T4_LIFECYCLE_TOOLS};
+use otterhive::mcp::{tool_names, P1A_INSTANCE_TOOLS, P1A_PRIVILEGED_TOOLS};
 use serde_json::{json, Value};
 
 /// bridge 讀不到 daemon 時的 JSON-RPC 錯誤碼（契約 §10）。
@@ -45,17 +45,36 @@ const SILENCE_TIMEOUT: Duration = Duration::from_millis(400);
 /// bridge 因前提缺失而退出的等待上限。
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// T4 的一般 instance 工具清單（plan T4：只列已完成的 lifecycle 工具）。
-const T4_INSTANCE_TOOLS: [&str; 3] = ["list_instances", "pane_snapshot", "restart_instance"];
-/// T4 的 manager 工具清單（多了 `interrupt`）。
-const T4_MANAGER_TOOLS: [&str; 4] = [
+/// T5 之後一般 instance 看得到的工具（契約 §10，恰 6 個）。
+const P1A_INSTANCE: [&str; 6] = [
     "list_instances",
-    "pane_snapshot",
     "restart_instance",
+    "send",
+    "inbox",
+    "team",
+    "pane_snapshot",
+];
+/// T5 之後 manager／orchestrator 看得到的工具（契約 §10，恰 7 個）。
+const P1A_PRIVILEGED: [&str; 7] = [
+    "list_instances",
+    "restart_instance",
+    "send",
+    "inbox",
+    "team",
+    "pane_snapshot",
     "interrupt",
 ];
-/// T4 尚未實作、因此不列入工具清單的 P1a 工具（handler 在 T5）。
-const DEFERRED_TO_T5: [&str; 3] = ["send", "inbox", "team"];
+/// P1a 已實作但 `tools_list` 不列出的工具（契約 §10 明文）。
+const NOT_LISTED_IN_P1A: [&str; 8] = [
+    "create_instance",
+    "delete_instance",
+    "start_instance",
+    "deployment",
+    "decision",
+    "task",
+    "set_metadata",
+    "schedule",
+];
 
 struct Bridge {
     child: Child,
@@ -512,7 +531,7 @@ fn daemon_unreachable_is_reported_for_every_calling_method() {
     let mut bridge = Bridge::start(home.home(), &[("OTTERHIVE_INSTANCE_TOKEN", "token-wire")]);
     bridge.handshake();
 
-    for (index, tool) in T4_MANAGER_TOOLS.iter().enumerate() {
+    for (index, tool) in P1A_PRIVILEGED.iter().enumerate() {
         let id = 100 + index as i64;
         let response = bridge.call(&json!({
             "jsonrpc": "2.0",
@@ -531,38 +550,41 @@ fn daemon_unreachable_is_reported_for_every_calling_method() {
 // ------------------------------------------------- lifecycle 工具（registry）
 
 #[test]
-fn t4_lists_only_the_three_completed_lifecycle_tools_for_an_instance() {
-    // plan T4：T4 只列已完成的 lifecycle 工具，一般 instance 為三個。
+fn lists_exactly_six_tools_for_an_instance() {
+    // 契約 §10：instance 一律看得到 list_instances／restart_instance／send／
+    // inbox／team／pane_snapshot。取代 T4 的「只列三個 lifecycle 工具」。
     let names = tool_names(false);
     assert_eq!(
-        names, T4_INSTANCE_TOOLS,
-        "繁中說明：一般 instance 的工具清單應恰為 T4 已完成的三個 lifecycle 工具"
+        names, P1A_INSTANCE,
+        "繁中說明：一般 instance 的工具清單應恰為契約 §10 的 6 個"
     );
 }
 
 #[test]
-fn t4_adds_interrupt_only_for_a_manager() {
+fn adds_interrupt_only_for_a_manager_or_orchestrator() {
     let names = tool_names(true);
     assert_eq!(
-        names, T4_MANAGER_TOOLS,
-        "繁中說明：manager 的工具清單應在一般 instance 的三個之外多一個 interrupt"
+        names, P1A_PRIVILEGED,
+        "繁中說明：manager 的工具清單應恰為契約 §10 的 7 個"
     );
 }
 
 #[test]
-fn t4_does_not_list_tools_whose_handlers_land_in_t5() {
-    let mut listed = tool_names(true);
+fn lists_the_three_tools_whose_handlers_landed_in_t5() {
+    // T4 時 send／inbox／team 的 handler 未落地，因此不在清單裡；T5 落地後
+    // 三個都必須看得到（契約 §10 明文點名）。
+    let mut listed = tool_names(false);
     listed.sort();
-    for tool in DEFERRED_TO_T5 {
+    for tool in ["send", "inbox", "team"] {
         assert!(
-            !listed.contains(&tool.to_owned()),
-            "繁中說明：{tool} 的 handler 在 T5，T4 不應列出（契約 §10：只列已實作的工具）"
+            listed.contains(&tool.to_owned()),
+            "繁中說明：{tool} 的 handler 已在 T5 落地，一般 instance 應看得到"
         );
     }
 }
 
 #[test]
-fn t4_does_not_list_create_delete_start_or_deployment() {
+fn does_not_list_create_delete_start_or_deployment() {
     // 契約 §10：create／delete／start／deployment 不列出。
     let mut listed = tool_names(true);
     listed.sort();
@@ -580,18 +602,60 @@ fn t4_does_not_list_create_delete_start_or_deployment() {
 }
 
 #[test]
-fn t4_lifecycle_tool_set_is_pinned_by_the_plan() {
-    // 把範圍常數與模組層的清單綁在一起，避免兩處各自漂移。
+fn the_p1a_tool_set_is_pinned_by_the_contract() {
+    // 把模組公開的契約清單與測試認定的清單綁在一起，避免兩處各自漂移。
     assert_eq!(
-        T4_LIFECYCLE_TOOLS, T4_MANAGER_TOOLS,
-        "繁中說明：模組公開的 T4 lifecycle 清單應等於測試認定的 manager 清單"
+        P1A_INSTANCE_TOOLS, P1A_INSTANCE,
+        "繁中說明：模組公開的一般 instance 清單應等於測試認定的契約集合"
     );
+    assert_eq!(
+        P1A_PRIVILEGED_TOOLS, P1A_PRIVILEGED,
+        "繁中說明：模組公開的 manager 清單應等於測試認定的契約集合"
+    );
+    assert_eq!(
+        P1A_INSTANCE.len(),
+        6,
+        "繁中說明：契約 §10 的一般 instance 工具數是 6"
+    );
+    assert_eq!(
+        P1A_PRIVILEGED.len(),
+        7,
+        "繁中說明：契約 §10 的 manager／orchestrator 工具數是 7"
+    );
+}
+
+#[test]
+fn every_not_listed_tool_is_absent_for_both_caller_kinds() {
+    // 「不列出」對兩種 caller 都成立：manager 多一個 interrupt，不代表
+    // create／delete／start／deployment 就浮出來。
+    for absent in NOT_LISTED_IN_P1A {
+        for is_manager in [false, true] {
+            assert!(
+                !tool_names(is_manager).contains(&absent.to_owned()),
+                "繁中說明：{absent} 對 is_manager={is_manager} 都不應被列出（契約 §10）"
+            );
+        }
+    }
+}
+
+#[test]
+fn does_not_list_any_non_p1a_tool() {
+    // 契約 §10：「所有非 P1a 工具不列出」。`NOT_LISTED_IN_P1A` 裡的後半段
+    // （decision／task／set_metadata／schedule）屬於 catalog 的後續期別。
+    let mut listed = tool_names(true);
+    listed.sort();
+    for tool in ["decision", "task", "set_metadata", "schedule"] {
+        assert!(
+            !listed.contains(&tool.to_owned()),
+            "繁中說明：非 P1a 工具 {tool} 不應出現在工具清單"
+        );
+    }
 }
 
 #[test]
 fn schema_properties_equal_the_catalog_supported_and_added_fields() {
     let catalog = load_catalog();
-    for tool in T4_MANAGER_TOOLS {
+    for tool in P1A_PRIVILEGED {
         let expected = catalog_schema_fields(&catalog, tool);
         let actual = otterhive::mcp::input_schema_fields(tool);
         assert_eq!(
@@ -606,7 +670,7 @@ fn schema_omits_every_refused_field() {
     // 契約 §10：schema 只含支援的欄位；舊版有但 P1a 拒收的欄位不得出現在
     // schema 裡，否則 backend 會照著 schema 送、`admission` 再拒一次。
     let catalog = load_catalog();
-    for tool in T4_MANAGER_TOOLS {
+    for tool in P1A_PRIVILEGED {
         let entry = catalog["tools"]
             .as_array()
             .expect("catalog tools 必須是陣列")
@@ -656,5 +720,520 @@ fn restart_schema_keeps_expected_generation_because_it_is_added_in_p1a() {
     assert!(
         !actual.contains(&"force".to_owned()),
         "繁中說明：restart_instance 的 schema 不應含 P1a 拒收的 force"
+    );
+}
+
+// ------------------------------------------------- refused 與 isError（§10）
+
+/// daemon 在線時，`tools/call` 的工具結果一律是
+/// `{content: [{type:"text", text: <OperationResult JSON>}], isError}`；
+/// `isError` 只在 `refused`／`unsupported` 時為 `true`（契約 §10）。
+///
+/// 本檔的 bridge harness 啟動時**不**帶 daemon，因此線上行為走不到。
+/// 這裡驗的是 bridge 端形狀不變的那一層：`-32001` 是 JSON-RPC 錯誤、沒有
+/// `isError`；一旦有人在 bridge 裡把「daemon 不可連」改寫成
+/// `isError: true` 的工具結果，就會被這個測試擋下。
+#[test]
+fn daemon_unreachable_is_an_rpc_error_not_a_tool_result_with_is_error() {
+    let home = TempHome::new("is_error_shape");
+    let mut bridge = Bridge::start(home.home(), &[("OTTERHIVE_INSTANCE_TOKEN", "token-wire")]);
+    bridge.handshake();
+
+    let response = bridge.call(&json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": {"name": "send", "arguments": {"message": "hi"}}
+    }));
+    assert_error_code(&response, ERR_DAEMON_UNREACHABLE, "send");
+    assert!(
+        rpc_result(&response).is_none(),
+        "繁中說明：daemon 不可連不得偽裝成工具結果（契約 §10「不假裝成功」），實際為 {response}"
+    );
+    assert!(
+        response.get("result").is_none() || response["result"].get("isError").is_none(),
+        "繁中說明：JSON-RPC 錯誤層沒有 isError，實際為 {response}"
+    );
+}
+
+/// `unsupported` 的工具／欄位在 admission 層就回 `unsupported_in_phase`
+/// （契約 §3），因此 `isError: true` 的內容必須帶著可行動的訊息。
+///
+/// 這裡以 `admission` 對**非 P1a 工具**做一次端到端形狀檢查：訊息必須同時
+/// 指出被拒的工具、並說明「P1a 不支援」，讓 backend 讀到 `isError` 的內容
+/// 時知道下一步是什麼，而不是只看到一個失敗旗標。
+#[test]
+fn an_unsupported_tool_result_carries_a_message_naming_it_and_the_phase() {
+    let error = otterhive::admission::admit("decision", &json!({}))
+        .expect_err("繁中說明：非 P1a 工具應被 admission 拒絕");
+    assert_eq!(
+        error.code,
+        otterhive::protocol::ErrorCode::UnsupportedInPhase,
+        "繁中說明：decision 應回 unsupported_in_phase（契約 §3）"
+    );
+    assert!(
+        error.message.contains("P1a 不支援"),
+        "繁中說明：訊息應說明 P1a 不支援，實際為 {:?}",
+        error.message
+    );
+    assert!(
+        error.message.contains("decision"),
+        "繁中說明：訊息應指出被拒的工具，實際為 {:?}",
+        error.message
+    );
+    assert!(
+        !error.retryable,
+        "繁中說明：同一請求永遠同樣被拒，重試無意義（契約 §3）"
+    );
+}
+
+/// 契約 §10 明文：「`create_instance`、`delete_instance`、
+/// `start_instance`、`deployment` 與所有非 P1a 工具不列出；**直接呼叫依 §2、
+/// §3 拒絕**」。
+///
+/// 因此「不列出」必須配對「直接呼叫不沉默」。`admission` 對這四個工具的
+/// 形狀檢查是**通過**的（它們在 catalog 中是 P1a 工具，規格存在），所以這
+/// 條斷言它們**不得**因為形狀合法就被當成可呼叫——判斷必須發生在 daemon
+/// 端的 handler。
+#[test]
+fn unlisted_p1a_tools_pass_shape_but_are_not_callable() {
+    for (tool, args) in [
+        ("create_instance", json!({"name": "worker"})),
+        ("delete_instance", json!({"instance": "worker"})),
+        ("start_instance", json!({"instance": "worker"})),
+        ("deployment", json!({"action": "list"})),
+    ] {
+        assert!(
+            otterhive::admission::admit(tool, &args).is_ok(),
+            "繁中說明：{tool} 是 catalog 中的 P1a 工具，形狀檢查應通過"
+        );
+        assert!(
+            !tool_names(true).contains(&tool.to_owned()),
+            "繁中說明：{tool} 不得出現在工具清單（契約 §10）"
+        );
+        assert!(
+            !tool_names(false).contains(&tool.to_owned()),
+            "繁中說明：{tool} 對一般 instance 也不得出現在工具清單"
+        );
+    }
+}
+
+// ------------------------------------- 以真 daemon 驗證 caller kind 的工具清單
+
+/// B1 的端對端驗收：orchestrator 看得到 `interrupt`（契約 §10 第 283 行）。
+///
+/// ## 為什麼需要這支測試（0a 的 review 指出）
+///
+/// `tests/backend_contract.rs::daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind`
+/// 參數化了三種身分（operator／manager／一般 instance），**唯獨漏了 orchestrator**。
+/// 而參數化本身就有選擇性：選哪幾種身分是一個判斷，而那個判斷漏掉了唯一會壞的
+/// 一種。所以「三種身分都對」完全不證明「orchestrator 也對」。
+///
+/// ## 這支怎麼避免同一個盲點
+///
+/// 不再做身分參數化，而是**先建立一個 team**，讓三種身分的差異成為 fixture 的
+/// 自然結果，而不是逐一列舉：
+/// - `lead` 是 team 的 orchestrator。
+/// - `mate` 是同一個 team 的**非** orchestrator 成員。
+/// - `outsider` 不屬任何 team。
+/// - `helper` 在設定檔的 `managers` 裡。
+///
+/// 然後對每種身分真的啟動一個 `otterhive-mcp-bridge`（`tools/list` 走的是
+/// §10 的 stdio 轉接，而不是 socket 直呼 `tools_list`）。
+mod caller_kind_fixtures {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use otterhive::home::Home;
+    use otterhive::protocol::{Auth, OperationResult, Request};
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    pub const POLL_STEP: Duration = Duration::from_millis(20);
+    pub const LONG_TIMEOUT: Duration = Duration::from_secs(30);
+
+    pub fn daemon_bin() -> &'static str {
+        match option_env!("CARGO_BIN_EXE_otterhive") {
+            Some(path) => path,
+            None => panic!("繁中說明：otterhive binary 尚未建立（本測試為 integration 測試）"),
+        }
+    }
+
+    pub fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backends")
+            .join(name)
+    }
+
+    pub struct TestHome {
+        pub home: Home,
+        _root: TempDir,
+    }
+
+    impl TestHome {
+        pub fn new(label: &str) -> TestHome {
+            let root = TempDir::new().expect("繁中說明：測試需建立隔離暫存目錄");
+            // `label` 只進子目錄名，讓逾時訊息能指出是哪個測試的 home——
+            // `TempDir` 本身已保證每次呼叫是獨立目錄，不會互相看到。
+            let home =
+                Home::initialize(&root.path().join(label)).expect("繁中說明：暫存 home 應可初始化");
+            Self { home, _root: root }
+        }
+
+        pub fn root(&self) -> &Path {
+            self.home.root()
+        }
+
+        pub fn socket_path(&self) -> PathBuf {
+            self.home.run_dir().join("daemon.sock")
+        }
+
+        pub fn operator_token(&self) -> String {
+            fs::read_to_string(self.home.operator_token_path())
+                .expect("繁中說明：應可讀取 operator 憑證")
+                .trim()
+                .to_owned()
+        }
+
+        pub fn operator(&self) -> Auth {
+            Auth::Operator(self.operator_token())
+        }
+
+        /// 該 generation 的 instance token（§5.1 寫在 MCP 設定裡）。
+        pub fn instance_token(&self, name: &str) -> String {
+            let path = self
+                .root()
+                .join("workspace")
+                .join(name)
+                .join(".claude/otterhive-mcp.json");
+            let raw = fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("繁中說明：應可讀取 {} 的 MCP 設定", path.display()));
+            let parsed: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("繁中說明：MCP 設定應是合法 JSON：{e}；實際 {raw}"));
+            parsed["mcpServers"]["otterhive"]["env"]["OTTERHIVE_INSTANCE_TOKEN"]
+                .as_str()
+                .unwrap_or_else(|| panic!("繁中說明：MCP 設定應含 instance token；實際 {raw}"))
+                .to_owned()
+        }
+    }
+
+    pub struct Daemon {
+        child: Option<Child>,
+    }
+
+    impl Daemon {
+        pub fn start(home: &TestHome) -> Daemon {
+            let root = home.root().to_path_buf();
+            let child = Command::new(daemon_bin())
+                .arg("daemon")
+                .env("HOME", &root)
+                .env("OTTERHIVE_HOME", &root)
+                .env("OTTERHIVE_TEST_STARTUP_GRACE_MS", "600")
+                .env("OTTERHIVE_TEST_STOP_TERM_MS", "1000")
+                .env("OTTERHIVE_TEST_STOP_KILL_MS", "500")
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("繁中說明：daemon 應可啟動");
+            let daemon = Self { child: Some(child) };
+            let socket = home.socket_path();
+            let deadline = Instant::now() + LONG_TIMEOUT;
+            loop {
+                if socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "繁中說明：daemon 應在期限內可服務 {}（啟動自檢失敗？）",
+                    socket.display()
+                );
+                std::thread::sleep(POLL_STEP);
+            }
+            daemon
+        }
+
+        pub fn call(&self, home: &TestHome, auth: &Auth, op: &str, args: Value) -> OperationResult {
+            use std::io::{BufRead, BufReader, Write};
+            let request = Request {
+                v: 1,
+                auth: auth.clone(),
+                op: op.to_owned(),
+                args,
+                operation_id: None,
+            };
+            let socket = home.socket_path();
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+                .unwrap_or_else(|e| panic!("繁中說明：應能連到 {}：{e}", socket.display()));
+            let _ = stream.set_read_timeout(Some(LONG_TIMEOUT));
+            let mut line = serde_json::to_string(&request).expect("繁中說明：請求應可序列化");
+            line.push('\n');
+            stream
+                .write_all(line.as_bytes())
+                .expect("繁中說明：應能送出請求");
+            let mut reader = BufReader::new(stream);
+            let mut response = String::new();
+            reader
+                .read_line(&mut response)
+                .unwrap_or_else(|e| panic!("繁中說明：應可讀回一行回應：{e}"));
+            serde_json::from_str(response.trim())
+                .unwrap_or_else(|e| panic!("繁中說明：回應應是合法 JSON：{e}；實際 {response}"))
+        }
+
+        pub fn operator_call(&self, home: &TestHome, op: &str, args: Value) -> OperationResult {
+            let auth = home.operator();
+            self.call(home, &auth, op, args)
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            let pid = child.id() as i32;
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let start = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+                if start.elapsed() >= Duration::from_secs(5) {
+                    break;
+                }
+                std::thread::sleep(POLL_STEP);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// 以 `fake_claude.sh` 建立 instance（backend 一律用絕對路徑）。
+    pub fn create_instance(daemon: &Daemon, home: &TestHome, name: &str) {
+        let created = daemon.operator_call(
+            home,
+            "create_instance",
+            serde_json::json!({"name": name,
+                               "command": fixture("fake_claude.sh").to_string_lossy()}),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：create_instance {name} 應完成（測試前提），實際為 {created:?}"
+        );
+    }
+
+    /// 以 instance token 啟動一個**真 bridge**，走 `initialize` → `tools/list`。
+    ///
+    /// 走 stdio 而不是 socket 直呼 `tools_list`，是因為契約 §10 的規則屬於
+    /// **bridge 的**呈現層：agent 透過 MCP 看到的是這條路徑。
+    pub fn tool_names_over_bridge(home: &TestHome, instance: &str) -> Vec<String> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_otterhive-mcp-bridge"));
+        command.env_clear();
+        command
+            .env("HOME", home.root())
+            .env("OTTERHIVE_HOME", home.root())
+            .env("OTTERHIVE_INSTANCE_TOKEN", home.instance_token(instance))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("繁中說明：bridge 應可啟動");
+        let mut stdin = child.stdin.take().expect("繁中說明：bridge stdin 應可取得");
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("繁中說明：bridge stdout 應可取得");
+
+        use serde_json::json;
+        use std::io::{BufRead, BufReader, Write};
+
+        let call = |stdin: &mut std::process::ChildStdin,
+                    stdout: &mut std::process::ChildStdout,
+                    message: &Value| {
+            let line = format!("{message}\n");
+            stdin
+                .write_all(line.as_bytes())
+                .expect("繁中說明：應可向 bridge 寫入一行");
+            stdin.flush().expect("繁中說明：應可 flush");
+            let mut reader = BufReader::new(stdout);
+            let mut response = String::new();
+            reader
+                .read_line(&mut response)
+                .expect("繁中說明：應可讀回一行");
+            serde_json::from_str::<Value>(response.trim()).unwrap_or_else(|e| {
+                panic!("繁中說明：bridge 回應應是合法 JSON：{e}；實際 {response}")
+            })
+        };
+
+        let handshake = call(
+            &mut stdin,
+            &mut stdout,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {}}
+            }),
+        );
+        assert!(
+            handshake.get("error").is_none(),
+            "繁中說明：initialize 應成功，實際為 {handshake}"
+        );
+        let listed = call(
+            &mut stdin,
+            &mut stdout,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        );
+        // 契約 §10：`tools/list` 轉呼叫 daemon 的 `tools_list`，而那個操作的
+        // 回傳是整個 `OperationResult`——所以 `tool_names` 在
+        // `result.value.tool_names`，不是 `result.tool_names`。
+        let names = listed["result"]["value"]["tool_names"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("繁中說明：tools/list 應回 daemon 的 tools_list 結果，實際為 {listed}")
+            })
+            .iter()
+            .filter_map(|tool| tool.as_str().map(str::to_owned))
+            .collect::<Vec<String>>();
+        let _ = child.kill();
+        let _ = child.wait();
+        names
+    }
+}
+
+use caller_kind_fixtures::*;
+
+/// B1（§10 第 283 行）：orchestrator 看得到 `interrupt`——恰 7 個工具。
+///
+/// 對照組刻意挑了三種「不一樣但都不該是 orchestrator」的身分，讓「同隊成員」這個
+/// 混淆因子被獨立出來：
+/// - `mate` 是**同一個 team** 的非 orchestrator 成員 → 恰 6 個（在 team 裡不
+///   代表有 `interrupt`）。
+/// - `helper` 是設定檔 `managers` 裡的 instance（非 orchestrator）→ 恰 7 個。
+/// - `outsider` 不屬任何 team → 恰 6 個。
+#[test]
+fn an_orchestrator_sees_interrupt_on_tools_list() {
+    use caller_kind_fixtures as fx;
+
+    let home = fx::TestHome::new("orchestrator_tools");
+    // §1：`managers` 的變更要重啟 daemon 才生效，所以先寫設定再啟動。
+    std::fs::write(home.home.config_path(), "managers:\n  - helper\n")
+        .expect("繁中說明：應可寫入測試用設定檔");
+    let daemon = fx::Daemon::start(&home);
+
+    for name in ["lead", "mate", "outsider", "helper"] {
+        fx::create_instance(&daemon, &home, name);
+    }
+    let created = daemon.operator_call(
+        &home,
+        "team",
+        json!({"action": "create", "name": "squad",
+               "members": ["lead", "mate"], "orchestrator": "lead"}),
+    );
+    assert_eq!(
+        created.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：team create 應完成（測試前提），實際為 {created:?}"
+    );
+
+    // 主斷言：orchestrator 恰 7 個。
+    let orchestrator = tool_names_over_bridge(&home, "lead");
+    assert_eq!(
+        orchestrator,
+        P1A_PRIVILEGED.to_vec(),
+        "繁中說明：契約 §10「manager 與 orchestrator 另外看得到 interrupt」——\
+         orchestrator 的工具清單應恰為 7 個，實際為 {orchestrator:?}"
+    );
+    assert!(
+        orchestrator.iter().any(|name| name == "interrupt"),
+        "繁中說明：orchestrator 應看得到 interrupt（§10），實際為 {orchestrator:?}"
+    );
+
+    // 對照組 1：同隊的非 orchestrator 成員恰 6 個——「在 team 裡」不等於
+    // 「是 orchestrator」。
+    let same_team_member = tool_names_over_bridge(&home, "mate");
+    assert_eq!(
+        same_team_member,
+        P1A_INSTANCE.to_vec(),
+        "繁中說明：同隊的非 orchestrator 成員應恰為 6 個（在 team 裡不給它\
+         interrupt），實際為 {same_team_member:?}"
+    );
+    assert!(
+        !same_team_member.iter().any(|name| name == "interrupt"),
+        "繁中說明：非 orchestrator 的同隊成員不應看得到 interrupt，實際為 {same_team_member:?}"
+    );
+
+    // 對照組 2：設定檔 managers 裡的 instance 恰 7 個（非 orchestrator 也對）。
+    let manager = tool_names_over_bridge(&home, "helper");
+    assert_eq!(
+        manager,
+        P1A_PRIVILEGED.to_vec(),
+        "繁中說明：`managers` 裡的 instance 應恰為 7 個，實際為 {manager:?}"
+    );
+
+    // 對照組 3：不屬任何 team 的 instance 恰 6 個。
+    let outsider = tool_names_over_bridge(&home, "outsider");
+    assert_eq!(
+        outsider,
+        P1A_INSTANCE.to_vec(),
+        "繁中說明：不屬任何 team 的 instance 應恰為 6 個，實際為 {outsider:?}"
+    );
+}
+
+/// B1 的授權側對照：**看得到**之外也要**做得到**。
+///
+/// 契約 §2 給 orchestrator 的是「自己 team 的成員」的 `interrupt` 權限，而 §10 給的
+/// 是「看得到 `interrupt`」。§2 的授權早就是對的（0a 實測回 `Completed`／
+///
+/// `effects: ["esc_sent"]`），而 §10 的「看得見」沒跟上——agent 看不到工具就永遠
+/// 不會呼叫它，那個權限等於不存在。
+///
+/// 這條斷言把兩層綁在一起：`tools/list` 看得見（§10）且 `tools/call` 真的做得到
+/// （§2）。只驗其中一層會漏掉另一種缺陷。
+#[test]
+fn an_orchestrator_sees_and_can_call_interrupt_on_its_own_team() {
+    use caller_kind_fixtures as fx;
+
+    let home = fx::TestHome::new("orchestrator_interrupt");
+    let daemon = fx::Daemon::start(&home);
+    for name in ["lead", "mate"] {
+        fx::create_instance(&daemon, &home, name);
+    }
+    let created = daemon.operator_call(
+        &home,
+        "team",
+        json!({"action": "create", "name": "squad",
+               "members": ["lead", "mate"], "orchestrator": "lead"}),
+    );
+    assert_eq!(
+        created.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：team create 應完成（測試前提），實際為 {created:?}"
+    );
+
+    // §10：看得見。
+    assert!(
+        tool_names_over_bridge(&home, "lead")
+            .iter()
+            .any(|name| name == "interrupt"),
+        "繁中說明：orchestrator 的 tools/list 應含 interrupt（§10）"
+    );
+
+    // §2：做得到——對自己 team 的成員呼叫 `interrupt` 回 completed 並帶 `esc_sent`。
+    let auth = otterhive::protocol::Auth::Instance(home.instance_token("lead"));
+    let called = daemon.call(&home, &auth, "interrupt", json!({"instance": "mate"}));
+    assert_eq!(
+        called.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：orchestrator 對自己 team 的成員 interrupt 應完成（§2），實際為 {called:?}"
+    );
+    assert!(
+        called.effects.iter().any(|effect| effect == "esc_sent"),
+        "繁中說明：§4.7 的 interrupt 應帶 effects: [\"esc_sent\"]，實際為 {called:?}"
     );
 }
