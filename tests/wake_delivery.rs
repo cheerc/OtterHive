@@ -451,15 +451,19 @@ fn require_quiet(home: &TestHome, daemon: &Daemon, instance: &str, what: &str) {
 /// `type_and_await_echo` 回傳的就是「回聲已出現」的時刻——那比 Input frame
 /// 抵達**晚**（daemon 先記時間戳、再寫入 PTY、fixture 才印字），所以從回聲
 /// 出現起算滿整個視窗，一定覆蓋了「自輸入起算」的時間。
+///
+/// 「輸入視窗 > 重判節拍」這個約束是**編譯期**成立的（兩個都是 `const`），所以
+/// 用 `const _: () = assert!(…)` 表達而不是 runtime 的 `assert!`——後者不可能
+/// 失敗，卻給人「這裡有東西在防著」的錯覺（otterhive-0a review 指出）。
+const _: () = assert!(
+    WAKE_INPUT_MS > wake::RECHECK_INTERVAL.as_millis() as u64,
+    "輸入視窗必須大於重判節拍，否則「安靜了一個視窗」與「重判了一輪」互相矛盾"
+);
+
 fn require_input_window_elapsed(what: &str) {
     let settle = Duration::from_millis(WAKE_INPUT_MS + POLL_STEP.as_millis() as u64);
     std::thread::sleep(settle);
-    assert!(
-        WAKE_INPUT_MS > wake::RECHECK_INTERVAL.as_millis() as u64,
-        "繁中說明：輸入視窗（{WAKE_INPUT_MS}ms）必須大於重判節拍（{}ms），\
-         否則「安靜了一個視窗」與「重判了一輪」互相矛盾。{what}",
-        wake::RECHECK_INTERVAL.as_millis()
-    );
+    let _ = what;
 }
 
 /// 建立一個跑 `echo_agent.sh` 的 instance，回傳它的 generation。

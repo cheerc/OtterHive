@@ -34,9 +34,31 @@ spawn_wake_recheck
 
 同一份 sample 中，處理該次 `send` 的執行緒也在等同一把鎖。
 
-### 3. 重現門檻
+### 3. 直接證據：daemon 的執行緒堆疊（`otterhive-0a` 以 `sample` 在卡住的當下取得）
+
+```
+spawn_wake_recheck
+  write_hint                            <-- otterhive
+    Session::write_input
+      portable_pty::UnixMasterWriter::write_all
+        write  (libsystem_kernel)        ← 卡在 write(2)
+```
+
+同一份 sample 中，處理該次 `send` 的執行緒也在等同一個呼叫鏈。該執行緒在同一個
+frame 裡停了 1714 ms。
+
+**這是直接觀察 daemon，不是推論**，所以它是本工作包的主要證據。
+
+### 4. 輔助證據：重現門檻（`otterhive-0a` 的量測）
 
 `200` 次 `send` 在本機 12 輪全綠；`2000` 次本機 3 輪全紅。CI 是 3 核 runner。
+
+⚠️ 量測本身有**已知的描述錯誤**，不要引用它當門檻：otterhive-0a 的兩個量測都是
+**寫到時間上限（8 秒）為止**（DRAINING child 寫了 205128 KiB、NON-READING 寫了
+188868 KiB 都還在寫，是被迴圈條件截斷的），**不是**寫到某個位元組數就停住。
+所以「累積到約 200 MiB 就會 STOPPED」這個說法不精確——如果 PTY 寫入其實只是
+很慢而永遠不阻塞，那個結論就是錯的。**會阻塞這件事由上面的執行緒堆疊證明，
+不由這個量測證明。**
 
 ## 已被推翻的兩個錯誤結論
 
@@ -44,7 +66,8 @@ spawn_wake_recheck
 
 - **我（coordinator）**量測「PTY 在讀端不動時接受 64 MiB 無阻塞」，據此判定「不可達」。量測在 Python + `pty.openpty` 的模型裡，**不是 daemon 本身**。
 - **`otterhive-0a`**量測「單次 1 MiB 寫入最慢 42 ms、400 MiB 內無阻塞」，同樣據此判定不可達。
-- 兩人都量到「寫很多都沒阻塞」，但 0a 補的控制組顯示累積到約 200 MiB 就會 STOPPED。**提示行長度雖小（§6.4 的 `count` + 36 字元 UUID），但會隨 `send` 次數無界累積。**
+- 兩人都量到「寫很多都沒阻塞」，但那是**寫到時間上限為止**（見上面輔助證據的警告），不是「永遠不阻塞」。真正的證據是 daemon 的執行緒堆疊。
+- **提示行長度雖小**（§6.4 的 `count` + 36 字元 UUID），**但同一收件人的提示會隨 `send` 次數無界累積**——這才是它可達的原因。
 
 共同的教訓：**在模型裡量到「沒阻塞」不等於在產品裡不會阻塞。** 執行緒堆疊是直接觀察 daemon，可信度不同。
 
@@ -94,3 +117,18 @@ spawn_wake_recheck
 
 - T5 PR #4 的 Lessons 一至三記錄了 D-1 的診斷過程與被推翻的結論。
 - `tests/fixtures/backends/non_reader.sh` 是本缺陷的 fixture（T5 建立）。
+
+## 附帶記錄：另一項 T4 遺留缺陷（W4）
+
+`list_instances` 的 `team` 欄位**恆為 `null`**。實作讀 `row.spec.get("team")`
+（`src/daemon/mod.rs:2546`），而契約 §4.1 明說「team 成員資格只經 §8.1 的 team
+操作設定」，所以 `create_instance` 的欄位清單不含 `team`——`spec.team` 永遠
+不存在。
+
+**正確的讀法應該是 `team_members`**，不是 `instances.spec`。
+
+- 發現者：`otterhive-0a`（T5 非作者 review 的 W4）
+- 性質：§4.7 的契約面缺陷，**T4 遺留、非 T5 引入**
+- T5 的處置：**不在本 PR 修**——`list_instances` 是 T4 交付的，動它要連帶 review
+  T4 的測試，而本 PR 的範圍已經很大
+- 待修：與本工作包一起進 T6 的 dispatch 佇列（它會一直錯到有人修為止）

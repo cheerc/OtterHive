@@ -2115,9 +2115,14 @@ fn write_hint_outside_lock(state: &DaemonState, instance: &str, bytes: &[u8]) ->
     // clippy 抓到（鎖的型別沒變），而那時的 `wake_delivery` 8 支也全綠——
     // 所以「測試綠」不能證明這裡的鎖區間正確。
     //
-    // 值得記錄的是：**當時那個寫法所防的威脅經實測不可達**（macOS PTY 在讀端
-    // 不動時接受 64 MiB 都沒阻塞）。但型別強制仍然值得保留——`Session` 不可
-    // clone 使 `Arc` 成為唯一選項，而它讓「寫入不持鎖」不必靠註解紀律維持。
+    // 值得記錄的是：**當時那個寫法所防的威脅後來被證實可達**（見
+    // `docs/worklog-t6-pty-write-block.md`：PTY 的 `write(2)` 在收件人不讀 stdin
+    // 時會阻塞，而 `interrupt`／attach Input／喚醒三條路徑都走 `write_input`）。
+    // 但型別強制仍然值得保留——`Session` 不可 clone 使 `Arc` 成為唯一選項，而它
+    // 讓「寫入不持 **daemon** 鎖」不必靠註解紀律維持。
+    //
+    // 注意範圍：型別強制解決的是**鎖的粒度**，不是「寫入不會阻塞」。`write_input`
+    // 內部仍要鎖 `core.writer`，那把鎖仍會被阻塞的寫入佔住。
     let session = {
         let inner = state.lock();
         match inner.running.get(instance) {

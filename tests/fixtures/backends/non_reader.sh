@@ -6,10 +6,13 @@
 # 用途：驗證一個**不讀 stdin 的收件人**不會讓 daemon 對其他呼叫端失效
 # （§6.4 的延後沒有上限，所以這樣的收件人會讓重判迴圈持續重判）。
 #
-# **這不是 D-1（阻塞式 PTY 寫入持有全域鎖）的迴歸防護，而且證明不了那件事**：
-# 實測在讀端不動時，macOS PTY 的寫端接受 64 MiB 都沒有阻塞（見 PR 說明的
-# 量測）。`Arc<Session>` 的改動仍值得保留（讓寫入不持鎖成為型別保證），只是
-# 它防的不是一個會發生的問題。
+# **這個阻塞已經證實可達**：daemon 曾兩次因此紅（CI），`sample` 取得的執行緒堆疊
+# 顯示喚醒的重判執行緒卡在 `write(2)`，而處理該次 `send` 的執行緒在等同一把
+# `core.writer` 鎖。證據、累積門檻與已裁決的修法（writer 改 `O_NONBLOCK`）見
+# `docs/worklog-t6-pty-write-block.md`。
+#
+# 這支 fixture 存在的原因就是它：**`Arc<Session>` 只解決了鎖的粒度**（寫入不持
+# daemon 鎖），沒有解決 `write_input` 內部那把 `core.writer` 仍被佔住的問題。
 #
 # 收到 SIGTERM 就結束（daemon 的停止路徑需要它能乾淨退出）。
 trap 'exit 0' TERM INT

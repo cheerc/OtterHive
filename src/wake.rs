@@ -673,7 +673,12 @@ mod tests {
     ///
     /// 這是對「決策與寫入分離」最直接的證據——如果 `check` 的簽章收
     /// `Option<&Session>`，它就**有能力**在呼叫端持有 daemon 鎖時阻塞寫入；
-    /// 現在它連 `Session` 的型別都看不到，所以那個阻塞 I/O 在型別上不可達。
+    /// 現在它連 `Session` 的型別都看不到，所以「阻塞 I/O 發生在 daemon 鎖內」在
+    /// 型別上不可達。
+    ///
+    /// 範圍提醒：`Session::write_input` **內部**仍要鎖 `core.writer`，而 PTY 的
+    /// `write(2)` 在收件人不讀 stdin 時確實會阻塞——那把鎖仍會被佔住。證據與已
+    /// 裁決的修法見 `docs/worklog-t6-pty-write-block.md`。
     ///
     /// 函式指標的型別即證明：簽章要匹配，`check` 只能接受這六個參數。
     #[test]
