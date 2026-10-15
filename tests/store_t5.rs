@@ -379,6 +379,28 @@ fn fresh_restart_requeues_delivering_but_leaves_acked_alone() {
         in_flight_row.delivery_count, 1,
         "繁中說明：退回不重置 delivery_count（至少一次投遞要看得見重送）"
     );
+
+    // 退回期間用**舊 token** ack → `Stale`，不是 `NeverDelivered`。§6.3 的
+    // `never_delivered` 是「從未投遞」，而這則被投遞過一次；回它會讓 agent 誤
+    // 以為這則從沒送到過（§4.4 明說舊 token 失效）。
+    let stale = store
+        .transaction(|tx| tx.ack_message(&alpha, &in_flight, "過期的 token", 2_500))
+        .expect("繁中說明：ack 應執行");
+    assert_eq!(
+        stale,
+        AckOutcome::Stale,
+        "繁中說明：退回期間的舊 token 是 stale，不是 never_delivered"
+    );
+
+    // 對照組：真的**從未**投遞的訊息仍是 `NeverDelivered`（`delivery_count == 0`）。
+    let never = store
+        .transaction(|tx| tx.ack_message(&alpha, &untouched, "任何 token", 2_500))
+        .expect("繁中說明：ack 應執行");
+    assert_eq!(
+        never,
+        AckOutcome::NeverDelivered,
+        "繁中說明：delivery_count 為 0 的訊息從未投遞，應是 never_delivered"
+    );
     assert_eq!(acked_row.state, "acked", "已確認的不應被退回");
     assert_eq!(untouched_row.state, "unread", "未投遞的應仍是 unread");
 

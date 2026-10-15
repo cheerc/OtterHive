@@ -951,6 +951,15 @@ impl Tx<'_> {
             }
             "archived" => return Ok(AckOutcome::Archived),
             "delivering" => {}
+            // 曾被投遞過、又被 `fresh` restart 退回 `unread`（§4.4）→ 舊 token
+            // 失效，所以回 `Stale`。不能回 `NeverDelivered`：§6.3 的
+            // `never_delivered` 是「**從未**投遞」，而這則的接收端可能已經讀到
+            // 過、只是還沒 ack。回 `never_delivered` 會讓 agent 誤以為「這則從沒
+            // 送到過，可以忽略」，而它其實還在 inbox 裡等重送。
+            //
+            // 兩者的差別就是 `delivery_count`：它是為了記錄投遞次數而存在，這裡
+            // 順帶擔任「是否曾被投遞」的判準（`0` = 真的從未投遞）。
+            "unread" if row.delivery_count > 0 => return Ok(AckOutcome::Stale),
             _ => return Ok(AckOutcome::NeverDelivered),
         }
         let lease_valid = row.lease_expires_ms.is_some_and(|expires| expires > now_ms);
