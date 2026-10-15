@@ -704,10 +704,16 @@ fn claude_resume_without_evidence_is_unavailable() {
     let home = TestHome::new();
     let daemon = Daemon::start(&home);
 
+    // 顯式指定 fake 可執行檔。契約 §5.1 說省略 `command` 時執行 `claude`，
+    // 那條預設是正確的產品行為，但測試**不能**真的去跑 PATH 上的 `claude`：
+    // 有沒有裝了那支 CLI 會決定測試通過與否（本機有、runner 沒有，於是
+    // create 變成 `spawn_failed`）。backend 行為一律用
+    // `tests/fixtures/backends/` 的 fake 測（CLAUDE.md 的邊界）。
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "no-evidence"}),
+        serde_json::json!({"name": "no-evidence",
+                           "command": fixture("fake_claude.sh").to_string_lossy()}),
     );
     assert_eq!(
         created.outcome,
