@@ -416,6 +416,71 @@ fn fresh_restart_requeues_delivering_but_leaves_acked_alone() {
     assert_eq!(redelivered.delivery_count, 2);
 }
 
+/// §4.5：刪除 instance 要**移出所屬 team**，且不留孤兒列。
+///
+/// 這條斷言**必須直接查底層表**。`team_members`、`team_name_of_instance`、
+/// `team_of_instance_name` 三個讀取端都 join `instances.deleted_ms IS NULL`，
+/// 所以孤兒列在所有對外查詢裡都是隱形的——任何 `team list`／`team_members()`
+/// 層的斷言在 buggy 版本上**都會綠**，那等於沒測。
+///
+/// 孤兒列的實際危害：§8.1 的「一個 instance 最多屬於一個 team」靠
+/// `team_members.instance_id` 的 UNIQUE 實作，而 `set_team_members` 的 OR IGNORE
+/// 逐行檢查查的是「**本 team 裡**有沒有」——孤兒列會讓它回 `already_here == 1`
+/// 而靜默接受，該 ID 的單一歸屬約束就 **fail-open**。
+#[test]
+fn deleting_an_instance_removes_it_from_its_team() {
+    let (_directory, path) = temporary_database();
+    let mut store = open_store(&path);
+    let alpha = instance_id(&mut store, "alpha");
+    let beta = instance_id(&mut store, "beta");
+
+    store
+        .transaction(|tx| {
+            tx.insert_team("squad", &alpha, None, &[], None)?;
+            tx.set_team_members("squad", &[alpha.clone(), beta.clone()])
+        })
+        .expect("繁中說明：建立 team 應成功");
+    assert_eq!(
+        store
+            .transaction(|tx| tx.team_members("squad"))
+            .expect("繁中說明：讀取成員應成功"),
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        "繁中說明：刪除前兩人都應是 squad 的成員（測試前提）"
+    );
+
+    store
+        .transaction(|tx| {
+            tx.archive_messages(&beta)?;
+            tx.remove_from_team(&beta)?;
+            tx.mark_instance_deleted(&beta)
+        })
+        .expect("繁中說明：刪除 beta 應成功");
+
+    // 關鍵斷言：底層列必須不存在。孤兒列在對外查詢裡隱形，所以只能這樣查。
+    let connection = rusqlite::Connection::open(&path).expect("繁中說明：應能開啟資料庫");
+    let orphans: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM team_members WHERE instance_id = ?1",
+            params![beta],
+            |row| row.get(0),
+        )
+        .expect("繁中說明：應能直接查 team_members");
+    assert_eq!(
+        orphans, 0,
+        "繁中說明：刪除的 instance 不得留下孤兒的 team_members 列——\
+         孤兒列會讓 §8.1 的單一歸屬約束對該 ID fail-open"
+    );
+
+    // 對照組：未刪除的 alpha 仍在 team 裡（不該被連帶移除）。
+    assert_eq!(
+        store
+            .transaction(|tx| tx.team_members("squad"))
+            .expect("繁中說明：讀取成員應成功"),
+        vec!["alpha".to_owned()],
+        "繁中說明：刪除一個成員不該影響其他成員"
+    );
+}
+
 /// §8.1：一個 instance 最多屬於一個 team；被拒的加入整批回滾。
 #[test]
 fn an_instance_belongs_to_at_most_one_team() {

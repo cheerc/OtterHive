@@ -555,7 +555,36 @@ impl Tx<'_> {
         self.append_journal(Some(instance_id), Some(generation), kind, Some(detail))
     }
 
+    /// 把 instance 移出所屬 team（契約 §4.5 的「移出所屬 team」）。
+    ///
+    /// §4.5 的三件事（標記刪除／移出 team／封存 inbox）刻意是三個獨立的
+    /// 操作，讓 `delete_instance` 的交易裡三行可數——那個可讀性就是 §8.1
+    /// 「所有檢查在同一交易內」靠什麼維護的。
+    ///
+    /// **不留孤兒列。** §8.1 的「一個 instance 最多屬於一個 team」靠
+    /// `team_members.instance_id` 的 UNIQUE 實作，而孤兒列會讓那條約束對該
+    /// ID **fail-open**：`set_team_members` 的 OR IGNORE 逐行檢查查的是「本
+    /// team 裡有沒有」，孤兒列會讓它回 `already_here == 1` 而靜默接受。
+    ///
+    /// 而且孤兒列在**所有對外查詢裡都是隱形的**——`team_members`、
+    /// `team_name_of_instance`、`team_of_instance_name` 都 join
+    /// `instances.deleted_ms IS NULL`，所以沒有任何 `team list` 層的斷言能
+    /// 抓到它。測試必須直接斷言底層列不存在。
+    pub fn remove_from_team(&self, id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM team_members WHERE instance_id = ?1",
+            params![id],
+        )?;
+        if changed > 0 {
+            self.append_journal(Some(id), None, "team_member_removed", Some(id))?;
+        }
+        Ok(())
+    }
+
     /// 標記 instance 已刪除（契約 §4.5）；列本身保留以維持歷史與名稱重用規則。
+    ///
+    /// §4.5 的另外兩件事由 [`Tx::remove_from_team`] 與
+    /// [`Tx::archive_messages`] 各自負責。
     pub fn mark_instance_deleted(&self, id: &str) -> Result<(), StoreError> {
         let now = now_ms();
         let changed = self.connection.execute(
@@ -808,6 +837,11 @@ impl Tx<'_> {
         // 別的 team，該回 `name_conflict`（§8.1），讓交易回滾。
         let encoded = serde_json::to_string(instance_ids)
             .map_err(|error| StoreError::Invalid(format!("序列化成員清單失敗: {error}")))?;
+        // 隱性依賴：`?2` 必須是 **JSON 陣列**的序列化結果，而 `json_each.value` 的
+        // 比較是 SQLite 的型別敏感比較——`text` 欄位比 `integer` 值不會相等。
+        // 這裡傳進去的 `encoded` 由 `serde_json::to_string(&[String])` 產生，所以
+        // 元素一定是字串。**若改成傳別的型別，刪除條件會靜默失配**（沒有列被
+        // 刪除，`set_team_members` 看起來仍然正確）。
         let mut statement = self.connection.prepare(
             "DELETE FROM team_members WHERE team = ?1 AND NOT EXISTS ( \
                SELECT 1 FROM json_each(?2) WHERE json_each.value = team_members.instance_id \

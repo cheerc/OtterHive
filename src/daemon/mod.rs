@@ -37,7 +37,6 @@ use serde_json::{json, Value};
 
 use crate::admission::admit;
 use crate::backend::claude;
-use crate::config::Config;
 use crate::daemon::auth::{Action, Caller, Subject};
 use crate::daemon::lifecycle::{InstanceState, SpecError, ValidatedSpec};
 use crate::daemon::recovery::RESTART_REASON;
@@ -234,17 +233,20 @@ fn millis(key: &str, default: u64) -> Duration {
 
 /// 一個正在執行的 instance 的記憶體狀態。
 struct Running {
-    /// `Arc<Session>` 而不是 owned `Session`（D-1 的結構性修法）。
+    /// `Arc<Session>` 而不是 owned `Session`（防禦性設計）。
     ///
-    /// 喚醒排程器必須能在**不持有 daemon 全域鎖**的情況下寫入 PTY。若
-    /// `Inner::running` 存的是 owned `Session`，要拿到它就只能持有鎖遍歷
-    /// `running`，而 `Session` 不可 `Clone`（它的 `_child` 欄位持有 child
-    /// handle、`threads` 欄位在 `Drop` 時做有界 join——複製會讓同一個 child 被
-    /// drop 兩次）。
+    /// 喚醒排程器在**不持有 daemon 全域鎖**的情況下寫入 PTY。若 `Inner::running`
+    /// 存的是 owned `Session`，要拿到它就只能持有鎖遍歷 `running`，而 `Session`
+    /// 不可 `Clone`（它的 `_child` 欄位持有 child handle、`threads` 欄位在 `Drop`
+    /// 時做有界 join——複製會讓同一個 child 被 drop 兩次）。所以存 `Arc`：鎖內
+    /// `Arc::clone` 取得一個不借用 `inner` 的擁有者，放掉鎖之後才寫入。鎖的生命
+    /// 週期與寫入完全分離，這是型別強制的，不是靠註解提醒。
     ///
-    /// 所以存 `Arc`：鎖內 `Arc::clone` 取得一個不借用 `inner` 的擁有者，放掉鎖
-    /// 之後才寫入。鎖的生命週期與寫入完全分離，這是型別強制的，不是靠註解
-    /// 提醒。
+    /// **這個型別強制本身防的威脅經實測不可達**：量測顯示 macOS PTY 在讀端不動
+    /// 時接受 64 MiB 都沒有阻塞，而提示行的長度由 §6.4 的機制決定（`count` 加
+    /// 36 字元 UUID），永遠遠低於那個容量。所以「寫入阻塞 → 鎖死 daemon」沒有
+    /// 可達路徑。保留 `Arc` 是因為它讓正確的性質由型別保證、且 `Session` 不可
+    /// clone 使它成為唯一選項——**不是**因為已證實有那個缺陷。
     session: Arc<Session>,
     /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
     ///
@@ -1865,21 +1867,18 @@ fn send_operation(
     caller: &Caller,
     args: &Value,
 ) -> OperationResult {
-    // 設定檔在 daemon 啟動時讀入（§1：只有 `templates` 與 `managers`，daemon
-    // 只讀不寫）。`send` 需要它判斷 `managers`（§6.2 的收件權限）。
-    let config = match Config::load(&state.home.join("otterhive.yaml")) {
-        Ok(config) => config,
-        Err(config_error) => {
-            return OperationResult::refused(
-                operation_id,
-                ErrorCode::Internal,
-                &format!("讀取設定檔失敗：{config_error}"),
-            );
-        }
-    };
+    // `managers` 用 daemon 啟動時讀入的那份（§1：「`managers` 的變更要重啟
+    // daemon 才生效」），**不是**每次 `send` 重讀設定檔——那會讓一個正在執行的
+    // daemon 因為設定檔被改而接受不同的 manager，違反 §1。`subject_for` 與
+    // `tools_list` 已經用同一份。
+    // 先取出 `managers` 的擁有者再傳引用：`messaging::send` 需要
+    // `&mut inner.store` 與 `&inner.managers` 同時存在，而兩者都在同一個 guard
+    // 後面，所以直接寫 `&inner.managers` 會同時可變借用與不可變借用同一個
+    // struct。先 clone 出一份擁有者就沒有這個衝突。
+    let managers = state.lock().managers.clone();
     let mut recipients = {
         let mut inner = state.lock();
-        match messaging::send(&mut inner.store, caller, args, &config) {
+        match messaging::send(&mut inner.store, caller, args, &managers) {
             Ok(outcome) => outcome,
             Err(op_error) => return result_from_error(operation_id, op_error),
         }
@@ -2065,7 +2064,7 @@ fn schedule_hint(
     // 寫入失敗要如實回報 `failed`（§6.4 的四個值），不能因為「排程器已經清空」
     // 就假裝送達。
     if let Some(bytes) = to_write {
-        return match write_hint(state, instance, &bytes) {
+        return match write_hint_outside_lock(state, instance, &bytes) {
             Ok(()) => wake::WakeOutcome::Hinted.as_wire().to_owned(),
             Err(()) => wake::WakeOutcome::Failed.as_wire().to_owned(),
         };
@@ -2081,22 +2080,33 @@ fn schedule_hint(
     }
 }
 
-/// 把提示行寫入收件人的 PTY（**只在 daemon 鎖之外呼叫**）。
+/// 把提示行寫入收件人的 PTY。**函式名帶這個副詞是刻意的**：它必須只在
+/// daemon 鎖之外呼叫，���且型別讓這點無法忘記——`Inner::running` 存的是
+/// `Arc<Session>`，所以鎖內能取得的只是一個不借用鎖的擁有者。
 ///
 /// 失敗回 [`Result`]：§6.4 的 `failed` 與 `not_running` 是兩個不同的事實，
 /// 必須分別回報。失敗時排程器已被 `commit_delivery` 清空，所以這則提示不會
-/// 重試——延續「PTY master 已關時重試沒意義」的裁決（實作判斷，非契約推導）。
-fn write_hint(state: &DaemonState, instance: &str, bytes: &[u8]) -> Result<(), ()> {
+/// 重試（實作判斷，非契約推導）。兩種失敗要分開講：
+///
+/// - **master 已關**：PTY master fd 不存在了，重試只是重複同一個錯誤。
+/// - **程序已退出但 master 未關**：此時寫入通常仍成功（PTY 對端已 EOF 前的
+///   寫入多半不報錯），所以這種情形多半不會走到 `Err`。
+///
+/// 兩者合併成一句「寫入失敗不重試」是精確度不足，但方向正確。
+fn write_hint_outside_lock(state: &DaemonState, instance: &str, bytes: &[u8]) -> Result<(), ()> {
     // **鎖內只做 clone，寫入在鎖外。**
     //
     // `Inner::running` 存的是 `Arc<Session>`，所以能在鎖內取得一個不借用 `inner`
     // 的擁有者；`session` 這個綁定離開區塊時鎖已釋放，之後的 `write_input`
     // （可能因 PTY 緩衝區滿而阻塞）不再持有 daemon 的全域鎖。
     //
-    // 這個函式第一次寫成「取得鎖 → 在 match 內寫入」，那與原本
-    // `schedule_hint` 裡的行為一模一樣，只是把缺陷搬到輔助函式。`cargo clippy`
-    // 抓不到（鎖的型別沒變），`wake_delivery` 的 8 支也綠（提示只有約 70 bytes，
-    // 從來沒填滿過緩衝區）。**註解與函式名不能保證不變量，型別可以。**
+    // 這個函式**曾經**寫成「取得鎖 → 在 match 內寫入」。那不會編譯錯誤也不會被
+    // clippy 抓到（鎖的型別沒變），而那時的 `wake_delivery` 8 支也全綠——
+    // 所以「測試綠」不能證明這裡的鎖區間正確。
+    //
+    // 值得記錄的是：**當時那個寫法所防的威脅經實測不可達**（macOS PTY 在讀端
+    // 不動時接受 64 MiB 都沒阻塞）。但型別強制仍然值得保留——`Session` 不可
+    // clone 使 `Arc` 成為唯一選項，而它讓「寫入不持鎖」不必靠註解紀律維持。
     let session = {
         let inner = state.lock();
         match inner.running.get(instance) {
@@ -2207,7 +2217,7 @@ fn spawn_wake_recheck(state: &DaemonState, instance: &str) {
                 };
                 // 鎖已釋放：寫入與「是否重試」都在鎖外決定（D-1）。
                 if let Some(bytes) = to_write {
-                    let _ = write_hint(&state, &instance, &bytes);
+                    let _ = write_hint_outside_lock(&state, &instance, &bytes);
                     return;
                 }
                 match outcome {
@@ -2321,9 +2331,13 @@ fn delete_instance(
             inner
                 .store
                 .transaction(|tx| {
-                    tx.clear_process(&row.id)?;
+                    // 契約 §4.5 的三件事，各自一行：停止後封存 inbox、移出所屬
+                    // team、標記為已刪除。三行可數是刻意的——§8.1 的交易邊界靠
+                    // 這個可讀性維護。
                     tx.archive_messages(&row.id)?;
-                    tx.mark_instance_deleted(&row.id)
+                    tx.remove_from_team(&row.id)?;
+                    tx.mark_instance_deleted(&row.id)?;
+                    tx.clear_process(&row.id)
                 })
                 .is_ok()
         };
