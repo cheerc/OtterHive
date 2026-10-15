@@ -348,6 +348,13 @@ pub fn run(home_root: &Path, tuning: Tuning) -> Result<(), DaemonError> {
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                // accepted stream 會**繼承 listener 的 O_NONBLOCK**（macOS／Linux
+                // 皆然）。non-blocking 只為讓 accept 迴圈能被訊號旗標中斷（否則
+                // accept 會一直睡住）；它不該洩漏到每個連線的讀取語意。若不解除，
+                // `handle_connection` 的第一個 `read_line` 會在客戶端資料到達前
+                // 就回 `WouldBlock`，然後把連線當成空請求關掉——客戶端看到的是
+                // `Broken pipe`，而且只在排程延遲足夠大時出現。
+                let _ = stream.set_nonblocking(false);
                 let state = state.clone();
                 // 每個連線一個執行緒；attach 的長連線在自己的執行緒裡跑到結束。
                 std::thread::spawn(move || {
