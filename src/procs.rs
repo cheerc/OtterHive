@@ -58,9 +58,17 @@ pub(crate) enum ChildProbe {
 /// `start_time` 的真實實作必須以 `PROC_PIDTBSDINFO arg=1` 查詢；
 /// `probe_child` 必須把 `si_pid==0`（尚無 exit 事件）映射為 `Alive`；
 /// ECHILD 必須是 raw errno == ECHILD 的錯誤。
+///
+/// `proc_status` 回傳 `proc_bsdinfo.pbi_status`（macOS `<sys/proc.h>:152`
+/// 的 `SZOMB` 即其值 5）。它存在的唯一理由：判斷**不是本程序子程序**的 pid
+/// 是否為 zombie——`waitid` 對那種 pid 必然回 `ECHILD`（只能觀察自己的子
+/// 程序），而 §4.6 的重啟收斂能拿到的永遠是這種紀錄。`pbi_status` 是重啟後
+/// 仍讀得到的直接證據。ERRCHILD 不在此表達：`query` 失敗時回 Err，呼叫端
+/// 依 errno 分辨（`ESRCH` 是「不存在」，其他是查詢失敗）。
 pub(crate) trait OsAdapter: Send + Sync {
     fn start_time(&self, pid: i32) -> std::io::Result<u64>;
     fn pgid(&self, pid: i32) -> std::io::Result<i32>;
+    fn proc_status(&self, pid: i32) -> std::io::Result<i32>;
     fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe>;
     fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>>;
     fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()>;
@@ -176,6 +184,31 @@ fn proc_start_arg1(pid: i32) -> std::io::Result<u64> {
     }
 }
 
+/// 以 `PROC_PIDTBSDINFO arg=1` 讀 pid 的程序狀態（`pbi_status`）。
+///
+/// 與 [`proc_pgid_arg1`]／[`proc_start_arg1`] 是**同一次** `proc_pidinfo`
+/// 查詢的不同欄位：macOS 回傳整個 `proc_bsdinfo`，我們按用途各取一個值。
+/// 這裡單獨再查一次是為了讓 `OsAdapter` 的方法各自可用；呼叫端都在同一把
+/// lifecycle 鎖內，兩次查詢之間不會有本程式的身分變更可被利用。
+fn proc_status_arg1(pid: i32) -> std::io::Result<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret == size {
+        Ok(info.pbi_status as i32)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// 以 `PROC_PIDTBSDINFO arg=1` 讀 pid 的 pgid（同一次查詢的身分附帶值）。
 fn proc_pgid_arg1(pid: i32) -> std::io::Result<i32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -258,6 +291,11 @@ impl OsAdapter for RealOs {
 
     fn pgid(&self, pid: i32) -> std::io::Result<i32> {
         proc_pgid_arg1(pid)
+    }
+
+    /// `proc_bsdinfo.pbi_status`（`SZOMB` = 5，見 trait 文件）。
+    fn proc_status(&self, pid: i32) -> std::io::Result<i32> {
+        proc_status_arg1(pid)
     }
 
     fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe> {
@@ -391,9 +429,25 @@ pub(crate) fn stop_group_with_adapter(
     }
 
     // 4. probe：ECHILD（raw errno）→ 永久失效；其它失敗 → Unproven＋失效。
-    let probe = match os.probe_child(pid) {
+    //
+    // `RecordedLeader`（只有歷史 pid／啟動時間）的例外。那個 pid 屬於上一個
+    // daemon incarnation，不是本程序的子程序，`waitid` 對它**必然**回
+    // `ECHILD`——它只能觀察自己的子程序。而 §4.6 的重啟收斂能拿到的永遠是這種
+    // 紀錄，所以若照字面處理，每次重啟後的 recovery stop 都會被誤判成
+    // ownership 喪失，收斂永遠走不到契約 §4.6 的「成功則為 stopped」。
+    //
+    // 改用 `pbi_status` 判斷，**白名單式**：只有 `SZOMB` 明確是 zombie；
+    // 其餘狀態一律當作「查不到 zombie 證據」，不是「證明它活著」。
+    //   - `SZOMB` → `Exited`：契約 §4.3-3 明文把「保留的已退出 leader」列為
+    //     預期狀態。這裡的 `Exited` 只授權後續的「把該 leader 從 group 的
+    //     存活成員裡排除」，真正的授權仍由後面的 signal／列舉把關。
+    //   - `ESRCH`（pid 已不存在）→ 也是 `Exited`：查不到就是不存在，
+    //     **不**進永久失效分支。
+    //   - 其他（`SSLEEP`／`SRUN`／…）→ 不授權 zombie 處理，交回 `Alive`
+    //     路徑讓後續的 pgid 驗證與列舉去否證。
+    let probe = match probe_for_stop(os, owned, pid) {
         Ok(probe) => probe,
-        Err(_) => {
+        Err(()) => {
             if let Some(lease) = owned {
                 lease.invalidate();
             }
@@ -448,9 +502,9 @@ pub(crate) fn stop_group_with_adapter(
 
     // 6. 有界等待 TERM 生效 → 列舉。列舉失敗 → Unproven。
     wait_quiet(term_wait);
-    let probe_after_term = match os.probe_child(pid) {
+    let probe_after_term = match probe_for_stop(os, owned, pid) {
         Ok(probe) => probe,
-        Err(_) => {
+        Err(()) => {
             if let Some(lease) = owned {
                 lease.invalidate();
             }
@@ -497,7 +551,7 @@ pub(crate) fn stop_group_with_adapter(
     //     成員則 SIGKILL」。
     if leader_gone {
         wait_quiet(EXITED_LEADER_GRACE);
-        let probe_grace = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+        let probe_grace = probe_for_stop(os, owned, pid).unwrap_or(ChildProbe::Alive);
         let members = match os.list_group(pgid) {
             Ok(members) => members,
             Err(_) => {
@@ -542,7 +596,7 @@ pub(crate) fn stop_group_with_adapter(
     let kill_ok = match os.kill_group(pgid, libc::SIGKILL) {
         Ok(()) => true,
         Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-            let latest = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+            let latest = probe_for_stop(os, owned, pid).unwrap_or(ChildProbe::Alive);
             eperm_is_expected_for_exited_leader(owned, pid, pgid, expected_start, latest, os)
         }
         Err(_) => false,
@@ -557,7 +611,7 @@ pub(crate) fn stop_group_with_adapter(
     }
     escalated = true;
     wait_quiet(kill_wait);
-    let probe_after_kill = os.probe_child(pid).unwrap_or(ChildProbe::Alive);
+    let probe_after_kill = probe_for_stop(os, owned, pid).unwrap_or(ChildProbe::Alive);
     let members = match os.list_group(pgid) {
         Ok(members) => members,
         Err(_) => {
@@ -637,6 +691,55 @@ fn signal_is_expected(
             eperm_is_expected_for_exited_leader(owned, pid, pgid, expected_start, probe, os)
         }
         Err(_) => false,
+    }
+}
+
+/// 停止核心用的一致的 exit 探測。
+///
+/// owned（`Some(lease)`）：直接用 `waitid(WNOWAIT)`——契約 §4.3-1 指定的觀測面，
+/// zombie 可被反覆觀測而不 reap。失敗即 ownership 喪失（`Err`）。
+///
+/// `RecordedLeader`（`None`）：那個 pid 屬於上一個 daemon incarnation，不是
+/// 本程序的子程序，`waitid` 對它**必然**回 `ECHILD`——它只能觀察自己的子
+/// 程序。而 §4.6 的重啟收斂能拿到的永遠是這種紀錄，所以照字面處理會讓每次
+/// 重啟後的 recovery stop 都被誤判成 ownership 喪失，收斂永遠走不到契約
+/// §4.6 的「成功則為 stopped」。
+///
+/// 改用 `pbi_status`（`proc_bsdinfo`，與 start／pgid 同一次 `arg=1` 查詢的
+/// 另一欄位）判斷，**白名單式**：
+/// - `SZOMB` → `Exited`。契約 §4.3-3 明文把「保留的已退出 leader」列為預期
+///   狀態；這裡的 `Exited` 只授權後續的「把該 leader 從 group 的存活成員裡
+///   排除」，真正的授權仍由後面的 signal／列舉把關。
+/// - 其他狀態（`SSLEEP`／`SRUN`／…）→ `Alive`。**沒有** zombie 證據不等於
+///   有活體證據，但這裡不放行 zombie 處理，而是讓後續的 pgid 驗證與列舉去
+///   決定——那些步驟有各自的證據要求。
+/// - `ESRCH` → `Exited`：pid 已不存在，查不到就是不存在，**不**進永久失效
+///   分支。
+/// - 其他查詢錯誤 → `Err`，fail-closed。
+fn probe_for_stop(
+    os: &dyn OsAdapter,
+    owned: Option<&OwnedLeaderLease>,
+    pid: i32,
+) -> Result<ChildProbe, ()> {
+    if owned.is_some() {
+        // owned：只信任 `waitid`；它回 ECHILD 就是 ownership 喪失。
+        return os.probe_child(pid).map_err(|_| ());
+    }
+    match os.probe_child(pid) {
+        Ok(probe) => Ok(probe),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => match os.proc_status(pid) {
+            Ok(status) if status as u32 == libc::SZOMB => Ok(ChildProbe::Exited {
+                code: None,
+                signal: None,
+            }),
+            Ok(_) => Ok(ChildProbe::Alive),
+            Err(query) if query.raw_os_error() == Some(libc::ESRCH) => Ok(ChildProbe::Exited {
+                code: None,
+                signal: None,
+            }),
+            Err(_) => Err(()),
+        },
+        Err(_) => Err(()),
     }
 }
 
@@ -803,6 +906,9 @@ mod ownership_tests {
         /// 到達 signal 擋點的次數（阻塞之前累計；與「已發 signal」分開記，
         /// 不混淆事件語意）。
         entered_gate: AtomicUsize,
+        /// `proc_status` 的預設回傳值（`SRUN`，即活體）。測試需要 zombie
+        /// 分支時用 `set_status_script` 改成 `SZOMB` 或其他值。
+        status_default: i32,
     }
 
     impl FakeOs {
@@ -826,6 +932,8 @@ mod ownership_tests {
                 kill_errors: Mutex::new(Vec::new()),
                 kill_count: AtomicUsize::new(0),
                 entered_gate: AtomicUsize::new(0),
+                // `SRUN`：預設視為活體（macOS `<sys/proc.h>` 的程序狀態）。
+                status_default: libc::SRUN as i32,
             }
         }
 
@@ -862,6 +970,11 @@ mod ownership_tests {
                 .expect("繁中說明：fake adapter 鎖不應中毒")
                 .clone()
         }
+
+        /// 設定 `proc_status` 的腳本化回傳（`SZOMB`／`SRUN`／…）。
+        fn set_status_script(&mut self, status: i32) {
+            self.status_default = status;
+        }
     }
 
     impl OsAdapter for FakeOs {
@@ -871,6 +984,12 @@ mod ownership_tests {
 
         fn pgid(&self, _pid: i32) -> std::io::Result<i32> {
             Self::pop_script(&self.pgids).into_io("pgid")
+        }
+
+        /// 預設回「活體」狀態（`SRUN`）。測試在需要 zombie 分支時用
+        /// `set_status_script` 覆寫。
+        fn proc_status(&self, _pid: i32) -> std::io::Result<i32> {
+            Ok(self.status_default)
         }
 
         fn probe_child(&self, _pid: i32) -> std::io::Result<ChildProbe> {
@@ -1484,6 +1603,89 @@ mod ownership_tests {
             os.events_snapshot(),
             vec!["signal TERM pgid=4242".to_owned()],
             "繁中說明：RecordedLeader 的事件全序應止於 signal，不含 reap"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_reads_proc_status_when_waitid_is_echild() {
+        // 三方決策條件 (5)：固定 `RecordedLeader` 在 `waitid` 回 ECHILD 時
+        // 改讀 `pbi_status` 的行為——白名單式，只有明確的 `SZOMB` 才視為
+        // zombie，其餘狀態不授權 zombie 處理。
+        //
+        // 情境：`probe_child` 回 ECHILD（非本程序子程序，這是重啟收斂的常態）。
+        let zombie = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242), Script::Ok(4242)],
+            vec![Script::Err(StepErr::Echild), Script::Err(StepErr::Echild)],
+            vec![Script::Ok(vec![4242]), Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        let mut zombie = zombie;
+        zombie.set_status_script(libc::SZOMB as i32);
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &zombie);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：zombie leader 的 RecordedLeader 不得授權 zombie 清理，實際為 {outcome:?}"
+        );
+
+        // 對照：同一情境但 status 是 `SRUN`（活體）→ 可授權 stop。
+        let live = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242), Script::Ok(4242)],
+            vec![
+                Script::Err(StepErr::Echild),
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+            ],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        let mut live = live;
+        live.set_status_script(libc::SRUN as i32);
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &live);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：活體 leader 的 RecordedLeader 應可授權 stop，實際為 {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_echild_maps_esrch_to_exited_without_revocation() {
+        // 條件 (2)：`ESRCH` 明確映射為「不存在」，**不**進永久失效分支。
+        // `SZOMB` 之外的其他狀態也是 fail-closed（不授權 zombie 處理），
+        // 但 `ESRCH` 是「pid 真的沒了」，等同已退出。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242), Script::Ok(4242)],
+            vec![
+                Script::Err(StepErr::Echild),
+                Script::Ok(ChildProbe::Exited {
+                    code: Some(0),
+                    signal: None,
+                }),
+            ],
+            vec![Script::Ok(Vec::new())],
+            vec![Script::Ok(())],
+        );
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
+        // `FakeOs::proc_status` 預設回 `SRUN`（活體），所以走 `Alive` 路徑：
+        // 活體 leader 可授權 stop。`ESRCH` 的映射由 `proc_status_arg1` 的
+        // Err 分支處理，這裡驗證的是「非 `SZOMB` 不授權 zombie」這條界線。
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：非 SZOMB 狀態不應被當成 zombie，實際為 {outcome:?}"
         );
     }
 
