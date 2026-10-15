@@ -1417,10 +1417,13 @@ fn second_lifecycle_operation_on_the_same_instance_is_refused() {
 
     let socket = home.socket_path();
     let token = home.operator_token();
+    // 這個執行緒必須**贏得**鎖：它送出 delete 後會持有 lifecycle 鎖約
+    // 1500ms（TERM 1000ms ＋ KILL 500ms），主執行緒才有「另一個操作撞上進行中
+    // 的操作」的視窗可觀察。若它自己先被 `operation_in_progress` 拒絕，就根本
+    // 沒有程序持有鎖，主執行緒每次都會拿到 `Completed` 而永遠觀察不到拒絕——
+    // 測試會以「時序不巧」的名義失敗。所以兩邊都必須重試。
     let busy = std::thread::spawn(move || {
-        let stream =
-            std::os::unix::net::UnixStream::connect(&socket).expect("繁中說明：並行 stop 應可連線");
-        let _ = stream.set_read_timeout(Some(RECV_TIMEOUT));
+        use std::io::Write;
         let request = otterhive::protocol::Request {
             v: 1,
             auth: otterhive::protocol::Auth::Operator(token),
@@ -1430,17 +1433,29 @@ fn second_lifecycle_operation_on_the_same_instance_is_refused() {
         };
         let mut line = serde_json::to_string(&request).expect("繁中說明：請求應可序列化");
         line.push('\n');
-        use std::io::Write;
-        let mut stream = stream;
-        stream
-            .write_all(line.as_bytes())
-            .expect("繁中說明：應可送出 delete");
-        let mut reader = std::io::BufReader::new(stream);
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .expect("繁中說明：應可讀回 delete 回應");
-        response
+        let deadline = std::time::Instant::now() + LONG_TIMEOUT;
+        loop {
+            let stream = std::os::unix::net::UnixStream::connect(&socket)
+                .expect("繁中說明：並行 delete 應可連線");
+            let _ = stream.set_read_timeout(Some(RECV_TIMEOUT));
+            let mut stream = stream;
+            stream
+                .write_all(line.as_bytes())
+                .expect("繁中說明：應可送出 delete");
+            let mut reader = std::io::BufReader::new(stream);
+            let mut response = String::new();
+            reader
+                .read_line(&mut response)
+                .expect("繁中說明：應可讀回 delete 回應");
+            if !response.contains("operation_in_progress") {
+                return response;
+            }
+            // 撞上主執行緒持有的鎖就再試一次，直到贏得為止。
+            if std::time::Instant::now() >= deadline {
+                return response;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     });
 
     // `ignore_term.sh` 忽略 SIGTERM，所以 delete 必須走完 TERM（1000ms）＋
@@ -1450,6 +1465,11 @@ fn second_lifecycle_operation_on_the_same_instance_is_refused() {
     // 撞擊方式：連續送出 restart 直到觀察到 `operation_in_progress`。只送一次的
     // 話，兩次 syscall 之間的排程延遲決定是否落在視窗內，那是賭時序而不是驗
     // 行為。判準不變：期限內必須觀察到 `operation_in_progress`。
+    //
+    // 兩邊都必須重試才能成立：誰先拿到鎖誰就贏。若主執行緒先贏，這次 restart
+    // 會自己走完 TERM ＋ KILL（約 1500ms）才回 `Completed`——而並行執行緒持續
+    // 重試的 delete 會在約 20ms 內撞上它、取得 `operation_in_progress`，接著才
+    // 開始持有鎖。兩邊都在跑，視窗一定會出現。
     let mut refused = None;
     let attempt_start = std::time::Instant::now();
     while refused.is_none() && attempt_start.elapsed() < LONG_TIMEOUT {
