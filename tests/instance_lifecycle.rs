@@ -108,6 +108,48 @@ mod support {
         }
     }
 
+    /// 連線後延遲 `delay_ms` 才送出一行 JSON 請求，回讀該行回應。
+    ///
+    /// 刻意把「送出」排在「連線」之後：accepted stream 若繼承 listener 的
+    /// `O_NONBLOCK`，daemon 會在資料到達前就結束這個連線，客戶端只看到
+    /// `Broken pipe`。
+    pub fn call_after_delay(
+        home: &TestHome,
+        auth: &Auth,
+        op: &str,
+        args: Value,
+        delay_ms: u64,
+    ) -> std::io::Result<OperationResult> {
+        let request = Request {
+            v: 1,
+            auth: auth.clone(),
+            op: op.to_owned(),
+            args,
+            operation_id: None,
+        };
+        let mut line = serde_json::to_string(&request).expect("繁中說明：請求應可序列化為 JSON");
+        line.push('\n');
+        let socket = home.socket_path();
+        let stream = UnixStream::connect(socket)?;
+        let _ = stream.set_read_timeout(Some(LONG_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(RECV_TIMEOUT));
+        let mut stream = stream;
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        stream.write_all(line.as_bytes())?;
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response)?;
+        if response.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon 未回任何一行",
+            ));
+        }
+        serde_json::from_str(response.trim()).map_err(|parse_error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, parse_error)
+        })
+    }
+
     /// 前景執行的 daemon；Drop 時先 SIGTERM、有界等待、再 SIGKILL。
     pub struct Daemon {
         child: Option<Child>,
@@ -404,6 +446,42 @@ fn create_starts_the_instance_and_list_shows_it_running() {
     // T4 只實作 claude（plan T4：`backend: command` 回 unsupported_in_phase）；
     // 這裡用 `command` 欄位覆寫可執行檔（契約 §5.1），backend 仍是 claude。
     assert_eq!(instances[0]["backend"], json!("claude"));
+}
+
+/// 連線之後**延遲**送出請求，daemon 仍必須回應（契約 §1：一個連線一個請求）。
+///
+/// 這條固定一個真實缺陷：daemon 的 listener 是 non-blocking（accept 迴圈要能
+/// 被訊號旗標中斷），而 accepted stream 會**繼承** `O_NONBLOCK`。若不解除，
+/// `handle_connection` 的第一個 `read_line` 會在客戶端資料到達前就回
+/// `WouldBlock`，並把連線當成空請求關掉——客戶端看到的是 `Broken pipe`。
+/// 它只在排程延遲足夠大時出現（集中全量負載下的 `concurrent_creates` 兩條執行緒
+/// 同時 `Broken pipe`），所以單跑測試永遠看不到。
+///
+/// 延遲必須**大於** accept 迴圈的輪詢間隔（20ms），否則請求會在 daemon 尚未
+/// accept 之前就抵達socket，讀不到這個缺陷。
+#[test]
+fn request_sent_after_a_delay_is_still_answered() {
+    let home = TestHome::new();
+    // daemon 在本測試結束時（`Daemon` Drop）才關閉。
+    let _daemon = Daemon::start(&home);
+
+    for delay_ms in [0u64, 50, 200] {
+        let result = call_after_delay(
+            &home,
+            &home.operator(),
+            "list_instances",
+            json!({}),
+            delay_ms,
+        )
+        .unwrap_or_else(|error| {
+            panic!("繁中說明：延遲 {delay_ms}ms 的請求應仍被正常處理：{error}")
+        });
+        assert_eq!(
+            result.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：延遲 {delay_ms}ms 的請求應被正常處理，實際為 {result:?}"
+        );
+    }
 }
 
 /// 明確 `backend: command` 在 T4 回 `unsupported_in_phase`，且不建立 instance。
