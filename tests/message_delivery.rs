@@ -1376,7 +1376,10 @@ fn fresh_restart_requeues_and_resume_keeps_the_lease() {
 #[test]
 fn undelivered_and_unacked_messages_survive_daemon_kill() {
     let home = TestHome::new();
-    let mut daemon = Daemon::start(&home);
+    // 從一開始就用短 lease：daemon 只在啟動時讀一次 `OTTERHIVE_TEST_LEASE_MS`，
+    // 而重啟後的 daemon 沿用同一個 home 與設定。若第一個 daemon 用契約預設的
+    // 600 秒 lease，重啟後也不會有任何重送——後面的「lease 過期後重送」就永遠等不到。
+    let mut daemon = Daemon::start_with_env(&home, &[("OTTERHIVE_TEST_LEASE_MS", "600")]);
     create_instance(&daemon, &home, "alpha");
     operator_send(&daemon, &home, "alpha", "未投遞");
     operator_send(&daemon, &home, "alpha", "已投遞未 ack");
@@ -1396,11 +1399,13 @@ fn undelivered_and_unacked_messages_survive_daemon_kill() {
         "繁中說明：依建立順序先取到第一則，實際 {messages:?}"
     );
 
+    // 先取出 pid 再呼叫：`terminate` 會把 child 從 `self.child` 取走，
+    // 呼叫之後再讀 `daemon.pid()` 必然得到 `-1`。
+    let daemon_pid = daemon.pid();
     daemon.terminate();
     assert!(
-        !pid_running(daemon.pid()),
-        "繁中說明：daemon 應已停止（pid {}）",
-        daemon.pid()
+        !pid_running(daemon_pid),
+        "繁中說明：daemon 應已停止（pid {daemon_pid}）"
     );
 
     // 重啟 daemon：兩個訊息都還在，lease 已過期的那則可重送。
@@ -1430,12 +1435,73 @@ fn undelivered_and_unacked_messages_survive_daemon_kill() {
         },
     );
 
-    // 未 ack 的那則（lease 已過期）可重送；未投遞的那則也在同一批之前。
-    let (_, _, after) = drain(&daemon, &home, "alpha");
+    // 未 ack 的訊息在 lease 過期後可再次被 drain；而且重啟**沒有**把它們結算成
+    // acked（§6.3 的至少一次投遞：daemon 重啟不構成 ack）。
+    let rows = message_rows(&home, "alpha");
+    assert_eq!(rows.len(), 2, "繁中說明：應有兩則訊息，實際 {rows:?}");
+    let still_not_acked = rows
+        .iter()
+        .find(|row| row.0 == acked_id)
+        .map(|row| row.2.clone())
+        .unwrap_or_default();
+    assert_ne!(
+        still_not_acked, "acked",
+        "繁中說明：daemon 重啟不應把未 ack 的訊息結算成 acked，實際 {rows:?}"
+    );
+
+    // §2／§4.6：daemon 重啟會讓該 instance 停下，它的舊 generation token 隨之失效
+    // （`clear_process` 清掉 `token_hash`），所以重啟後的 drain 不能用舊 token——
+    // 那會是 `unauthorized`，不是「訊息不見了」。operator 以 `start_instance` 重新
+    // 啟動它，新 generation 會拿到新 token 並覆寫 MCP 設定。
+    let restarted = daemon.operator_call(&home, "start_instance", json!({"instance": "alpha"}));
+    assert_eq!(
+        restarted.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：daemon 重啟後應能重新 start，實際為 {restarted:?}"
+    );
+
+    // §6.3 的至少一次投遞：等 lease 真的過期後，兩則都應被重送且 `delivery_count`
+    // 為 2。**不能用「反覆 drain 直到成功」來等**——每次 drain 都會把 lease 往後推，
+    // 讓它永遠不過期（第一次觀測到的 lease 會是唯一一次寫入的值，之後的輪詢只是
+    // 回空批次）。所以直接讀 `lease_expires_ms` 等它真的過期，只 drain 一次。
+    let lease_ms: i64 = 600;
+    let expired = poll_until(LONG_TIMEOUT, || {
+        let rows = message_rows(&home, "alpha");
+        rows.iter()
+            .filter_map(|row| row.5)
+            .all(|expires| expires <= now_ms())
+    });
+    let before: Vec<(String, String, String, i64)> = message_rows(&home, "alpha")
+        .into_iter()
+        .map(|row| (row.0, row.1, row.2, row.3))
+        .collect();
+    assert!(
+        expired,
+        "繁中說明：lease（{lease_ms} ms）應在期限內過期，最後觀測：{before:?}"
+    );
+
+    let (drained, _, after) = drain(&daemon, &home, "alpha");
+    assert_eq!(
+        drained.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：lease 過期後的 drain 應完成，實際為 {drained:?}"
+    );
     let bodies: Vec<&str> = after
         .iter()
         .map(|message| message["body"].as_str().unwrap_or_default())
         .collect();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "繁中說明：lease 過期後兩則都應重送，實際 {bodies:?}"
+    );
+    for message in &after {
+        assert_eq!(
+            message["delivery_count"],
+            json!(2),
+            "繁中說明：重送後 delivery_count 應為 2，實際 {message}"
+        );
+    }
     assert!(
         bodies.contains(&"未投遞"),
         "繁中說明：daemon 被殺後未投遞的訊息應仍在，實際 {bodies:?}"
@@ -1443,18 +1509,6 @@ fn undelivered_and_unacked_messages_survive_daemon_kill() {
     assert!(
         bodies.contains(&"已投遞未 ack"),
         "繁中說明：daemon 被殺後未 ack 的訊息應重送，實際 {bodies:?}"
-    );
-
-    let rows = message_rows(&home, "alpha");
-    assert_eq!(rows.len(), 2, "繁中說明：應有兩則訊息，實際 {rows:?}");
-    let still_delivering = rows
-        .iter()
-        .find(|row| row.0 == acked_id)
-        .map(|row| row.2.clone())
-        .unwrap_or_default();
-    assert_eq!(
-        still_delivering, "delivering",
-        "繁中說明：daemon 重啟不應結算未 ack 的訊息（lease 尚在），實際 {rows:?}"
     );
 }
 
