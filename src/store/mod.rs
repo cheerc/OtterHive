@@ -785,16 +785,22 @@ impl Tx<'_> {
     /// `team_members.instance_id` 是 UNIQUE（§8.1「一個 instance 最多屬於一個
     /// team」），所以先把不在新集合裡的關係刪掉，再插入新的。
     pub fn set_team_members(&self, team: &str, instance_ids: &[String]) -> Result<(), StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("DELETE FROM team_members WHERE team = ?1 AND instance_id NOT IN (SELECT value FROM json_each(?2))")?;
+        // 保留集合用「過濾器」而不是 `NOT IN (...)`：`json_each('[]')` 回空結果集，
+        // 而 SQL 的 `NOT IN (空集合)` **恆為真**——那會讓每次 `add` 都清空整個
+        // team，再重新插入時撞上自己剛插入的列。`EXISTS` 對空集合恆為假，
+        // 語意正好相反（沒有任何列在空集合裡，所以什麼都不該被刪）。
+        let mut statement = self.connection.prepare(
+            "DELETE FROM team_members WHERE team = ?1 AND NOT EXISTS ( \
+               SELECT 1 FROM json_each(?2) WHERE json_each.value = team_members.instance_id \
+             )",
+        )?;
         let encoded = serde_json::to_string(instance_ids)
             .map_err(|error| StoreError::Invalid(format!("序列化成員清單失敗: {error}")))?;
         statement.execute(params![team, encoded])?;
         drop(statement);
         for id in instance_ids {
             self.connection.execute(
-                "INSERT INTO team_members(team, instance_id) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO team_members(team, instance_id) VALUES (?1, ?2)",
                 params![team, id],
             )?;
         }

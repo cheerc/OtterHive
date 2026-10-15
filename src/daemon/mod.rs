@@ -1864,15 +1864,37 @@ fn send_operation(
         }
     };
 
-    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。
+    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。用 `message_id` 做 key 而不是
+    // instance 名稱：同一個收件人可能有多則訊息待喚醒，按名稱做 key 會讓後一則
+    // 覆蓋前一則的結果。
     let mut wakers: BTreeMap<String, String> = BTreeMap::new();
+    // 每個成功寫入的收件人都必須有一個 `wake` 值（§6.1：queued 的收件人帶
+    // `wake`）。先為每一則填入預設值，再由實際排程結果覆蓋——所以 `wake_targets`
+    // 少列或名稱對不上時，欄位仍然是合法的契約值而不是缺漏。
+    for recipient in &recipients {
+        if let Some(message_id) = recipient.message_id.as_deref() {
+            wakers.insert(
+                message_id.to_owned(),
+                wake::WakeOutcome::NotRunning.as_wire().to_owned(),
+            );
+        }
+    }
     for target in &wake_targets {
         let Some(message_id) = target.message_id.as_deref() else {
             continue;
         };
+        // `wake_targets` 的元素是 `recipients` 中已寫入那些的副本，所以名稱
+        // 一定對得上；找不到只是不應該發生的情形，跳過而不是編一個值。
+        let Some(instance) = recipients
+            .iter()
+            .find(|recipient| recipient.message_id.as_deref() == Some(message_id))
+            .map(|recipient| recipient.instance.clone())
+        else {
+            continue;
+        };
         wakers.insert(
-            target.instance.clone(),
-            schedule_hint(state, caller, &target.instance, message_id),
+            message_id.to_owned(),
+            schedule_hint(state, caller, &instance, message_id, args),
         );
     }
 
@@ -1891,7 +1913,7 @@ fn send_operation(
             let wake = recipient
                 .message_id
                 .as_deref()
-                .and_then(|_| wakers.get(&recipient.instance))
+                .and_then(|message_id| wakers.get(message_id))
                 .cloned();
             json!({
                 "instance": recipient.instance,
@@ -1952,7 +1974,13 @@ fn send_operation(
 ///
 /// `sender` 與 `kind` 取自憑證與請求（§2「sender 一律由憑證推導」、§6.1 的
 /// `request_kind` 省略時記為 `message`），不從 store 反查。
-fn schedule_hint(state: &DaemonState, caller: &Caller, instance: &str, message_id: &str) -> String {
+fn schedule_hint(
+    state: &DaemonState,
+    caller: &Caller,
+    instance: &str,
+    message_id: &str,
+    args: &Value,
+) -> String {
     let sender_name = match caller {
         Caller::Operator => String::from("operator"),
         Caller::Instance(id) => {
@@ -2000,7 +2028,12 @@ fn schedule_hint(state: &DaemonState, caller: &Caller, instance: &str, message_i
     }
     scheduler.enqueue(wake::PendingHint {
         from: sender_name,
-        kind: String::from("message"),
+        // §6.1：`request_kind` 省略時記為 `message`；`admit` 已擋掉其他值。
+        kind: args
+            .get("request_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("message")
+            .to_owned(),
         message_id: message_id.to_owned(),
     });
     let decision = scheduler.check(
