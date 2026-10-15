@@ -78,6 +78,12 @@ pub struct Tuning {
     pub stop_term: Duration,
     pub stop_kill: Duration,
     pub subscriber_queue: usize,
+    /// 契約 §6.3 的投遞 lease（預設 600 秒）。
+    pub lease: Duration,
+    /// 契約 §6.4：client 最近輸入過多久就延後喚醒（預設 3 秒）。
+    pub wake_input: Duration,
+    /// 契約 §6.4：收件人最近輸出過多久就延後喚醒（預設 500 毫秒）。
+    pub wake_quiet: Duration,
 }
 
 impl Tuning {
@@ -91,6 +97,9 @@ impl Tuning {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(256),
+            lease: millis("OTTERHIVE_TEST_LEASE_MS", 600_000),
+            wake_input: millis("OTTERHIVE_TEST_WAKE_INPUT_MS", 3000),
+            wake_quiet: millis("OTTERHIVE_TEST_WAKE_QUIET_MS", 500),
         }
     }
 }
@@ -122,6 +131,12 @@ struct Inner {
     /// daemon 重啟後沒有記憶體畫面；此表讓停止後仍可回最後畫面，直到
     /// process 紀錄被清掉為止。
     last_screens: HashMap<String, Vec<String>>,
+    /// 契約 §6.4：每個 instance 最近一次收到 client Input 的時間。
+    ///
+    /// 「有 client 在最近 3 秒內輸入過」是喚醒的延後條件之一：operator
+    /// 正在打字時插入提示行會打斷他。**只在收到 Input frame 時更新**——
+    /// Resize／Detach 不是輸入。
+    last_client_input: HashMap<String, Instant>,
 }
 
 /// 共用的 daemon 狀態。
@@ -232,6 +247,7 @@ pub fn prepare(
             busy: HashMap::new(),
             managers,
             last_screens: HashMap::new(),
+            last_client_input: HashMap::new(),
         })),
         home: home_root.to_path_buf(),
         bridge: bridge.to_path_buf(),
@@ -2240,9 +2256,18 @@ fn read_client_frames(
                     }
                     continue;
                 }
-                let inner = state.lock();
-                if let Some(running) = inner.running.get(name) {
-                    let _ = running.session.write_input(&payload[8..]);
+                {
+                    // 只在收到 Input frame 時更新：Resize／Detach 不是輸入。
+                    // 喚醒排程之後會讀這個欄位判斷「operator 正在打字」，
+                    // 而排程器自己送出的提示行不經這裡（那走
+                    // `Session::write_input`），所以不會污染它。
+                    let mut inner = state.lock();
+                    inner
+                        .last_client_input
+                        .insert(name.to_owned(), Instant::now());
+                    if let Some(running) = inner.running.get(name) {
+                        let _ = running.session.write_input(&payload[8..]);
+                    }
                 }
             }
             0x11 => {
