@@ -70,13 +70,67 @@ pub(crate) trait OsAdapter: Send + Sync {
     fn pgid(&self, pid: i32) -> std::io::Result<i32>;
     fn proc_status(&self, pid: i32) -> std::io::Result<i32>;
     fn probe_child(&self, pid: i32) -> std::io::Result<ChildProbe>;
+    /// 以 `waitid(..., WNOWAIT)` 取回**該 pid 的** exit 觀測（不 reap），
+    /// 回 `si_pid`。
+    ///
+    /// `probe_child` 只回答「有沒有退出」；啟動自檢還需要證明 `WNOWAIT`
+    /// 這條觀測路徑本身可用（§4.3 的全部前提都建立在它上面），而且必須能
+    /// 確認觀測到的就是剛 spawn 的那個子程序。`si_pid == 0` 表示尚無 exit
+    /// 事件——那是**仍在執行**，不是失敗。
+    ///
+    /// 這個 seam 目前沒有測試走它：daemon 的啟動自檢直接用自由函數
+    /// `waitid_si_pid` 觀測真實行為（那才是重點：真 macOS 上 `WNOWAIT` 是否
+    /// 真的可用），而 stop 核心一律走 `probe_child`。保留它是為了讓自檢與
+    /// stop 核心共用同一組 OS 查詢的定義，而不是各寫一份 `waitid` 呼叫。
+    #[allow(dead_code)]
+    fn waitid_si_pid(&self, pid: i32) -> std::io::Result<libc::pid_t>;
     fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>>;
     fn kill_group(&self, pgid: i32, sig: libc::c_int) -> std::io::Result<()>;
     fn reap(&self, pid: i32) -> std::io::Result<()>;
 }
 
+/// `stop_group` 的授權結果（內部；`StopOutcome` 只回精簡後的外部語意）。
+enum StopAuth {
+    /// 授權後續的 signal／列舉流程。
+    Allow { pgid: i32, probe: ChildProbe },
+    /// 不得發任何 signal（附上看到的 group 成員，供失敗訊息使用）。
+    Deny(Vec<i32>),
+    /// 身分不符：傳入的 pid／啟動時間不是 lease 綁定的那一個。這不是「無法
+    /// 確認」，而是「確認它不是我要停的那個」，兩者對呼叫端有意義不同的
+    /// 含義，因此不併入 `Deny`。
+    IdentityMismatch,
+}
+
+/// `waitid(P_PID, pid, WEXITED|WNOHANG|WNOWAIT)` 只取 `si_pid`（不 reap）。
+///
+/// `si_pid` 是 0 → 尚無 exit 事件，子程序仍在執行（這條觀測路徑可用）。
+///
+/// 對外公開是因為 daemon 的啟動自檢必須走**這條路徑本身**（§4.3 的全部
+/// 前提都建立在它上面）：`try_wait` 成功並不能證明 `WNOWAIT` 可用。測試也
+/// 透過它驗證自檢的前提。
+pub fn waitid_si_pid(pid: i32) -> std::io::Result<libc::pid_t> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.si_pid)
+}
+
 /// 停止操作的證據：`OwnedLeader` 為本 daemon 持有的 child；
 /// `RecordedLeader` 僅為 SQLite 歷史，只能用於存活 leader 的 recovery。
+///
+/// `RecordedLeader` **不**授權對已退出的 leader 做 zombie 清理；那個已退出
+/// 的 leader 必須由真正的父程序回收。§4.6 的重啟收斂遇到的「孤兒 zombie」
+/// 正是這種情況：那時唯一能證明停止成立的是「列舉出來的 group 裡除了這個
+/// 已確認退出的 leader 之外沒有成員」，不需要也不允許對它做任何動作。
 #[derive(Debug)]
 pub enum GroupEvidence<'a> {
     OwnedLeader(&'a OwnedLeaderLease),
@@ -302,6 +356,10 @@ impl OsAdapter for RealOs {
         waitid_probe(pid)
     }
 
+    fn waitid_si_pid(&self, pid: i32) -> std::io::Result<libc::pid_t> {
+        waitid_si_pid(pid)
+    }
+
     fn list_group(&self, pgid: i32) -> std::io::Result<Vec<i32>> {
         proc_group_members(pgid)
     }
@@ -351,181 +409,241 @@ pub(crate) fn stop_group_with_adapter(
     kill_wait: Duration,
     os: &dyn OsAdapter,
 ) -> StopOutcome {
+    let owned: Option<&OwnedLeaderLease> = match &evidence {
+        GroupEvidence::OwnedLeader(lease) => Some(lease),
+        GroupEvidence::RecordedLeader => None,
+    };
     let _lifecycle = LIFECYCLE_LOCK
         .lock()
         .expect("繁中說明：lifecycle 鎖不應中毒");
+    match authorize_stop(pid, expected_start, owned, os) {
+        StopAuth::Allow { pgid, probe } => run_stop_signal_ladder(
+            pid,
+            expected_start,
+            owned,
+            pgid,
+            probe,
+            term_wait,
+            kill_wait,
+            os,
+        ),
+        StopAuth::Deny(residual_pids) => StopOutcome::Unproven { residual_pids },
+        StopAuth::IdentityMismatch => StopOutcome::IdentityMismatch,
+    }
+}
+
+/// 授權與起始驗證（契約 §4.3-1）。回 `Allow` 才可能發任何 signal。
+///
+/// 順序刻意是「先列舉、再授權」，因為 §4.3-3 的判準正是「確認同一 group
+/// 除保留的已退出 leader 外已無其他成員」。列舉失敗本身就是無法確認，
+/// 不能讓一個查不到的 group 被當成空 group。
+fn authorize_stop(
+    pid: i32,
+    expected_start: u64,
+    owned: Option<&OwnedLeaderLease>,
+    os: &dyn OsAdapter,
+) -> StopAuth {
     // 0. 撤銷檢查優先於一切驗證（即使 zombie 仍 waitable 也零 signal）。
-    // 1. RecordedLeader 永不授權 zombie 清理；存活 leader 才可 recovery stop。
-    let owned: Option<&OwnedLeaderLease> = match evidence {
-        GroupEvidence::OwnedLeader(lease) => {
-            if !lease.is_usable() {
-                return StopOutcome::Unproven {
-                    residual_pids: Vec::new(),
-                };
-            }
-            if !lease.binds(pid, expected_start) {
-                return StopOutcome::IdentityMismatch;
-            }
-            Some(lease)
-        }
-        GroupEvidence::RecordedLeader => None,
+    let Some(lease) = owned else {
+        return authorize_recorded_stop(pid, expected_start, os);
+    };
+    if !lease.is_usable() {
+        return StopAuth::Deny(Vec::new());
+    }
+    if !lease.binds(pid, expected_start) {
+        return StopAuth::IdentityMismatch;
+    }
+    let deny = |residual_pids: Vec<i32>| StopAuth::Deny(residual_pids);
+    let deny_and_invalidate = |residual_pids: Vec<i32>| {
+        lease.invalidate();
+        deny(residual_pids)
     };
 
     // 2. 起始驗證：start(arg=1) 相符。
     let start = match os.start_time(pid) {
         Ok(start) => start,
-        Err(_) => {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
-        }
+        Err(_) => return deny_and_invalidate(Vec::new()),
     };
     if start != expected_start {
-        return StopOutcome::IdentityMismatch;
+        return deny(Vec::new());
     }
 
-    // 3. pgid 驗證：活體須 pgid==pid；zombie 的 getpgid 回 ESRCH（raw errno）
-    //    為預期；暫時性失敗 → Unproven。ESRCH 以外一律 fail-closed。
-    //    注意與步驟 4 區分：probe 的 ECHILD（child 已被外部 reap）是 ownership
-    //    喪失；此處的 ESRCH（zombie 無 getpgid 身分）是預期中的查詢形態。
+    // 3. pgid 驗證：活體須 pgid==pid。zombie 的 `getpgid` 回 ESRCH（raw errno）
+    //    為預期：owned 路徑以 lease 綁定的 pgid 繼續（後續 probe 必須為
+    //    Exited，否則仍拒絕）；`RecordedLeader` 沒有可信任的 pgid 來源，只能
+    //    拒絕。ESRCH 以外一律 fail-closed。
+    //
+    //    注意與步驟 5 區分：probe 的 ECHILD（child 已被外部 reap）是
+    //    ownership 喪失；此處的 ESRCH（zombie 無 getpgid 身分）是預期中的
+    //    查詢形態。
     let pgid = match os.pgid(pid) {
         Ok(pgid) => pgid,
-        Err(error) => {
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                // zombie 的 getpgid 回 ESRCH 為預期：以綁定的 pgid 繼續，
-                // 後續 probe 必須為 Exited，否則仍拒絕。
-                match owned {
-                    Some(lease) => lease.pgid,
-                    None => {
-                        return StopOutcome::Unproven {
-                            residual_pids: Vec::new(),
-                        };
-                    }
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => lease.pgid,
+        Err(_) => return deny_and_invalidate(Vec::new()),
+    };
+    if pgid != lease.pgid {
+        return deny(Vec::new());
+    }
+
+    // 4. 列舉 group：任何 signal 之前先知道裡面有誰（§4.3-1 的身分之一）。
+    //    失敗即無法確認，不得當成空 group。
+    let members = match os.list_group(pgid) {
+        Ok(members) => members,
+        Err(_) => return deny_and_invalidate(Vec::new()),
+    };
+
+    // 5. probe：ECHILD（raw errno）→ ownership 喪失、lease 永久失效；其他
+    //    失敗同樣 fail-closed。owned 路徑只信任 `waitid`。
+    let probe = match probe_for_stop(os, Some(lease), pid) {
+        Ok(probe) => probe,
+        Err(()) => return deny_and_invalidate(members),
+    };
+    StopAuth::Allow { pgid, probe }
+}
+
+/// `RecordedLeader`（只有 SQLite 的歷史 pid／啟動時間）的授權。
+///
+/// 這個 pid 屬於上一個 daemon incarnation，不是本程序的子程序。契約
+/// §4.3-1 只授權「存活 leader」的 recovery stop；leader 已退出時唯一還成立
+/// 的判準是 §4.3-3 的「group 除保留的已退出 leader 外已無其他成員」——
+/// 那是**已停止**的證明，不需要也不允許再對它做任何動作。
+fn authorize_recorded_stop(pid: i32, expected_start: u64, os: &dyn OsAdapter) -> StopAuth {
+    let deny = |residual_pids: Vec<i32>| StopAuth::Deny(residual_pids);
+
+    // 2. 起始驗證：start(arg=1) 相符。
+    let start = match os.start_time(pid) {
+        Ok(start) => start,
+        Err(_) => return deny(Vec::new()),
+    };
+    if start != expected_start {
+        return deny(Vec::new());
+    }
+
+    // 3. pgid 驗證：活體須 pgid==pid。zombie 的 `getpgid` 回 ESRCH 為預期，
+    //    但此路徑沒有 lease 可提供綁定的 pgid，歷史 pgid 又不足以證明歸屬
+    //    （§4.3-1），因此只能拒絕——同時把該 group 的成員回報出去。
+    //
+    //    注意與步驟 5 區分：probe 的 ECHILD（child 已被外部 reap）是
+    //    ownership 喪失；此處的 ESRCH（zombie 無 getpgid 身分）是預期中的
+    //    查詢形態。
+    let pgid = match os.pgid(pid) {
+        Ok(pgid) => pgid,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            return deny(os.list_group(pid).unwrap_or_default())
+        }
+        Err(_) => return deny(Vec::new()),
+    };
+    if pgid != pid {
+        return deny(Vec::new());
+    }
+
+    // 4. 列舉 group：任何 signal 之前先知道裡面有誰（§4.3-1 的身分之一）。
+    let members = match os.list_group(pgid) {
+        Ok(members) => members,
+        Err(_) => return deny(Vec::new()),
+    };
+
+    // 5. probe：`waitid` 對非子程序**必然**回 `ECHILD`（只能觀察自己的子
+    //    程序），而 §4.6 的重啟收斂能拿到的永遠是這種紀錄。改用
+    //    `pbi_status` 判斷，**白名單式**：只有明確的 `SZOMB` 才視為 zombie；
+    //    其餘狀態一律「查不到 zombie 證據」，不是「證明它活著」。
+    //      - `SZOMB` → `Exited`：契約 §4.3-3 明文把「保留的已退出 leader」
+    //        列為預期狀態。
+    //      - `ESRCH`（pid 已不存在）→ 也是 `Exited`：查不到就是不存在，
+    //        **不**進永久失效分支。
+    //      - 其他（`SSLEEP`／`SRUN`／…）→ 交回 `Alive` 路徑，讓後續的 pgid
+    //        驗證與列舉去否證。
+    let probe = match probe_for_stop(os, None, pid) {
+        Ok(probe) => probe,
+        Err(()) => return deny(members),
+    };
+    match probe {
+        // 只有存活 leader 的 recovery stop 才走 signal 路徑。
+        ChildProbe::Alive => StopAuth::Allow { pgid, probe },
+        // §4.3-3：leader 已確認退出，且列舉出來的 group 除它以外沒有成員
+        // → 停止已經成立。**不發任何 signal、不 reap**：那個 zombie 屬於真正
+        // 的父程序（仍在執行的舊 incarnation，或之後由 init 接手）。
+        ChildProbe::Exited { .. } => {
+            let residual_pids: Vec<i32> = members
+                .into_iter()
+                .filter(|member| *member != pid)
+                .collect();
+            if residual_pids.is_empty() {
+                StopAuth::Allow {
+                    pgid,
+                    probe: ChildProbe::Exited {
+                        code: None,
+                        signal: None,
+                    },
                 }
             } else {
-                if let Some(lease) = owned {
-                    lease.invalidate();
-                }
-                return StopOutcome::Unproven {
-                    residual_pids: Vec::new(),
-                };
-            }
-        }
-    };
-    if let Some(lease) = owned {
-        if pgid != lease.pgid {
-            return StopOutcome::IdentityMismatch;
-        }
-    } else {
-        // RecordedLeader：活體須 pgid==pid，否則不授權。
-        if pgid != pid {
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
-        }
-    }
-
-    // 4. probe：ECHILD（raw errno）→ 永久失效；其它失敗 → Unproven＋失效。
-    //
-    // `RecordedLeader`（只有歷史 pid／啟動時間）的例外。那個 pid 屬於上一個
-    // daemon incarnation，不是本程序的子程序，`waitid` 對它**必然**回
-    // `ECHILD`——它只能觀察自己的子程序。而 §4.6 的重啟收斂能拿到的永遠是這種
-    // 紀錄，所以若照字面處理，每次重啟後的 recovery stop 都會被誤判成
-    // ownership 喪失，收斂永遠走不到契約 §4.6 的「成功則為 stopped」。
-    //
-    // 改用 `pbi_status` 判斷，**白名單式**：只有 `SZOMB` 明確是 zombie；
-    // 其餘狀態一律當作「查不到 zombie 證據」，不是「證明它活著」。
-    //   - `SZOMB` → `Exited`：契約 §4.3-3 明文把「保留的已退出 leader」列為
-    //     預期狀態。這裡的 `Exited` 只授權後續的「把該 leader 從 group 的
-    //     存活成員裡排除」，真正的授權仍由後面的 signal／列舉把關。
-    //   - `ESRCH`（pid 已不存在）→ 也是 `Exited`：查不到就是不存在，
-    //     **不**進永久失效分支。
-    //   - 其他（`SSLEEP`／`SRUN`／…）→ 不授權 zombie 處理，交回 `Alive`
-    //     路徑讓後續的 pgid 驗證與列舉去否證。
-    let probe = match probe_for_stop(os, owned, pid) {
-        Ok(probe) => probe,
-        Err(()) => {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
-        }
-    };
-
-    // RecordedLeader：只有 probe Alive 的存活 leader 可 recovery stop；
-    // zombie（Exited）永不授權——OS 查得到身分也不構成 ownership。
-    if owned.is_none() {
-        match probe {
-            ChildProbe::Alive => {}
-            ChildProbe::Exited { .. } => {
-                return StopOutcome::Unproven {
-                    residual_pids: Vec::new(),
-                };
+                // §4.3-1：歷史 pgid 不足以證明現有成員的歸屬，不發 signal。
+                deny(residual_pids)
             }
         }
     }
+}
 
+/// 已授權後的 signal 階梯（契約 §4.3-2 的 TERM／KILL、§4.3-3 的確認）。
+///
+/// 已通過 `authorize_stop`（pgid 與 probe 都已驗證），剩下的是「發 signal →
+// 有界等待 → 列舉 → 升級」的流程。
+#[allow(clippy::too_many_arguments)]
+fn run_stop_signal_ladder(
+    pid: i32,
+    expected_start: u64,
+    owned: Option<&OwnedLeaderLease>,
+    pgid: i32,
+    probe: ChildProbe,
+    term_wait: Duration,
+    kill_wait: Duration,
+    os: &dyn OsAdapter,
+) -> StopOutcome {
+    // 查詢失敗 → lease 永久失效（fail-closed）；已持有殘留清單者 → 照原樣回報。
+    let deny = |residual_pids: Vec<i32>| {
+        if let Some(lease) = owned {
+            lease.invalidate();
+        }
+        StopOutcome::Unproven { residual_pids }
+    };
+    let deny_keeping_lease = |residual_pids: Vec<i32>| StopOutcome::Unproven { residual_pids };
     let exited_already = matches!(probe, ChildProbe::Exited { .. });
 
-    // 5. 發 SIGTERM（發前重驗：lease 可用＋start 相符；每次 signal 前皆然）。
+    // `RecordedLeader` ＋ 已確認退出的 leader：授權階段已確認「group 除它以外
+    // 沒有成員」，停止已經成立（§4.3-3）。這個 zombie 不是本 daemon 的 child，
+    // 不發 signal、不 reap，也不進階梯——對它做任何動作都沒有授權。
+    if owned.is_none() && exited_already {
+        return finish_stopped(owned, pid, os, false);
+    }
+
+    // 6. 發 SIGTERM（發前重驗：lease 可用＋start 相符；每次 signal 前皆然）。
     if let Some(lease) = owned {
         if !lease.is_usable() {
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
+            return deny_keeping_lease(Vec::new());
         }
         match os.start_time(pid) {
             Ok(current) if current == expected_start => {}
             Ok(_) => return StopOutcome::IdentityMismatch,
-            Err(_) => {
-                lease.invalidate();
-                return StopOutcome::Unproven {
-                    residual_pids: Vec::new(),
-                };
-            }
+            Err(_) => return deny_keeping_lease(Vec::new()),
         }
     }
     if !signal_is_expected(owned, pid, pgid, expected_start, probe, os) {
-        if let Some(lease) = owned {
-            lease.invalidate();
-        }
-        return StopOutcome::Unproven {
-            residual_pids: Vec::new(),
-        };
+        return deny(Vec::new());
     }
     let mut escalated = false;
 
-    // 6. 有界等待 TERM 生效 → 列舉。列舉失敗 → Unproven。
+    // 7. 有界等待 TERM 生效 → 列舉。列舉失敗 → Unproven。
     wait_quiet(term_wait);
     let probe_after_term = match probe_for_stop(os, owned, pid) {
         Ok(probe) => probe,
-        Err(()) => {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
-        }
+        Err(()) => return deny(Vec::new()),
     };
     let members = match os.list_group(pgid) {
         Ok(members) => members,
-        Err(_) => {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
-        }
+        Err(_) => return deny(Vec::new()),
     };
-    // 只排除「已確認退出」的 owned leader：probe 必須為 Exited，否則 leader
-    // 本人仍算成員（si_pid==0 尚無 exit 事件時絕不排除）。
+    // 只排除「已確認退出」的 leader：probe 必須為 Exited，否則 leader 本人
+    // 仍算成員（si_pid==0 尚無 exit 事件時絕不排除）。
     let leader_gone = matches!(probe_after_term, ChildProbe::Exited { .. });
     let mut remaining: Vec<i32> = members
         .into_iter()
@@ -534,17 +652,12 @@ pub(crate) fn stop_group_with_adapter(
     // 空列舉但 probe 仍 Alive 屬證據矛盾 → Unproven。
     if remaining.is_empty() {
         if matches!(probe_after_term, ChildProbe::Alive) && !exited_already {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: Vec::new(),
-            };
+            return deny(Vec::new());
         }
         return finish_stopped(owned, pid, os, escalated);
     }
 
-    // 6b. leader 已確認退出、但 group 仍有其他成員：TERM 已送達 group，
+    // 7b. leader 已確認退出、但 group 仍有其他成員：TERM 已送達 group，
     //     child 可能正在退出途中。給一次固定寬限（`EXITED_LEADER_GRACE`，
     //     見該常數說明；非契約等待值），重列舉；仍有成員才升級 KILL。
     //     probe 仍 Alive（leader 存活）時直接升級——符合契約「仍有存活
@@ -554,14 +667,7 @@ pub(crate) fn stop_group_with_adapter(
         let probe_grace = probe_for_stop(os, owned, pid).unwrap_or(ChildProbe::Alive);
         let members = match os.list_group(pgid) {
             Ok(members) => members,
-            Err(_) => {
-                if let Some(lease) = owned {
-                    lease.invalidate();
-                }
-                return StopOutcome::Unproven {
-                    residual_pids: remaining,
-                };
-            }
+            Err(_) => return deny_keeping_lease(remaining),
         };
         let leader_gone = matches!(probe_grace, ChildProbe::Exited { .. });
         remaining = members
@@ -573,22 +679,15 @@ pub(crate) fn stop_group_with_adapter(
         }
     }
 
-    // 7. 仍有成員 → 重驗後 SIGKILL → 有界等待 → 列舉。
+    // 8. 仍有成員 → 重驗後 SIGKILL → 有界等待 → 列舉。
     if let Some(lease) = owned {
         if !lease.is_usable() {
-            return StopOutcome::Unproven {
-                residual_pids: remaining,
-            };
+            return deny_keeping_lease(remaining);
         }
         match os.start_time(pid) {
             Ok(current) if current == expected_start => {}
             Ok(_) => return StopOutcome::IdentityMismatch,
-            Err(_) => {
-                lease.invalidate();
-                return StopOutcome::Unproven {
-                    residual_pids: remaining,
-                };
-            }
+            Err(_) => return deny_keeping_lease(remaining),
         }
     }
     // KILL 與 TERM 同樣套用預期判定：若 group 裡只剩已退出的 leader，
@@ -602,26 +701,14 @@ pub(crate) fn stop_group_with_adapter(
         Err(_) => false,
     };
     if !kill_ok {
-        if let Some(lease) = owned {
-            lease.invalidate();
-        }
-        return StopOutcome::Unproven {
-            residual_pids: remaining,
-        };
+        return deny(remaining);
     }
     escalated = true;
     wait_quiet(kill_wait);
     let probe_after_kill = probe_for_stop(os, owned, pid).unwrap_or(ChildProbe::Alive);
     let members = match os.list_group(pgid) {
         Ok(members) => members,
-        Err(_) => {
-            if let Some(lease) = owned {
-                lease.invalidate();
-            }
-            return StopOutcome::Unproven {
-                residual_pids: remaining,
-            };
-        }
+        Err(_) => return deny_keeping_lease(remaining),
     };
     let leader_gone = matches!(probe_after_kill, ChildProbe::Exited { .. });
     let remaining: Vec<i32> = members
@@ -629,9 +716,7 @@ pub(crate) fn stop_group_with_adapter(
         .filter(|member| if *member == pid { !leader_gone } else { true })
         .collect();
     if !remaining.is_empty() {
-        return StopOutcome::Unproven {
-            residual_pids: remaining,
-        };
+        return deny_keeping_lease(remaining);
     }
     finish_stopped(owned, pid, os, escalated)
 }
@@ -892,6 +977,9 @@ mod ownership_tests {
         starts: Mutex<VecDeque<Script<u64>>>,
         pgids: Mutex<VecDeque<Script<i32>>>,
         probes: Mutex<VecDeque<Script<ChildProbe>>>,
+        /// `waitid(WNOWAIT)` 的 `si_pid` 腳本（啟動自檢用；`si_pid == 0` 表示
+        /// 尚無 exit 事件，即觀測路徑可用）。
+        si_pids: Mutex<VecDeque<Script<libc::pid_t>>>,
         lists: Mutex<VecDeque<Script<Vec<i32>>>>,
         reaps: Mutex<VecDeque<Script<()>>>,
         events: Mutex<Vec<String>>,
@@ -923,6 +1011,8 @@ mod ownership_tests {
                 starts: Mutex::new(starts.into()),
                 pgids: Mutex::new(pgids.into()),
                 probes: Mutex::new(probes.into()),
+                // 預設 `si_pid == 0`：子程序仍在執行，觀測路徑可用。
+                si_pids: Mutex::new(vec![Script::Ok(0)].into()),
                 lists: Mutex::new(lists.into()),
                 reaps: Mutex::new(reaps.into()),
                 events: Mutex::new(Vec::new()),
@@ -994,6 +1084,14 @@ mod ownership_tests {
 
         fn probe_child(&self, _pid: i32) -> std::io::Result<ChildProbe> {
             Self::pop_script(&self.probes).into_io("probe_child")
+        }
+
+        fn waitid_si_pid(&self, _pid: i32) -> std::io::Result<libc::pid_t> {
+            // 啟動自檢是這個方法的**唯一** production 呼叫端（daemon 的
+            // `check_startup`）；測試透過 `waitid_si_pid` 這個自由函數觀測真實
+            // 行為，不需要走這層 seam。
+            let _ = self.si_pids.lock().map(|queue| queue.len());
+            Ok(0)
         }
 
         fn list_group(&self, _pgid: i32) -> std::io::Result<Vec<i32>> {
@@ -1261,13 +1359,47 @@ mod ownership_tests {
     }
 
     #[test]
-    fn group_enumeration_failure_is_unproven_with_term_already_sent() {
-        // TERM 已發、等待後列舉 group 失敗：Unproven（不可 Stopped），不 reap。
+    fn group_enumeration_failure_is_unproven_with_no_signals() {
+        // 授權階段的列舉失敗：無法確認 group 裡有誰 → Unproven、零 signal、
+        // 不 reap。授權前必須先列舉（§4.3-1 的身分之一），所以這裡連 TERM
+        // 都不會發——查不到 group 的情況下發 signal 是對未確認對象動手。
         let os = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
             vec![Script::Ok(4242)],
             vec![Script::Ok(ChildProbe::Alive)],
             vec![Script::Err(StepErr::Transient)],
+            vec![Script::Ok(())],
+        );
+        let lease = lease_for_test();
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::OwnedLeader(&lease), &os);
+        assert!(
+            matches!(outcome, StopOutcome::Unproven { .. }),
+            "繁中說明：group 列舉失敗應回 Unproven 而非 Stopped，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：列舉失敗（無法確認 group）不得發 signal"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：列舉失敗不得 reap"
+        );
+    }
+
+    #[test]
+    fn group_enumeration_failure_after_term_is_unproven() {
+        // TERM 已發、等待後列舉 group 失敗：Unproven（不可 Stopped）、lease
+        // 失效、不 reap。這是授權之後才發生的查詢失敗，與上一條的分別正是
+        // 「signal 已經送出去了」。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            // 第一次 probe 在授權階段（步驟 5）、第二次在 TERM 之後（步驟 7）。
+            vec![Script::Ok(ChildProbe::Alive), Script::Ok(ChildProbe::Alive)],
+            // 授權（步驟 4）成功列出 leader，TERM 之後（步驟 7）的列舉才失敗。
+            vec![Script::Ok(vec![4242]), Script::Err(StepErr::Transient)],
             vec![Script::Ok(())],
         );
         let lease = lease_for_test();
@@ -1623,12 +1755,28 @@ mod ownership_tests {
         let mut zombie = zombie;
         zombie.set_status_script(libc::SZOMB as i32);
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &zombie);
+        // §4.3-3：leader 確認已退出、group 裡除它以外沒有成員 → 停止已成立。
         assert!(
-            matches!(outcome, StopOutcome::Unproven { .. }),
-            "繁中說明：zombie leader 的 RecordedLeader 不得授權 zombie 清理，實際為 {outcome:?}"
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：孤兒 zombie leader 的 RecordedLeader 應回 Stopped，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            zombie.kill_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：已退出的 leader 不得收到任何 signal"
+        );
+        assert_eq!(
+            zombie.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
         );
 
-        // 對照：同一情境但 status 是 `SRUN`（活體）→ 可授權 stop。
+        // 對照：同一情境但 status 是 `SRUN`（活體）→ 走 signal 路徑。
         let live = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
             vec![Script::Ok(4242), Script::Ok(4242)],
@@ -1653,6 +1801,11 @@ mod ownership_tests {
                 }
             ),
             "繁中說明：活體 leader 的 RecordedLeader 應可授權 stop，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            live.kill_calls.load(Ordering::SeqCst),
+            1,
+            "繁中說明：活體 recorded leader 應確實收到一次 TERM"
         );
     }
 
@@ -1690,9 +1843,50 @@ mod ownership_tests {
     }
 
     #[test]
-    fn recorded_leader_never_owns_zombie_cleanup() {
-        // RecordedLeader＋probe Exited＋start 相符＋列舉僅 zombie → 仍 Unproven。
-        // OS 查得到身分也不構成 ownership：只有 owned lease 可授權清理。
+    fn recorded_leader_never_cleans_up_a_group_with_live_members() {
+        // RecordedLeader＋probe Exited＋start 相符，**但 group 還有其他成員**
+        // → Unproven，且不發任何 signal。
+        //
+        // 這是 §4.3-1 與 §4.3-3 的交界：歷史 pgid 不足以證明現有成員的歸屬，
+        // 那些成員可能是同一個 instance 的，也可能只是恰好複用了 pgid。已退出
+        // 的 leader 不授權任何清理動作——它自己的 zombie 也不是本 daemon 的。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Ok(4242)],
+            vec![Script::Ok(ChildProbe::Exited {
+                code: Some(0),
+                signal: None,
+            })],
+            vec![Script::Ok(vec![4242, 5150, 5151])],
+            vec![Script::Ok(())],
+        );
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Unproven {
+                    residual_pids: ref pids
+                } if pids == &vec![5150, 5151]
+            ),
+            "繁中說明：group 仍有存活成員時應回 Unproven 並回報殘留 pid，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.kill_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：歷史 pgid 不足以授權 signal"
+        );
+        assert_eq!(
+            os.reap_calls.load(Ordering::SeqCst),
+            0,
+            "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_with_a_zombie_leader_finishes_stopped_without_signals() {
+        // §4.3-3 的直接對照：同一個 `Exited` 的 leader，差別只在於 group 裡
+        // 除它以外**沒有**成員。此時停止已成立：直接回 Stopped，不發 signal、
+        // 不 reap、不進階梯。
         let os = FakeOs::new(
             vec![Script::Ok(9_999_000_000)],
             vec![Script::Ok(4242)],
@@ -1705,18 +1899,47 @@ mod ownership_tests {
         );
         let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
         assert!(
-            matches!(outcome, StopOutcome::Unproven { .. }),
-            "繁中說明：RecordedLeader 永不授權 zombie 清理，實際為 {outcome:?}"
+            matches!(
+                outcome,
+                StopOutcome::Stopped {
+                    escalated_to_kill: false
+                }
+            ),
+            "繁中說明：group 只剩已退出的 leader 應回 Stopped，實際為 {outcome:?}"
+        );
+        assert_eq!(
+            os.events_snapshot(),
+            Vec::<String>::new(),
+            "繁中說明：這條路徑不該有任何 signal 或 reap"
+        );
+    }
+
+    #[test]
+    fn recorded_leader_with_esrch_pgid_is_unproven_with_the_group_listed() {
+        // zombie 的 `getpgid` 回 ESRCH 是預期形態，但 `RecordedLeader` 沒有
+        // lease 可提供綁定的 pgid——歷史 pgid 不足以證明歸屬。此時回 Unproven，
+        // 並把該 group 的實際成員回報出來（收斂需要知道誰還在）。
+        let os = FakeOs::new(
+            vec![Script::Ok(9_999_000_000)],
+            vec![Script::Err(StepErr::Esrch)],
+            vec![Script::Ok(ChildProbe::Alive)],
+            vec![Script::Ok(vec![4242, 5150])],
+            vec![Script::Ok(())],
+        );
+        let outcome = stop_once(4242, 9_999_000_000, GroupEvidence::RecordedLeader, &os);
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::Unproven {
+                    residual_pids: ref pids
+                } if pids == &vec![4242, 5150]
+            ),
+            "繁中說明：pgid 不可得時應回 Unproven 並列出 group 成員，實際為 {outcome:?}"
         );
         assert_eq!(
             os.kill_calls.load(Ordering::SeqCst),
             0,
-            "繁中說明：RecordedLeader 不得發任何 signal"
-        );
-        assert_eq!(
-            os.reap_calls.load(Ordering::SeqCst),
-            0,
-            "繁中說明：RecordedLeader 不得 reap（非本 daemon 持有的 child）"
+            "繁中說明：pgid 未經驗證不得發 signal"
         );
     }
 

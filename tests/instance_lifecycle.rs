@@ -1739,26 +1739,42 @@ fn pane_snapshot_returns_plain_text_and_honours_lines() {
         json!({"instance": "printer", "lines": 1}),
         None,
     );
+    // `lines` 取畫面最後 N 列。畫面在 `gamma-line` 之後還有游標所在的空白列，
+    // 那也是真實的一列；而 §4.7 的 `value.text` 是「每列去掉行尾空白」之後
+    // 的結果，所以最後一列取出來**必定**是空字串——這是可斷言的事實，
+    // 不必像原來那樣對尾端內容做「或者」式的寬容假設。
     let tail_text = tail.value["text"]
         .as_str()
         .unwrap_or_else(|| panic!("繁中說明：snapshot 應回 value.text，實際 {}", tail.value));
-    // `lines` 取畫面最後 N 列；畫面在 `gamma-line` 之後還有游標所在的空白列，
-    // 那也是真實的一列。若最後一列是空的，`value.text` 就是空字串
-    // （`str::lines()` 對空字串回 0 個元素），因此以「不超過一列」與
-    // 「完整畫面明顯較長」來驗，不對尾端內容下錯誤的必然假設。
-    let tail_lines: Vec<&str> = tail_text.lines().collect();
-    assert!(
-        tail_lines.len() <= 1,
-        "繁中說明：lines=1 只應取最後一列，實際 {tail_lines:?}"
+    assert_eq!(
+        tail_text, "",
+        "繁中說明：lines=1 取最後一列（游標所在的空白列，去掉行尾空白後為空），\
+         實際為 {tail_text:?}"
     );
-    assert!(
-        tail_text.is_empty() || tail_lines[0] == "gamma-line",
-        "繁中說明：最後一列應是游標所在的空白列或 gamma-line，實際 {tail_lines:?}"
-    );
+    // 對照：不給 `lines` 時應同時看得到三列，且每列都沒有行尾空白。畫面是
+    // §4.2-3 固定的 120×40，所以完整畫面是 40 列（游標停在第 4 列，之後
+    // 全是空白列）。`value.text` 是 40 列以換行接起來的字串，而
+    // `str::lines()` 對結尾的換行不產生元素，所以數到的是 39——這正是
+    // `lines=1` 取到空字串的原因。
     let full_lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        full_lines.len(),
+        39,
+        "繁中說明：完整畫面應是 PTY 的 40 列以換行接起（§4.2-3），實際 {full_lines:?}"
+    );
+    assert_eq!(
+        &full_lines[..3],
+        ["alpha-line", "beta-line", "gamma-line"],
+        "繁中說明：完整畫面前三列應依序是印出的三行，實際 {full_lines:?}"
+    );
     assert!(
-        full_lines.len() > 1,
-        "繁中說明：完整畫面應有多列，實際 {full_lines:?}"
+        full_lines.iter().all(|line| *line == line.trim_end()),
+        "繁中說明：每列都應去掉行尾空白（§4.7），實際 {full_lines:?}"
+    );
+    assert!(
+        full_lines[3..].iter().all(|line| line.is_empty()),
+        "繁中說明：游標之後的列都應是空白列，實際 {:?}",
+        &full_lines[3..]
     );
 
     // 停止後：snapshot 回最後畫面並標 live: false。
@@ -1921,6 +1937,233 @@ fn attach_stream_delivers_snapshot_then_output() {
 fn fs_write(path: &std::path::Path, contents: &str) {
     std::fs::write(path, contents)
         .unwrap_or_else(|e| panic!("繁中說明：應可寫入 {}：{e}", path.display()));
+}
+
+/// 把 instance 名稱列進設定檔的 `managers`（契約 §2 的權限來源之一）。
+///
+/// 必須在 `Daemon::start` **之前**寫：daemon 在啟動時讀一次設定。
+fn set_managers(home: &TestHome, names: &[&str]) {
+    let listed: Vec<String> = names.iter().map(|name| format!("  - {name}\n")).collect();
+    fs_write(
+        home.home.config_path(),
+        &format!("managers:\n{}", listed.concat()),
+    );
+}
+
+/// 建立一個 `running` 的 instance，回傳它的名稱。
+fn create_running(home: &TestHome, daemon: &Daemon, name: &str) -> OperationResultAlias {
+    let created = daemon.operator_call(
+        home,
+        "create_instance",
+        json!({"name": name, "command": fixture("echo_agent.sh").to_string_lossy()}),
+        None,
+    );
+    assert_eq!(
+        created.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：create {name} 應完成，實際為 {created:?}"
+    );
+    created
+}
+
+/// §4.4：被 restart 的是呼叫者自己時，daemon 先回 `queued` 再執行。
+///
+/// 呼叫端會在讀到結果之前就被自己的舊程序連同 PTY 收掉，所以結果不可能
+/// 同步回來；`queued` 是唯一誠實的答覆。新的 generation 由 `list_instances`
+/// 確認（§4.4）。
+#[test]
+fn restart_of_the_caller_itself_is_answered_queued_then_actually_runs() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+    create_running(&home, &daemon, "self-restart");
+    let generation_before = instance_generation(&home, &daemon, "self-restart");
+
+    let queued = daemon.call(
+        &home,
+        &home.instance_auth("self-restart"),
+        "restart_instance",
+        json!({"instance": "self-restart"}),
+        None,
+    );
+    assert_eq!(
+        queued.outcome,
+        otterhive::protocol::Outcome::Queued,
+        "繁中說明：restart 自己應回 queued，實際為 {queued:?}"
+    );
+    assert!(
+        queued.error.is_none(),
+        "繁中說明：queued 不是錯誤，實際為 {queued:?}"
+    );
+
+    // `queued` 之後工作真的執行了：generation 增加。
+    assert!(
+        daemon.poll_until(LONG_TIMEOUT, || {
+            instance_generation(&home, &daemon, "self-restart") > generation_before
+        }),
+        "繁中說明：queued 之後應真的以新 generation 重啟，最後為 {}",
+        instance_generation(&home, &daemon, "self-restart")
+    );
+}
+
+/// 以 `list_instances` 讀某 instance 的 generation（契約 §4.4 指定的確認方式）。
+fn instance_generation(home: &TestHome, daemon: &Daemon, name: &str) -> u64 {
+    let listed = daemon.operator_call(home, "list_instances", json!({"instance": name}), None);
+    listed.value["instances"][0]["generation"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            panic!("繁中說明：list_instances 應回 {name} 的 generation，實際為 {listed:?}")
+        })
+}
+
+/// §2 的授權矩陣（daemon 端整組）：instance 呼叫端不能 manage 任何 instance，
+/// 能 restart 自己但不能 restart 別人（除非在 `managers` 裡），也只能
+/// snapshot 自己。
+#[test]
+fn instance_caller_authorization_matrix_over_the_socket() {
+    let home = TestHome::new();
+    set_managers(&home, &["manager"]);
+    let daemon = Daemon::start(&home);
+    create_running(&home, &daemon, "worker");
+    create_running(&home, &daemon, "other");
+    create_running(&home, &daemon, "manager");
+
+    let worker = home.instance_auth("worker");
+    let manager = home.instance_auth("manager");
+    let refused = |result: &OperationResultAlias, what: &str| {
+        assert_eq!(
+            result.outcome,
+            otterhive::protocol::Outcome::Refused,
+            "繁中說明：{what} 應被拒絕，實際為 {result:?}"
+        );
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code),
+            Some(otterhive::protocol::ErrorCode::Unauthorized),
+            "繁中說明：{what} 應回 unauthorized，實際為 {result:?}"
+        );
+    };
+
+    // Manage（create／delete／start）只有 operator 做得到。
+    refused(
+        &daemon.call(
+            &home,
+            &worker,
+            "create_instance",
+            json!({"name": "sneaky", "command": fixture("echo_agent.sh").to_string_lossy()}),
+            None,
+        ),
+        "instance 呼叫 create_instance",
+    );
+    refused(
+        &daemon.call(
+            &home,
+            &worker,
+            "start_instance",
+            json!({"instance": "other"}),
+            None,
+        ),
+        "instance 呼叫 start_instance",
+    );
+    refused(
+        &daemon.call(
+            &home,
+            &worker,
+            "delete_instance",
+            json!({"instance": "other"}),
+            None,
+        ),
+        "instance 呼叫 delete_instance",
+    );
+
+    // Restart：自己可以（回 queued），別人不可以，除非在 `managers` 裡。
+    assert_eq!(
+        daemon
+            .call(
+                &home,
+                &worker,
+                "restart_instance",
+                json!({"instance": "worker"}),
+                None,
+            )
+            .outcome,
+        otterhive::protocol::Outcome::Queued,
+        "繁中說明：restart 自己應回 queued"
+    );
+    refused(
+        &daemon.call(
+            &home,
+            &worker,
+            "restart_instance",
+            json!({"instance": "other"}),
+            None,
+        ),
+        "instance 呼叫 restart 別人",
+    );
+    let restarted_other = daemon.call(
+        &home,
+        &manager,
+        "restart_instance",
+        json!({"instance": "other"}),
+        None,
+    );
+    assert_eq!(
+        restarted_other.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：manager 應能 restart 別人，實際為 {restarted_other:?}"
+    );
+
+    // PaneSnapshot：只看得到自己。
+    //
+    // 先用**過期前**的 token 固定住拒絕這件事：上一段的 self-restart 已經讓
+    // `worker` 的舊 token 失效，帶舊 token 呼叫必須是 `unauthorized`。
+    refused(
+        &daemon.call(
+            &home,
+            &worker,
+            "pane_snapshot",
+            json!({"instance": "worker"}),
+            None,
+        ),
+        "instance 帶已被換掉的舊 token 呼叫",
+    );
+
+    // `restart_instance` 換掉了 `worker` 自己的 token（每個 generation 一組），
+    // 而 restart 是回 `queued`、真正的工作在背景執行，所以磁碟上的 token
+    // 會再換一次。新 token 要等背景那次執行把 MCP 設定寫好，而它寫入的時機
+    // 又早於資料庫記錄新 token 的雜湊——所以「檔案上的 token 已經換掉」並不
+    // 保證它已被接受。以**一次真的通過認證的呼叫**為準。
+    let snapshot_of_self = || {
+        daemon.call(
+            &home,
+            &home.instance_auth("worker"),
+            "pane_snapshot",
+            json!({"instance": "worker"}),
+            None,
+        )
+    };
+    assert!(
+        daemon.poll_until(LONG_TIMEOUT, || {
+            snapshot_of_self().outcome == otterhive::protocol::Outcome::Completed
+        }),
+        "繁中說明：新 generation 的 token 應可用於認證自己並 snapshot 自己"
+    );
+
+    let own = snapshot_of_self();
+    assert_eq!(
+        own.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：instance 應能 snapshot 自己，實際為 {own:?}"
+    );
+    // 用**新** token 呼叫，確認拒絕的理由是授權而不是認證。
+    refused(
+        &daemon.call(
+            &home,
+            &home.instance_auth("worker"),
+            "pane_snapshot",
+            json!({"instance": "other"}),
+            None,
+        ),
+        "instance 呼叫 snapshot 別人",
+    );
 }
 
 /// 讀 fixture log 的第一行作為 pid。

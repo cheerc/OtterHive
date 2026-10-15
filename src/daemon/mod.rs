@@ -20,6 +20,10 @@ pub mod auth;
 pub mod lifecycle;
 pub mod recovery;
 
+use crate::procs;
+
+pub use crate::procs::stop_group;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -38,7 +42,7 @@ use crate::daemon::lifecycle::{InstanceState, SpecError, ValidatedSpec};
 use crate::daemon::recovery::RESTART_REASON;
 use crate::home::Home;
 use crate::mcp;
-use crate::procs::{process_start_time, stop_group, GroupEvidence, StopOutcome};
+use crate::procs::{process_start_time, GroupEvidence, StopOutcome};
 use crate::protocol::{
     Auth, ErrorCode, OpError, OperationResult, Outcome, Request, Subject as ResultSubject,
 };
@@ -139,8 +143,11 @@ impl DaemonState {
 /// 啟動自檢（契約 §1 的 bridge 需求與 §4.3 的 wait 前提），回 bridge 路徑。
 ///
 /// - bridge：`<otterhive 同目錄>/otterhive-mcp-bridge` 必須存在。
-/// - SIGCHLD：spawn 一個立即結束的子程序並以 `waitpid` 回收；不可 wait 就
-///   表示 §4.3 的前提不成立，daemon 拒絕啟動。
+/// - `waitid(WNOWAIT)`：spawn 一個立即結束的子程序，用
+///   `waitid(WEXITED|WNOHANG|WNOWAIT)` 取 `si_pid`，再用 `try_wait` 收掉它。
+///   §4.3 的全部前提都建立在「能觀測退出而不 reap」上，所以自檢必須走**那
+///   條路徑本身**並確認觀測到的就是剛 spawn 的子程序，不能只驗「wait 得到」
+///   ——`try_wait` 成功並不能證明 `WNOWAIT` 可用。任何一步不成立都拒絕啟動。
 pub fn check_startup(exe: &Path) -> Result<PathBuf, DaemonError> {
     let directory = exe
         .parent()
@@ -155,24 +162,49 @@ pub fn check_startup(exe: &Path) -> Result<PathBuf, DaemonError> {
     let mut probe = std::process::Command::new("/usr/bin/true")
         .spawn()
         .map_err(|spawn_error| error(format!("無法啟動 wait 自檢子程序：{spawn_error}")))?;
+    let pid = probe.id() as i32;
     let start = Instant::now();
     loop {
-        match probe.try_wait() {
-            Ok(Some(_)) => return Ok(bridge),
-            Ok(None) if start.elapsed() < Duration::from_secs(5) => {
+        match procs::waitid_si_pid(pid) {
+            // 尚無 exit 事件（si_pid == 0）→ 仍在執行，繼續等。
+            Ok(0) if start.elapsed() < Duration::from_secs(5) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) => {
+            Ok(0) => {
                 let _ = probe.kill();
                 let _ = probe.wait();
                 return Err(error(
-                    "SIGCHLD 不可 wait：無法觀測子程序退出，daemon 拒絕啟動",
+                    "SIGCHLD 不可 wait：自檢子程序始終沒有 exit 事件，daemon 拒絕啟動",
                 ));
             }
+            // 觀測到 exit，且確認是剛 spawn 的那個子程序。
+            Ok(observed) if observed == pid => break,
+            Ok(observed) => {
+                let _ = probe.wait();
+                return Err(error(format!(
+                    "waitid 觀測到非預期的 si_pid {observed}（自檢子程序是 {pid}），daemon 拒絕啟動"
+                )));
+            }
             Err(wait_error) => {
-                return Err(error(format!("wait 自檢失敗：{wait_error}")));
+                return Err(error(format!(
+                    "waitid(WEXITED|WNOHANG|WNOWAIT) 自檢失敗（errno {}）：daemon 拒絕啟動",
+                    wait_error
+                        .raw_os_error()
+                        .map_or_else(|| wait_error.to_string(), |code| code.to_string())
+                )));
             }
         }
+    }
+    match probe.try_wait() {
+        Ok(Some(_)) => Ok(bridge),
+        Ok(None) => {
+            let _ = probe.kill();
+            let _ = probe.wait();
+            Err(error(
+                "SIGCHLD 不可 wait：WNOWAIT 觀測到 exit 後仍無法 waitpid，daemon 拒絕啟動",
+            ))
+        }
+        Err(wait_error) => Err(error(format!("wait 自檢失敗：{wait_error}"))),
     }
 }
 
@@ -274,21 +306,25 @@ fn converge_on_start(store: &mut Store, tuning: &Tuning) -> Result<(), DaemonErr
     Ok(())
 }
 
-/// 執行 daemon：bind socket、處理請求，直到 SIGTERM／SIGINT。
+/// 執行 daemon：取得獨佔鎖、bind socket、處理請求，直到 SIGTERM／SIGINT。
+///
+/// 鎖的取得順序刻意排在 `Home::initialize` **之前**。initialize 會建立目錄並
+/// （在需要時）寫出 operator token；它是一次有外部可見副作用的操作，必須
+/// 由「確定自己拿得到這個 home」的那一方來做。順序顛倒會讓兩個同時啟動的
+/// daemon 都先寫完 home，第二個才在鎖上被擋下來。
 pub fn run(home_root: &Path, tuning: Tuning) -> Result<(), DaemonError> {
+    let run_dir = home_root.join("run");
+    let _lock =
+        crate::home::DaemonLock::acquire(&run_dir).map_err(|lock_error| match lock_error {
+            crate::home::LockError::AlreadyHeld => DaemonError {
+                already_running: true,
+                message: String::from("同一 home 只允許一個 daemon"),
+            },
+            other => error(format!("取得 daemon 鎖失敗：{other}")),
+        })?;
+
     let home = Home::initialize(home_root)
         .map_err(|init_error| error(format!("初始化 home 失敗：{init_error}")))?;
-    let _lock =
-        crate::home::DaemonLock::acquire(home.run_dir()).map_err(
-            |lock_error| match lock_error {
-                crate::home::LockError::AlreadyHeld => DaemonError {
-                    already_running: true,
-                    message: String::from("同一 home 只允許一個 daemon"),
-                },
-                other => error(format!("取得 daemon 鎖失敗：{other}")),
-            },
-        )?;
-
     let bridge = check_startup(&current_exe()?)?;
     let state = prepare(home_root, &bridge, tuning)?;
 
@@ -397,8 +433,104 @@ fn handle_connection(state: &DaemonState, stream: UnixStream) {
         handle_attach(state, &request, &mut reader, writer);
         return;
     }
+    // §4.4：被 restart 的是呼叫者自己時，daemon 先回 `queued` 再執行——呼叫端
+    // 會在讀到結果之前就被自己的舊程序連同 PTY 一起收掉，等結果等於等一個
+    // 永遠不會到的回應。判定在認證之後（要知道呼叫者是誰）、
+    // admission／去重之前（`queued` 本身就要走同一條回應路徑）。
+    let self_restart = matches!(request.op.as_str(), "restart_instance" | "delete_instance")
+        && targets_the_caller(state, &request)
+        && !operation_is_recorded(state, &request);
+    if self_restart {
+        let operation_id = request
+            .operation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let subject = caller_subject(state, &request.auth);
+        let _ = write_result(
+            &mut writer,
+            &OperationResult {
+                operation_id,
+                outcome: Outcome::Queued,
+                subject,
+                value: json!({"reason": "self_restart"}),
+                effects: Vec::new(),
+                error: None,
+            },
+        );
+    }
     let result = dispatch(state, &request);
+    if self_restart {
+        // 真正的工作在背景執行：self-restart 的呼叫端隨時會死掉，絕不能把
+        // 它的回應掛在 socket 上等。是否成功由新程序以 `list_instances` 確認
+        // （§4.4）。
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch(&state, &request);
+            }));
+        });
+        return;
+    }
     let _ = write_result(&mut writer, &result);
+}
+
+/// 請求的目標 instance 就是認證後的呼叫者本人（§2 的「自己」）。
+fn targets_the_caller(state: &DaemonState, request: &Request) -> bool {
+    let Ok(caller) = authenticate(state, &request.auth) else {
+        return false;
+    };
+    let Ok(instance) = require_target(request) else {
+        return false;
+    };
+    caller
+        .instance_id()
+        .is_some_and(|id| instance == caller_name_of(state, id))
+}
+
+/// 該 `operation_id` 是不是已被記錄的（不論是哪個呼叫端）。
+///
+/// §3 的跨 caller 去重必須在 `queued` 之前生效：重用別人用過的
+/// operation_id 必須回 `invalid_argument`，不能因為目標是呼叫者自己就先回
+/// `queued`——那會把「這次呼叫根本無效」講成「已排程」。
+fn operation_is_recorded(state: &DaemonState, request: &Request) -> bool {
+    let Some(operation_id) = request.operation_id.as_ref() else {
+        return false;
+    };
+    state
+        .lock()
+        .store
+        .recorded_operation(operation_id)
+        .unwrap_or(None)
+        .is_some()
+}
+
+/// `args.instance` 的 instance 名稱（沒有或不是字串回 `Err`）。
+fn require_target(request: &Request) -> Result<String, ()> {
+    request
+        .args
+        .get("instance")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(())
+}
+
+fn caller_name_of(state: &DaemonState, instance_id: &str) -> String {
+    state
+        .lock()
+        .store
+        .instance(instance_id)
+        .unwrap_or(None)
+        .map(|row| row.name)
+        .unwrap_or_default()
+}
+
+/// 認證並取回呼叫端的 subject（`queued` 回應要帶 `subject`；認證失敗回
+/// `None`，真正的錯誤由後續 `dispatch` 回報）。
+fn caller_subject(state: &DaemonState, request_auth: &Auth) -> Option<ResultSubject> {
+    let caller = authenticate(state, request_auth).ok()?;
+    let id = caller.instance_id()?;
+    let row = state.lock().store.instance(id).unwrap_or(None)?;
+    Some(subject_of(&row))
 }
 
 fn write_result(writer: &mut UnixStream, result: &OperationResult) -> std::io::Result<()> {
@@ -602,7 +734,14 @@ fn require_permission(
 
 /// 佔住 instance 的 lifecycle 鎖（同一 instance 一次一個）。
 ///
-/// 逾時的鎖視為失效（daemon 崩潰後的殘留），否則操作會永久被鎖死。
+/// 逾期（`BUSY_TIMEOUT`）的鎖視為失效——否則 daemon 崩潰後操作會永久被鎖死。
+/// 但**失效的鎖絕不自動放行**：那個持有者可能只是還在跑（只是比預期久）。
+/// 自動放行等於讓兩個 lifecycle 操作同時作用在同一個 instance 上，而契約
+/// §4.3 的證據式前提（同一把 lifecycle 鎖內的驗證／signal／reap）正是靠這
+/// 把鎖成立的。逾時因此回 `internal`，把它變成需要人看的狀態，而不是被
+/// daemon 自己悄悄蓋掉。
+const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn acquire_busy(
     state: &DaemonState,
     operation_id: &str,
@@ -610,13 +749,25 @@ fn acquire_busy(
 ) -> Result<(), Box<OperationResult>> {
     let mut inner = state.lock();
     if let Some(since) = inner.busy.get(name) {
-        if since.elapsed() < Duration::from_secs(120) {
+        if since.elapsed() < BUSY_TIMEOUT {
             return Err(Box::new(OperationResult::refused(
                 operation_id,
                 ErrorCode::OperationInProgress,
                 "此 instance 已有進行中的生命週期操作",
             )));
         }
+        // 逾期：撤掉這把殘留的鎖（它已經沒有合法的持有者），但本次操作
+        // 仍然拒絕——見 `BUSY_TIMEOUT` 的說明。
+        inner.busy.remove(name);
+        return Err(Box::new(OperationResult::refused(
+            operation_id,
+            ErrorCode::Internal,
+            &format!(
+                "此 instance 的生命週期鎖已逾期（{} 秒）仍被持有，daemon 已撤掉殘留鎖；\
+                 請確認沒有殘留程序後重試",
+                BUSY_TIMEOUT.as_secs()
+            ),
+        )));
     }
     inner.busy.insert(name.to_owned(), Instant::now());
     Ok(())
@@ -1223,6 +1374,24 @@ fn start_existing(state: &DaemonState, operation_id: &str, name: &str) -> Operat
                 "此 instance 需人工確認殘留程序後才能重啟",
             );
         }
+        // 不在契約列舉內的狀態：不 spawn、不發任何 signal，直接標
+        // `recovery_required`。猜成 `stopped` 會在沒有確認任何事的情況下改變
+        // 一個身分不明的 instance 的處境；猜成可 start 同理。
+        InstanceState::Unknown => {
+            let mut inner = state.lock();
+            let _ = inner
+                .store
+                .transaction(|tx| tx.set_lifecycle_state(&row.id, "recovery_required", None));
+            return OperationResult::refused(
+                operation_id,
+                ErrorCode::RecoveryRequired,
+                &format!(
+                    "此 instance 的狀態 {:?} 不在契約列舉內，已標為 recovery_required；\
+                     不 spawn、不發 signal",
+                    row.state
+                ),
+            );
+        }
         InstanceState::Stopped | InstanceState::Failed => {}
     }
 
@@ -1232,14 +1401,12 @@ fn start_existing(state: &DaemonState, operation_id: &str, name: &str) -> Operat
         match stop_previous(state, &row) {
             PreviousOutcome::Stopped => effects.push(String::from("process_stopped")),
             PreviousOutcome::Gone => {}
-            PreviousOutcome::Unproven => {
-                let mut inner = state.lock();
-                let _ = inner
-                    .store
-                    .transaction(|tx| tx.set_lifecycle_state(&row.id, "recovery_required", None));
-                return OperationResult::refused(
+            PreviousOutcome::Unproven { residual_pids } => {
+                return recovery_required(
+                    state,
+                    &row,
                     operation_id,
-                    ErrorCode::RecoveryRequired,
+                    &residual_pids,
                     "無法確認前一代程序已停止，不啟動新程序",
                 );
             }
@@ -1320,7 +1487,10 @@ fn finish_spawn(
 enum PreviousOutcome {
     Stopped,
     Gone,
-    Unproven,
+    /// 無法確認停止（殘留 pid 一併回報，契約 §4.3-3）。
+    Unproven {
+        residual_pids: Vec<i32>,
+    },
 }
 
 /// 依 §4.3 停止前一 generation 的程序。
@@ -1343,6 +1513,10 @@ fn stop_previous(state: &DaemonState, row: &InstanceRow) -> PreviousOutcome {
             state.tuning.stop_term,
             state.tuning.stop_kill,
         );
+        let residual_pids = match &outcome {
+            StopOutcome::Unproven { residual_pids } => residual_pids.clone(),
+            StopOutcome::Stopped { .. } | StopOutcome::IdentityMismatch => Vec::new(),
+        };
         if matches!(outcome, StopOutcome::Stopped { .. }) {
             // 停止成功：在同一 lifecycle 鎖區塊內標記 Child 已釋放。
             session.mark_child_released();
@@ -1352,14 +1526,16 @@ fn stop_previous(state: &DaemonState, row: &InstanceRow) -> PreviousOutcome {
             let detached_before = crate::terminal::session::detached_threads();
             drop(session);
             if crate::terminal::session::detached_threads() > detached_before {
-                return PreviousOutcome::Unproven;
+                return PreviousOutcome::Unproven {
+                    residual_pids: vec![pid],
+                };
             }
         } else {
             drop(session);
         }
         return match outcome {
             StopOutcome::Stopped { .. } => PreviousOutcome::Stopped,
-            _ => PreviousOutcome::Unproven,
+            _ => PreviousOutcome::Unproven { residual_pids },
         };
     }
     // 只有歷史紀錄（daemon 重啟後）：身分相符才可停止（§4.3-1）。
@@ -1373,12 +1549,41 @@ fn stop_previous(state: &DaemonState, row: &InstanceRow) -> PreviousOutcome {
                 state.tuning.stop_kill,
             ) {
                 StopOutcome::Stopped { .. } => PreviousOutcome::Stopped,
-                _ => PreviousOutcome::Unproven,
+                StopOutcome::Unproven { residual_pids } => {
+                    PreviousOutcome::Unproven { residual_pids }
+                }
+                StopOutcome::IdentityMismatch => PreviousOutcome::Unproven {
+                    residual_pids: vec![pid],
+                },
             }
         }
-        Some(_) => PreviousOutcome::Unproven,
+        // 身分不符：連 start time 都對不上，無法確認是同一個程序，但也不能
+        // 說它不存在——回報該 pid 讓人判斷。
+        Some(_) => PreviousOutcome::Unproven {
+            residual_pids: vec![pid],
+        },
         None => PreviousOutcome::Gone,
     }
+}
+
+/// 把「停止無法確認」變成結果：標記 `recovery_required` 並回報殘留 pid
+/// （契約 §4.3-3、§4.4）。
+fn recovery_required(
+    state: &DaemonState,
+    row: &InstanceRow,
+    operation_id: &str,
+    residual_pids: &[i32],
+    message: &str,
+) -> OperationResult {
+    {
+        let mut inner = state.lock();
+        let _ = inner
+            .store
+            .transaction(|tx| tx.set_lifecycle_state(&row.id, "recovery_required", None));
+    }
+    let mut refused = OperationResult::refused(operation_id, ErrorCode::RecoveryRequired, message);
+    refused.value = json!({ "residual_pids": residual_pids });
+    refused
 }
 
 /// 由 SQLite 的 spec JSON 重建規格（start／restart 用）。
@@ -1431,14 +1636,12 @@ fn delete_instance(
             match stop_previous(state, &row) {
                 PreviousOutcome::Stopped => effects.push(String::from("process_stopped")),
                 PreviousOutcome::Gone => {}
-                PreviousOutcome::Unproven => {
-                    let mut inner = state.lock();
-                    let _ = inner.store.transaction(|tx| {
-                        tx.set_lifecycle_state(&row.id, "recovery_required", None)
-                    });
-                    return OperationResult::refused(
+                PreviousOutcome::Unproven { residual_pids } => {
+                    return recovery_required(
+                        state,
+                        &row,
                         operation_id,
-                        ErrorCode::RecoveryRequired,
+                        &residual_pids,
                         "無法確認程序已停止，不刪除",
                     );
                 }
@@ -1561,10 +1764,12 @@ fn restart_instance(
             match stop_previous(state, &row) {
                 PreviousOutcome::Stopped => effects.push(String::from("process_stopped")),
                 PreviousOutcome::Gone => {}
-                PreviousOutcome::Unproven => {
-                    return OperationResult::refused(
+                PreviousOutcome::Unproven { residual_pids } => {
+                    return recovery_required(
+                        state,
+                        &row,
                         operation_id,
-                        ErrorCode::RecoveryRequired,
+                        &residual_pids,
                         "無法確認舊程序已停止，不 spawn",
                     );
                 }

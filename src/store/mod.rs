@@ -396,11 +396,23 @@ impl Tx<'_> {
         id: &str,
         workdir: &str,
     ) -> Result<bool, StoreError> {
+        // 契約 §5.4 判定的是「同一個 **canonical** working directory」。
+        // 呼叫端已把路徑正規化，但正規化只做一次、資料可能是更早寫入的：這裡
+        // 再比一次 `canonicalize` 後的路徑，`/var` 與 `/private/var` 才不會被
+        // 當成兩個目錄。
+        //
+        // `json_extract` 對不是合法 JSON 的 spec 回 NULL，因此比較結果是
+        // NULL（不等於 `?1`）——壞資料不會被當成「共用了目錄」。
+        let canonical = match std::fs::canonicalize(workdir) {
+            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+            // 目錄已經不存在：只能照原樣比。
+            Err(_) => workdir.to_owned(),
+        };
         self.connection
             .query_row(
                 "SELECT 1 FROM instances WHERE id != ?1 AND deleted_ms IS NULL \
                  AND json_extract(spec, '$.working_directory') = ?2 LIMIT 1",
-                params![id, workdir],
+                params![id, canonical],
                 |_| Ok(()),
             )
             .optional()

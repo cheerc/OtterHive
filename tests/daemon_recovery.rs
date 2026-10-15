@@ -263,6 +263,51 @@ mod support {
         info.si_pid == 0
     }
 
+    /// 該 pid 的程序狀態（macOS `proc_bsdinfo.pbi_status`，`SZOMB` = 5）。
+    ///
+    /// 這是**本測試行程**對該 pid 的直接觀測；daemon 之後能不能收斂，取決於
+    /// 它自己以 `RecordedLeader` 走 `stop_group` 時讀到什麼。
+    pub fn proc_state(pid: i32) -> &'static str {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return "gone";
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if ret != size {
+            return "unqueryable";
+        }
+        match info.pbi_status as u32 {
+            libc::SZOMB => "zombie",
+            libc::SRUN | libc::SSLEEP => "running",
+            _ => "other",
+        }
+    }
+
+    /// 該 instance 記錄的 pid 的程序狀態。
+    ///
+    /// pid 可能已經被清掉（daemon 順利收斂過），那時沒有程序紀錄可比對；
+    /// 這時仍以 `proc_state` 直接觀察該 pid（測試行程在 `create` 的回應裡
+    /// 拿到了它）。
+    pub fn proc_state_of(pid: i32) -> &'static str {
+        proc_state(pid)
+    }
+
+    /// 讀 fixture 寫出的 pid 檔。
+    pub fn read_pid_file(path: &str) -> Option<i32> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+    }
+
     pub fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
         loop {
@@ -274,6 +319,23 @@ mod support {
             }
             std::thread::sleep(POLL_STEP);
         }
+    }
+
+    /// 啟動自檢所用的觀測：`waitid(WNOWAIT)` 回傳**該 pid** 才算觀測到
+    /// exit 事件。daemon 的自檢刻意**不**呼叫 `try_wait`——只靠 `try_wait`
+    /// 成功並不能證明 `WNOWAIT` 可用，而 `WNOWAIT` 才是 §4.3 的前提。
+    pub fn observe_exit_without_reaping(pid: i32) -> bool {
+        matches!(
+            otterhive::procs::waitid_si_pid(pid),
+            Ok(observed) if observed == pid
+        )
+    }
+
+    /// 自己的子程序：確認 `WNOWAIT` 可重複觀測同一個 exit 事件。
+    pub fn spawn_probe() -> std::process::Child {
+        std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("繁中說明：自檢子程序應可啟動")
     }
 
     /// SQLite 的 instance 列：(pid, pid_start, state, generation)。
@@ -468,6 +530,32 @@ fn daemon_reaps_its_exited_children() {
     );
 }
 
+/// 啟動自檢必須走 `waitid(WEXITED|WNOHANG|WNOWAIT)` 這條觀測路徑本身，
+/// 而不只是「wait 得到」——§4.3 的全部前提都建立在「能觀測退出而不 reap」
+/// 上，`try_wait` 成功證明不了這件事（它本身就是會 reap 的那條路徑）。
+#[test]
+fn startup_self_check_uses_waitid_wnowait_on_its_own_child() {
+    let mut probe = spawn_probe();
+    let pid = probe.id() as i32;
+    assert!(
+        poll_until(LONG_TIMEOUT, || observe_exit_without_reaping(pid)),
+        "繁中說明：waitid(WNOWAIT) 應觀測到自檢子程序 {pid} 的 exit 事件"
+    );
+    // 觀測是**不 reap**：`WNOWAIT` 之下同一個 exit 事件可以被觀測第二次。
+    assert!(
+        observe_exit_without_reaping(pid),
+        "繁中說明：WNOWAIT 觀測不得 reap，第二次觀測仍應看到同一個 exit 事件"
+    );
+    // 而它仍是本程序可 wait 的 child（自檢最後一步 `try_wait` 的前提）。
+    assert!(
+        probe
+            .try_wait()
+            .expect("繁中說明：WNOWAIT 觀測後仍應可 wait")
+            .is_some(),
+        "繁中說明：觀測 exit 後 try_wait 應回 Some（自檢的最後一步）"
+    );
+}
+
 /// daemon 重啟後對殘留程序收斂：仍存活的程序被停止、狀態為 `stopped`
 /// （原因 `daemon_restarted`）（契約 §4.6）。
 #[test]
@@ -535,6 +623,73 @@ fn daemon_restart_stops_lingering_processes() {
         json!("no_screen"),
         "繁中說明：daemon 重啟後應回 reason:no_screen，實際：{}",
         snapshot["value"]
+    );
+}
+
+/// §4.6 的「孤兒 zombie」：daemon 結束時 leader 已經退出、留下**沒有任何
+/// 存活成員**的 group。重啟後的收斂應把這視為「停止已成立」（§4.3-3）並
+/// 收斂為 `stopped`，而不是因為無法確認而永久停在 `recovery_required`。
+///
+/// 這是本 daemon **不是**那個 zombie 的父程序（`waitid` 必然回 ECHILD、
+/// `pbi_status` 明確是 `SZOMB`）的情況——舊的 guardrail 正是把這裡判成
+/// `Unproven`，於是每次 daemon 崩潰都會把已經死掉的 instance 永久卡住。
+#[test]
+fn daemon_restart_converges_an_orphan_zombie_leader() {
+    let home = TestHome::new();
+    let mut first = Daemon::start(&home);
+
+    // leader 在寬限期內結束、留下同 group 的子程序；daemon 的 §4.2-5 清理
+    // 會把那個子程序收掉，於是 group 只剩 leader 自己。leader 把自己的 pid
+    // 寫進 home（`failed` 路徑會清掉 SQLite 的 pid 紀錄，所以 pid 從這裡拿）。
+    let leader_pid = format!("{}/orphan-zombie.pid", home.home.root().display());
+    let created = operator_call(
+        &home,
+        "create_instance",
+        json!({
+            "name": "orphan-zombie",
+            "command": fixture("spawns_child.sh").to_string_lossy(),
+            "env": {
+                "FIXTURE_LEADER_EXIT_AFTER_MS": "50",
+                "FIXTURE_LEADER_PID_FILE": leader_pid,
+            },
+        }),
+    );
+    assert_eq!(
+        created["outcome"],
+        json!("refused"),
+        "繁中說明：寬限期內 leader 結束應回 refused，實際：{created}"
+    );
+    let pid = read_pid_file(&leader_pid)
+        .unwrap_or_else(|| panic!("繁中說明：fixture 應把 leader pid 寫進 {leader_pid}"));
+    assert!(
+        poll_until(LONG_TIMEOUT, || !pid_running(pid)),
+        "繁中說明：前提：leader 應已退出且被收乾淨（pid {pid} 不應再活著）"
+    );
+
+    // 停止 daemon。此時記憶體裡的 group 已空，沒有留下任何子程序。
+    let (code, ..) = first.stop_and_wait();
+    assert_eq!(
+        code,
+        Some(0),
+        "繁中說明：daemon 應正常結束，實際 exit={code:?}"
+    );
+    // 前提檢查：這個 pid 要嘛是沒有存活成員的孤兒 zombie，要嘛已經被 init
+    // 回收。父程序是已結束的 daemon，init(1) 接手後會立刻 reap，所以不能
+    // 要求它一定是 zombie——那取決於競速，不是這條規則。
+    let observed = proc_state_of(pid);
+    assert!(
+        matches!(observed, "zombie" | "gone"),
+        "繁中說明：重啟前的程序狀態應為 zombie（孤兒）或 gone（init 已回收），\
+         實際為 {observed:?}"
+    );
+
+    // 重啟 daemon：收斂應以 §4.3-3 的判準（group 除已退出的 leader 外沒有
+    // 成員）判定停止已成立 → `stopped`。
+    let _second = Daemon::start(&home);
+    assert!(
+        wait_state(&home, "orphan-zombie", "stopped"),
+        "繁中說明：孤兒 zombie 的收斂應為 stopped，最後為 {:?}",
+        instance_row(&home, "orphan-zombie")
     );
 }
 

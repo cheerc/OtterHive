@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 /// 一個 instance 的 lifecycle 狀態（契約 §4.1）。
+///
+/// `Unknown` 不是可持續的狀態，而是「資料庫裡的值不在契約列舉內」。它必須
+/// 與 `Stopped` 分開：把壞資料當成 `Stopped` 會讓 `start` 直接 spawn 新程序，
+/// 等於在沒有確認任何事的情況下改變一個身分不明的 instance 的處境。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceState {
     Stopped,
@@ -17,6 +21,8 @@ pub enum InstanceState {
     /// 附原因（`exited_during_startup`／`exec_failed`／`exited`／`daemon_restarted`）。
     Failed,
     RecoveryRequired,
+    /// 不在契約列舉內的 `instances.state` 值（壞資料或未來版本寫入）。
+    Unknown,
 }
 
 impl InstanceState {
@@ -29,21 +35,23 @@ impl InstanceState {
             InstanceState::Stopping => "stopping",
             InstanceState::Failed => "failed",
             InstanceState::RecoveryRequired => "recovery_required",
+            InstanceState::Unknown => "unknown",
         }
     }
 
-    /// 由 SQLite 的字串解析（未知值視為 `stopped`，不讓壞資料讓 daemon 崩潰）。
+    /// 由 SQLite 的字串解析。**未知值回 `Unknown`**，不猜成 `stopped`。
     ///
     /// 刻意不實作 `FromStr`：這不是會失敗的解析（未知值有明確的退路），
     /// 命名 `from_state` 以免被誤認為標準的 `from_str`。
     pub fn from_state(value: &str) -> Self {
         match value {
+            "stopped" => InstanceState::Stopped,
             "starting" => InstanceState::Starting,
             "running" => InstanceState::Running,
             "stopping" => InstanceState::Stopping,
             "failed" => InstanceState::Failed,
             "recovery_required" => InstanceState::RecoveryRequired,
-            _ => InstanceState::Stopped,
+            _ => InstanceState::Unknown,
         }
     }
 }
@@ -204,7 +212,16 @@ pub fn validate_spec(args: &Value, home: &Path) -> Result<ValidatedSpec, SpecErr
                     "working_directory 必須是目錄：{raw}"
                 )));
             }
-            path
+            // 正規化（§5.4）：`--continue` 接續的是「該目錄最新的 session」，
+            // 所以 §5.4 的「同一個 canonical working directory」判定必須用
+            // 正規化後的路徑。否則 `/var` 與 `/private/var`（macOS 的
+            // `/var` → `/private/var` 連結）會被當成兩個目錄，讓共用目錄的
+            // `resume_unavailable` 判定失效。
+            std::fs::canonicalize(&path).map_err(|canonical_error| {
+                SpecError::InvalidArgument(format!(
+                    "working_directory 無法正規化（{raw}）：{canonical_error}"
+                ))
+            })?
         }
         Some(_) => {
             return Err(SpecError::InvalidArgument(String::from(
