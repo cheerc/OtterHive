@@ -435,8 +435,7 @@ fn daemon_reaps_its_exited_children() {
     let created = operator_call(
         &home,
         "create_instance",
-        json!({"name": "crashy", "backend": "command",
-               "command": fixture("crash_on_start.sh").to_string_lossy()}),
+        json!({"name": "crashy", "command": fixture("crash_on_start.sh").to_string_lossy()}),
     );
     assert_eq!(
         created["outcome"],
@@ -467,8 +466,10 @@ fn daemon_restart_stops_lingering_processes() {
     let created = operator_call(
         &home,
         "create_instance",
-        json!({"name": "lingering", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        // `spawns_child.sh` 忽略 SIGHUP：daemon 結束時 PTY master 關閉會讓子程序
+        // 收到 SIGHUP，`echo_agent.sh` 會隨之退出——那樣就沒有「殘留程序」可供
+        // 重啟收斂。忽略 SIGHUP 才能真的模擬「daemon 崩潰／結束後程序仍在」。
+        json!({"name": "lingering", "command": fixture("spawns_child.sh").to_string_lossy()}),
     );
     assert_eq!(
         created["outcome"],
@@ -480,11 +481,13 @@ fn daemon_restart_stops_lingering_processes() {
     assert!(pid_running(pid), "繁中說明：前提：程序 {pid} 應在運行");
 
     // 停止 daemon（不經 stop_group，模擬 daemon 崩潰後程序仍留著）。
+    // daemon 收到 SIGTERM 後正常結束（exit 0）才是預期；重點是「確實結束」
+    // 且「結束時未經 stop_group」，讓程序留下來供重啟收斂。
     let (code, ..) = first.stop_and_wait();
-    assert_ne!(
+    assert_eq!(
         code,
         Some(0),
-        "繁中說明：daemon 應已結束，實際 exit={code:?}"
+        "繁中說明：daemon 應正常結束，實際 exit={code:?}"
     );
     assert!(
         pid_running(pid),
@@ -533,8 +536,7 @@ fn existing_recovery_required_is_not_cleared_by_restart() {
     let created = operator_call(
         &home,
         "create_instance",
-        json!({"name": "stuck", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "stuck", "command": fixture("spawns_child.sh").to_string_lossy()}),
     );
     assert_eq!(
         created["outcome"],
@@ -547,7 +549,11 @@ fn existing_recovery_required_is_not_cleared_by_restart() {
     // 直接把狀態設為 recovery_required（模擬先前無法確認停止）。
     force_state(&home, "stuck", "recovery_required", "cleanup_unproven");
     let (code, ..) = first.stop_and_wait();
-    assert_ne!(code, Some(0), "繁中說明：daemon 應已結束");
+    assert_eq!(
+        code,
+        Some(0),
+        "繁中說明：daemon 應正常結束，實際 exit={code:?}"
+    );
 
     let _second = Daemon::start(&home);
     // 不應被自動重新啟動，也不應變回 stopped／running。

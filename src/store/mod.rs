@@ -250,6 +250,187 @@ impl Tx<'_> {
             .ok_or_else(|| StoreError::Invalid(format!("新建的 instance 查不到: {id}")))
     }
 
+    /// 更新 lifecycle 狀態與原因（契約 §4.1 的狀態機）。
+    ///
+    /// `state` 為契約定義的字串（`stopped`／`starting`／`running`／
+    /// `stopping`／`failed`／`recovery_required`）；`reason` 為附帶原因
+    /// （`exited_during_startup`／`exec_failed`／`exited`／`daemon_restarted`），
+    /// 無原因時傳 `None` 以清空。instance 不存在時回 [`StoreError::Invalid`]。
+    pub fn set_lifecycle_state(
+        &self,
+        id: &str,
+        state: &str,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if self.instance(id)?.is_none() {
+            return Err(StoreError::Invalid(format!("instance 不存在: {id}")));
+        }
+        let changed = self.connection.execute(
+            "UPDATE instances SET state = ?2, reason = ?3, updated_ms = ?4 WHERE id = ?1",
+            params![id, state, reason, now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Invalid(format!(
+                "設定 lifecycle 狀態未影響任何列: {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 記錄本 generation 的程序紀錄與 token 雜湊（契約 §4.2-3）。
+    ///
+    /// 只在 spawn 成功後呼叫；與 `set_lifecycle_state` 分開，讓「程序已存在」
+    /// 與「程序已確認停止」兩件事在資料庫上可分別觀察。
+    pub fn record_process(
+        &self,
+        id: &str,
+        pid: i32,
+        pid_start: u64,
+        token_hash: &str,
+    ) -> Result<(), StoreError> {
+        if self.instance(id)?.is_none() {
+            return Err(StoreError::Invalid(format!("instance 不存在: {id}")));
+        }
+        let changed = self.connection.execute(
+            "UPDATE instances SET pid = ?2, pid_start = ?3, token_hash = ?4, updated_ms = ?5 \
+             WHERE id = ?1",
+            params![id, pid as i64, pid_start as i64, token_hash, now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Invalid(format!(
+                "記錄程序紀錄未影響任何列: {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 清掉程序紀錄（停止已確認、spawn 失敗或 delete 後）。
+    ///
+    /// 同時清掉 `token_hash`：舊 generation 的 token 一律失效（契約 §2）。
+    pub fn clear_process(&self, id: &str) -> Result<(), StoreError> {
+        if self.instance(id)?.is_none() {
+            return Err(StoreError::Invalid(format!("instance 不存在: {id}")));
+        }
+        let changed = self.connection.execute(
+            "UPDATE instances SET pid = NULL, pid_start = NULL, token_hash = NULL, \
+             updated_ms = ?2 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Invalid(format!(
+                "清除程序紀錄未影響任何列: {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 依名稱查 instance，**包含已刪除的歷史列**。
+    ///
+    /// 只用於契約 §2 的名稱重用判斷（「同名新 instance 取得新的
+    /// `InstanceId`」）與重啟收斂的歷史紀錄查核；是否為 live 請看
+    /// `deleted_ms`。
+    pub fn instance_by_name(&self, name: &str) -> Result<Option<InstanceRow>, StoreError> {
+        self.connection
+            .query_row(
+                &instance_query("name = ?1 ORDER BY created_ms DESC LIMIT 1"),
+                params![name],
+                read_instance_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 列出所有尚未刪除的 instance（契約 §4.7 的 `list_instances` 與 §4.6 的
+    /// 重啟收斂都需要）。
+    pub fn all_live_instances(&self) -> Result<Vec<InstanceRow>, StoreError> {
+        let mut statement = self.connection.prepare(&instance_query(
+            "deleted_ms IS NULL ORDER BY created_ms ASC",
+        ))?;
+        let rows = statement.query_map([], read_instance_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// 依 token 雜湊查尚未刪除的 instance（契約 §2 的 instance 認證：
+    /// 舊 generation 的 token 因 `token_hash` 被覆寫而自然失效）。
+    pub fn live_instance_by_token_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<InstanceRow>, StoreError> {
+        self.connection
+            .query_row(
+                &instance_query("token_hash = ?1 AND deleted_ms IS NULL"),
+                params![hash],
+                read_instance_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 依名稱查 instance 所屬的 team 與該 team 的 orchestrator 名稱
+    /// （契約 §2：orchestrator 對自己 team 的成員有 interrupt／snapshot 權限）。
+    ///
+    /// 未屬任何 team 時回 `None`。
+    pub fn team_of_instance_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT teams.name, (SELECT i.name FROM instances i WHERE i.id = teams.orchestrator_id) \
+                 FROM team_members JOIN teams ON teams.name = team_members.team \
+                 JOIN instances ON instances.id = team_members.instance_id \
+                 WHERE instances.name = ?1 AND instances.deleted_ms IS NULL",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// 是否存在**其他**未刪除的 instance 使用同一 `working_directory`
+    /// （契約 §5.4：`--continue` 接續的是該目錄最新的 session，不分 instance，
+    /// 因此共享 working directory 時 `resume` 回 `resume_unavailable`）。
+    pub fn other_instances_using_workdir(
+        &self,
+        id: &str,
+        workdir: &str,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM instances WHERE id != ?1 AND deleted_ms IS NULL \
+                 AND json_extract(spec, '$.working_directory') = ?2 LIMIT 1",
+                params![id, workdir],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(StoreError::from)
+    }
+
+    /// 將某 instance 的未讀／發送中訊息封存（契約 §4.5 delete：訊息改為
+    /// `archived`，不再可 drain）。
+    pub fn archive_messages(&self, id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE messages SET state = 'archived' WHERE recipient_id = ?1 \
+             AND state IN ('unread', 'delivering')",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// 寫入 journal（契約 §5.1 的 `skills_link_created` 需要 instance ID、
+    /// link 路徑與 target）。
+    pub fn append_public_journal(
+        &self,
+        instance_id: &str,
+        generation: u64,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        self.append_journal(Some(instance_id), Some(generation), kind, Some(detail))
+    }
+
     /// 標記 instance 已刪除（契約 §4.5）；列本身保留以維持歷史與名稱重用規則。
     pub fn mark_instance_deleted(&self, id: &str) -> Result<(), StoreError> {
         let now = now_ms();

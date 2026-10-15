@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use otterhive::cli::{self, Parsed};
 use otterhive::client::{self, CallOptions};
@@ -88,25 +88,18 @@ fn run_call(home: Option<&std::path::Path>, op: &str, args: Value) -> ExitCode {
 
 /// `otterhive daemon`：前景執行 daemon。
 ///
-/// daemon 的 socket 服務屬 Lane A；尚未實作時以 stderr 的
-/// `unsupported_in_phase` JSON 與 exit 4 結束，語意是「這期還沒做」而不是
-/// 「啟動失敗」。
+/// daemon 本體由 Lane A 的 `otterhive::daemon` 提供（契約 §1、§3、§4、§7
+/// daemon 端）：socket 服務、單一 home 單一 daemon、啟動自檢、lifecycle 與
+/// attach frame 串流。`run_daemon` 只是薄封裝——把 CLI 已解析的 `--home`
+/// 交給 daemon 端；`--home` 優先於 `OTTERHIVE_HOME`，`None` 才由 daemon 端
+/// 讀環境變數（契約 §9）。
+///
+/// 退出碼由 daemon 端決定：第二個 daemon 為 `3` ＋ stderr 一行
+/// `daemon_already_running` JSON（契約 §1）；啟動自檢（bridge 同目錄、
+/// SIGCHLD 可 wait）失敗或設定檔無效為 `1`。自檢是 fail-closed 的，沒有任何
+/// 環境變數可以跳過它。
 fn run_daemon(home: Option<&std::path::Path>) -> ExitCode {
-    let resolved = resolve_home(home);
-    let message = match &resolved {
-        Some(home) => format!(
-            "daemon 尚未實作（T4 Lane A）；目標 home：{}",
-            home.display()
-        ),
-        None => "daemon 尚未實作（T4 Lane A）；且未設定 OTTERHIVE_HOME 或 --home".to_owned(),
-    };
-    let failure = local_failure(ErrorCode::UnsupportedInPhase, &message);
-    let _ = writeln!(
-        std::io::stderr(),
-        "{}",
-        serde_json::to_string(&failure).unwrap_or_else(|_| json!({}).to_string())
-    );
-    ExitCode::from(cli::exit_code::UNSUPPORTED as u8)
+    otterhive::daemon::main_run(home.map(std::path::Path::to_path_buf))
 }
 
 /// 把結果以一行 JSON 印到 stdout，並依 outcome 回 exit code。

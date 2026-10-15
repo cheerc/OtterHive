@@ -17,6 +17,7 @@ log="${OTTERHIVE_FIXTURE_LOG:-/dev/null}"
 mcp_dump="${OTTERHIVE_FIXTURE_MCP:-/dev/null}"
 prompt_dump="${OTTERHIVE_FIXTURE_PROMPT:-/dev/null}"
 env_dump="${OTTERHIVE_FIXTURE_ENV:-/dev/null}"
+term_dump="${OTTERHIVE_FIXTURE_TERM:-/dev/null}"
 resume_dump="${OTTERHIVE_FIXTURE_RESUME:-/dev/null}"
 
 : >"$log"
@@ -26,8 +27,10 @@ for arg in "$@"; do
     printf '%s\n' "$arg" >>"$log"
 done
 
-# 環境變數名稱（不含值）寫入 env dump。
+# 環境變數名稱（不含值）寫入 env dump；TERM 的實際值另存一份，供測試驗
+# §5.3 要求的 `TERM=xterm-256color`（名稱 dump 看得到「有 TERM」但看不到值）。
 env | sed 's/=.*//' | sort >"$env_dump"
+printf '%s\n' "${TERM:-}" >"$term_dump"
 
 # 取出 --mcp-config / --append-system-prompt-file 的檔案內容。
 previous=""

@@ -133,7 +133,11 @@ mod support {
             daemon
         }
 
-        pub fn call(
+        pub fn call(&self, home: &TestHome, auth: &Auth, op: &str, args: Value) -> OperationResult {
+            self.call_with_id(home, auth, op, args, None)
+        }
+
+        pub fn call_with_id(
             &self,
             home: &TestHome,
             auth: &Auth,
@@ -169,7 +173,7 @@ mod support {
 
         pub fn operator_call(&self, home: &TestHome, op: &str, args: Value) -> OperationResult {
             let auth = home.operator();
-            self.call(home, &auth, op, args, None)
+            self.call_with_id(home, &auth, op, args, None)
         }
     }
 
@@ -244,6 +248,7 @@ fn claude_argv_order_matches_the_contract() {
         "create_instance",
         serde_json::json!({
             "name": "argv-check",
+                "command": fixture("fake_claude.sh").to_string_lossy(),
             "model": "test-model",
             "effort": "high",
             "args": ["--custom-flag", "custom-value"],
@@ -326,6 +331,7 @@ fn coordination_prompt_contains_name_and_instructions() {
         "create_instance",
         serde_json::json!({
             "name": "prompted",
+                "command": fixture("fake_claude.sh").to_string_lossy(),
             "instructions": instructions.to_string_lossy(),
             "env": {"OTTERHIVE_FIXTURE_PROMPT": prompt_dump.to_string_lossy()},
         }),
@@ -377,11 +383,13 @@ fn mcp_config_and_child_environment_match_the_contract() {
 
     // daemon 自己帶一個 OTTERHIVE_OPERATOR_* 變數；§5.3 要求子程序看不到。
     let daemon = Daemon::start_with_env(&home, &[("OTTERHIVE_OPERATOR_SECRET", "leak-me")]);
+    let term_dump = home.root().join("claude-term.txt");
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "env-check", "env": {
+        serde_json::json!({"name": "env-check", "command": fixture("fake_claude.sh").to_string_lossy(), "env": {
             "OTTERHIVE_FIXTURE_ENV": env_dump.to_string_lossy(),
+            "OTTERHIVE_FIXTURE_TERM": term_dump.to_string_lossy(),
             "OTTERHIVE_FIXTURE_MCP": mcp_dump.to_string_lossy(),
         }}),
     );
@@ -415,6 +423,10 @@ fn mcp_config_and_child_environment_match_the_contract() {
     assert!(
         wait_for_file(&env_dump),
         "繁中說明：fake_claude 應轉儲環境變數名稱"
+    );
+    assert!(
+        wait_for_file(&term_dump),
+        "繁中說明：fake_claude 應轉儲 TERM 的值"
     );
 
     let mcp: Value = serde_json::from_str(&read_text(&mcp_dump))
@@ -474,15 +486,11 @@ fn mcp_config_and_child_environment_match_the_contract() {
             .any(|name| name.starts_with("OTTERHIVE_OPERATOR")),
         "繁中說明：子程序不應看到 OTTERHIVE_OPERATOR 前綴變數，實際：{env_names:?}"
     );
-    let term_value = std::fs::read_to_string(&env_dump)
-        .expect("繁中說明：應可讀取環境轉儲")
-        .lines()
-        .find(|line| line.starts_with("TERM"))
-        .map(|line| line.to_owned())
-        .unwrap_or_default();
-    assert!(
-        term_value.contains("xterm-256color"),
-        "繁中說明：TERM 應為 xterm-256color，實際：{term_value}"
+    let term_value = read_text(&term_dump);
+    assert_eq!(
+        term_value.trim(),
+        "xterm-256color",
+        "繁中說明：§5.3 要求子程序的 TERM=xterm-256color，實際：{term_value:?}"
     );
 }
 
@@ -498,7 +506,8 @@ fn skills_symlink_is_created_and_existing_path_is_not_overwritten() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "skilled", "skills_path": skills.to_string_lossy()}),
+        serde_json::json!({"name": "skilled",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "skills_path": skills.to_string_lossy()}),
     );
     assert_eq!(
         created.outcome,
@@ -543,7 +552,8 @@ fn preexisting_skills_directory_is_not_overwritten_and_warns() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "preowned", "skills_path": skills.to_string_lossy(),
+        serde_json::json!({"name": "preowned",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "skills_path": skills.to_string_lossy(),
                            "working_directory": workdir.to_string_lossy()}),
     );
     assert_eq!(
@@ -574,14 +584,18 @@ fn preexisting_skills_directory_is_not_overwritten_and_warns() {
     );
 }
 
-/// §5.2：`backend: command` 只執行 `command` 加 `args`，不寫任何設定檔。
+/// §5.2：`backend: command` 在 T4 回 `unsupported_in_phase`，不執行任何東西。
+///
+/// 契約 §5.2 的完整 command 行為（只執行 `command` 加 `args`、不寫設定檔）
+/// 延到需要它的工作包；T4 **不**以未驗證的 fixture 冒充，所以這裡驗的是
+/// 「明確拒絕且零副作用」，不是「照 §5.2 執行」。
 #[test]
-fn command_backend_runs_only_command_and_args() {
+fn explicit_command_backend_is_unsupported_and_writes_nothing() {
     let home = TestHome::new();
     let daemon = Daemon::start(&home);
     let argv_log = home.root().join("cmd-argv.log");
 
-    let created = daemon.operator_call(
+    let unsupported = daemon.operator_call(
         &home,
         "create_instance",
         serde_json::json!({
@@ -593,25 +607,33 @@ fn command_backend_runs_only_command_and_args() {
         }),
     );
     assert_eq!(
-        created.outcome,
-        otterhive::protocol::Outcome::Completed,
-        "繁中說明：create 應完成，實際為 {created:?}"
-    );
-    let workdir = home.workspace("plain-cmd");
-    assert!(
-        wait_for_file(&argv_log),
-        "繁中說明：echo_agent.sh 應寫入 log {}",
-        argv_log.display()
+        unsupported.outcome,
+        otterhive::protocol::Outcome::Unsupported,
+        "繁中說明：T4 的 backend:command 應回 unsupported，實際為 {unsupported:?}"
     );
     assert_eq!(
-        read_lines(&argv_log),
-        vec!["alpha".to_owned(), "beta".to_owned()],
-        "繁中說明：command backend 的 argv 應只有 args，不加任何參數"
+        unsupported.error.as_ref().map(|error| error.code),
+        Some(otterhive::protocol::ErrorCode::UnsupportedInPhase),
+        "繁中說明：應回 unsupported_in_phase，實際為 {unsupported:?}"
     );
     assert!(
-        !workdir.join(".claude").exists(),
-        "繁中說明：command backend 不應寫任何設定檔，實際 {}",
-        workdir.join(".claude").display()
+        unsupported.effects.is_empty(),
+        "繁中說明：unsupported 在任何變更前拒絕，effects 應為空，實際 {:?}",
+        unsupported.effects
+    );
+    // 零副作用：沒有 instance、沒有工作目錄、沒有設定檔、沒有 argv。
+    assert!(
+        instance_row(&home, "plain-cmd").is_none(),
+        "繁中說明：不應建立 instance"
+    );
+    assert!(
+        !home.workspace("plain-cmd").exists(),
+        "繁中說明：不應建立工作目錄"
+    );
+    assert!(
+        !argv_log.exists(),
+        "繁中說明：不得執行 echo_agent.sh（argv log 不應出現），實際 {}",
+        argv_log.display()
     );
 }
 
@@ -627,7 +649,8 @@ fn claude_resume_uses_continue_when_evidence_exists() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "resumable", "env": {
+        serde_json::json!({"name": "resumable",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "env": {
             "OTTERHIVE_FIXTURE_LOG": argv_log.to_string_lossy(),
             "OTTERHIVE_FIXTURE_RESUME": resume_dump.to_string_lossy(),
         }}),
@@ -728,8 +751,7 @@ fn shared_working_directory_blocks_resume() {
         let created = daemon.operator_call(
             &home,
             "create_instance",
-            serde_json::json!({"name": name, "backend": "command",
-                               "command": fixture("echo_agent.sh").to_string_lossy(),
+            serde_json::json!({"name": name, "command": fixture("echo_agent.sh").to_string_lossy(),
                                "working_directory": shared.to_string_lossy()}),
         );
         assert_eq!(
@@ -772,8 +794,7 @@ fn default_working_directory_is_created_and_explicit_one_is_not() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "default-wd", "backend": "command",
-                           "command": fixture("echo_agent.sh").to_string_lossy()}),
+        serde_json::json!({"name": "default-wd", "command": fixture("echo_agent.sh").to_string_lossy()}),
     );
     assert_eq!(
         created.outcome,
@@ -789,8 +810,7 @@ fn default_working_directory_is_created_and_explicit_one_is_not() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "explicit-wd", "backend": "command",
-                           "command": fixture("echo_agent.sh").to_string_lossy(),
+        serde_json::json!({"name": "explicit-wd", "command": fixture("echo_agent.sh").to_string_lossy(),
                            "working_directory": home.root().join("not-created").to_string_lossy()}),
     );
     assert_eq!(
@@ -821,8 +841,7 @@ fn delete_does_not_remove_working_directory() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "keeper", "backend": "command",
-                           "command": fixture("echo_agent.sh").to_string_lossy(),
+        serde_json::json!({"name": "keeper", "command": fixture("echo_agent.sh").to_string_lossy(),
                            "working_directory": kept.to_string_lossy()}),
     );
     assert_eq!(
@@ -856,7 +875,8 @@ fn spec_env_is_passed_to_the_child() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "env-passthrough", "env": {
+        serde_json::json!({"name": "env-passthrough",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "env": {
             "OTTERHIVE_FIXTURE_ENV": env_dump.to_string_lossy(),
             "CUSTOM_VAR": "custom-value",
         }}),
@@ -886,8 +906,7 @@ fn interrupt_on_non_running_instance_is_invalid() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "not-running", "backend": "command",
-                           "command": fixture("crash_on_start.sh").to_string_lossy()}),
+        serde_json::json!({"name": "not-running", "command": fixture("crash_on_start.sh").to_string_lossy()}),
     );
     assert_eq!(
         refused.outcome,
@@ -953,8 +972,7 @@ fn list_instances_can_filter_by_name() {
         let created = daemon.operator_call(
             &home,
             "create_instance",
-            serde_json::json!({"name": name, "backend": "command",
-                               "command": fixture("echo_agent.sh").to_string_lossy()}),
+            serde_json::json!({"name": name, "command": fixture("echo_agent.sh").to_string_lossy()}),
         );
         assert_eq!(
             created.outcome,
@@ -1011,7 +1029,8 @@ fn skills_symlink_journal_entry_is_recorded() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "journalled", "skills_path": skills.to_string_lossy()}),
+        serde_json::json!({"name": "journalled",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "skills_path": skills.to_string_lossy()}),
     );
     assert_eq!(
         created.outcome,
@@ -1048,7 +1067,8 @@ fn bridge_path_in_env_matches_mcp_config() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        serde_json::json!({"name": "bridge-env", "env": {
+        serde_json::json!({"name": "bridge-env",
+                "command": fixture("fake_claude.sh").to_string_lossy(), "env": {
             "OTTERHIVE_FIXTURE_ENV": env_dump.to_string_lossy(),
             "OTTERHIVE_FIXTURE_MCP": mcp_dump.to_string_lossy(),
         }}),
@@ -1121,4 +1141,99 @@ fn instance_pid(home: &TestHome, name: &str) -> Option<i32> {
     instance_row(home, name)
         .and_then(|(pid, ..)| pid)
         .map(|pid| pid as i32)
+}
+
+/// 三方決策的對撞測試：daemon 的 `tools_list` 對同一 caller 回出的清單，必須
+/// **恰等於** `mcp::tool_names(is_manager)`（bridge 的 `tools/list` 轉呼叫這裡；
+/// 兩處若各自演化就會漂移）。
+///
+/// 參數化跑三種身分：
+/// - operator：daemon 端視為有全部權限（契約 §2）→ 對應 `tool_names(true)`。
+/// - manager：instance 名稱列在設定檔 `managers` → `tool_names(true)`。
+/// - 一般 instance：不在 `managers` → `tool_names(false)`。
+///
+/// 另外驗兩件事：
+/// - 期別工具（`DEFERRED_TO_LATER_PHASE`）不在 wire 結果裡。
+/// - 未列出的工具直呼回 `unsupported_in_phase`（契約 §3「不列出 ≠ 可靜默忽略」）。
+#[test]
+fn daemon_tools_list_matches_mcp_tool_names_for_every_caller_kind() {
+    use otterhive::mcp::{tool_names, DEFERRED_TO_LATER_PHASE};
+
+    let home = TestHome::new();
+    // 設定檔把 `managed` 列入 managers（契約 §2 的權限來源之一）。daemon 在啟動
+    // 時讀取，因此先寫設定再啟動。
+    std::fs::write(home.home.config_path(), "managers:\n  - managed\n")
+        .expect("繁中說明：應可寫入測試用設定檔");
+    let daemon = Daemon::start(&home);
+
+    for name in ["managed", "plain"] {
+        let created = daemon.operator_call(
+            &home,
+            "create_instance",
+            serde_json::json!({"name": name,
+                               "command": fixture("fake_claude.sh").to_string_lossy()}),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：{name} 應建立成功，實際為 {created:?}"
+        );
+    }
+
+    let cases: Vec<(&str, otterhive::protocol::Auth, bool)> = vec![
+        ("operator", home.operator(), true),
+        (
+            "manager",
+            otterhive::protocol::Auth::Instance(home.instance_auth("managed")),
+            true,
+        ),
+        (
+            "instance",
+            otterhive::protocol::Auth::Instance(home.instance_auth("plain")),
+            false,
+        ),
+    ];
+
+    for (label, auth, is_manager) in cases {
+        let listed = daemon.call(&home, &auth, "tools_list", serde_json::json!({}));
+        assert_eq!(
+            listed.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：{label} 的 tools_list 應完成，實際為 {listed:?}"
+        );
+        let wire: Vec<String> = listed.value["tool_names"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "繁中說明：{label} 的 tools_list 應回 tool_names，實際：{}",
+                    listed.value
+                )
+            })
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect();
+        let expected = tool_names(is_manager);
+        assert_eq!(
+            wire, expected,
+            "繁中說明：{label} 的 daemon tools_list 必須與 mcp::tool_names({is_manager}) 相同"
+        );
+        for deferred in DEFERRED_TO_LATER_PHASE {
+            assert!(
+                !wire.iter().any(|name| name == deferred),
+                "繁中說明：期別工具 {deferred} 不應出現在 wire 清單，實際：{wire:?}"
+            );
+        }
+        // 未列出的工具直呼：unsupported（不是靜默忽略）。用 T4 尚未實作的
+        // `deployment`：它在 MCP 工具清單之外（§10），在 socket 上也不屬 T4 的
+        // lifecycle 範圍，因此直呼必須被明確拒絕。注意 `create_instance` 不
+        // 適合當例子——它不在 *bridge 的工具清單* 裡，但對 operator 經 socket
+        // 直呼是完全合法的（§2），兩者是不同的清單。
+        let refused = daemon.call(&home, &auth, "deployment", serde_json::json!({"name": "x"}));
+        assert_eq!(
+            refused.outcome,
+            otterhive::protocol::Outcome::Unsupported,
+            "繁中說明：{label} 直呼 deployment 應回 unsupported（不在 T4 工具清單\
+             也不在 T4 已實作清單），實際為 {refused:?}"
+        );
+    }
 }

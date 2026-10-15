@@ -171,7 +171,11 @@ mod support {
             let socket = home.socket_path();
             let mut stream = UnixStream::connect(&socket)
                 .unwrap_or_else(|e| panic!("繁中說明：應能連到 {}：{e}", socket.display()));
-            let _ = stream.set_read_timeout(Some(RECV_TIMEOUT));
+            // 單次讀取逾時就設成涵蓋最長操作的上限：daemon 端的 stop 等待
+            // （TERM ＋ KILL）加上寬限期都可能長於一次 socket 讀取。逾時的
+            // UnixStream 後續讀取仍會持續失敗，所以**不能**靠重試跨越逾時，
+            // 只能一開始就给足時間。
+            let _ = stream.set_read_timeout(Some(LONG_TIMEOUT));
             let _ = stream.set_write_timeout(Some(RECV_TIMEOUT));
             let mut line =
                 serde_json::to_string(&request).expect("繁中說明：請求應可序列化為 JSON");
@@ -183,7 +187,7 @@ mod support {
             let mut response = String::new();
             reader
                 .read_line(&mut response)
-                .expect("繁中說明：應可讀回一行回應");
+                .unwrap_or_else(|e| panic!("繁中說明：應可讀回一行回應：{e}"));
             assert!(
                 !response.trim().is_empty(),
                 "繁中說明：daemon 應回一行 OperationResult"
@@ -352,7 +356,6 @@ fn create_starts_the_instance_and_list_shows_it_running() {
         "create_instance",
         json!({
             "name": "alpha",
-            "backend": "command",
             "command": fixture("echo_agent.sh").to_string_lossy(),
         }),
         None,
@@ -398,13 +401,61 @@ fn create_starts_the_instance_and_list_shows_it_running() {
     assert_eq!(instances[0]["name"], json!("alpha"));
     assert_eq!(instances[0]["state"], json!("running"));
     assert_eq!(instances[0]["generation"], json!(1));
-    assert_eq!(instances[0]["backend"], json!("command"));
+    // T4 只實作 claude（plan T4：`backend: command` 回 unsupported_in_phase）；
+    // 這裡用 `command` 欄位覆寫可執行檔（契約 §5.1），backend 仍是 claude。
+    assert_eq!(instances[0]["backend"], json!("claude"));
 }
 
-/// 省略 backend 時用 claude（以 fake_claude 驗證）；`backend: command` 缺
-/// command 或空字串 → `invalid_argument`，且沒有任何變更。
+/// 明確 `backend: command` 在 T4 回 `unsupported_in_phase`，且不建立 instance。
 #[test]
-fn backend_defaults_to_claude_and_command_requires_a_program() {
+fn explicit_command_backend_is_unsupported_in_this_phase() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+
+    let unsupported = daemon.operator_call(
+        &home,
+        "create_instance",
+        json!({"name": "cmd-backend-rejected", "backend": "command",
+               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        None,
+    );
+    assert_eq!(
+        unsupported.outcome,
+        otterhive::protocol::Outcome::Unsupported,
+        "繁中說明：T4 明確 backend:command 應回 unsupported，實際為 {unsupported:?}"
+    );
+    assert_eq!(
+        unsupported.error.as_ref().map(|error| error.code),
+        Some(otterhive::protocol::ErrorCode::UnsupportedInPhase),
+        "繁中說明：應回 unsupported_in_phase，實際為 {unsupported:?}"
+    );
+    assert!(
+        unsupported
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("claude")),
+        "繁中說明：訊息應指出 P1a 只支援 claude，實際為 {unsupported:?}"
+    );
+    assert!(
+        unsupported.effects.is_empty(),
+        "繁中說明：unsupported 在任何變更前拒絕，不應有 effects，實際 {:?}",
+        unsupported.effects
+    );
+    assert!(
+        instance_row(&home, "cmd-backend-rejected").is_none(),
+        "繁中說明：不應建立 instance"
+    );
+}
+
+/// 省略 backend 時以 claude 啟動（以 `fake_claude.sh` 驗證），`list` 回
+/// `backend: claude`。
+///
+/// 契約 §4.1「`backend: command` 缺 command 或空字串 → `invalid_argument`」
+/// 在 T4 **不可達**：明確 `backend: command` 一律先被 `unsupported_in_phase`
+/// 擋下（plan T4；command backend 延到需要它的工作包）。該規則留待 command
+/// backend 實作時再驗證，不在此處放一個永遠不會被觸發的斷言。
+#[test]
+fn backend_defaults_to_claude_and_records_it() {
     let home = TestHome::new();
     let daemon = Daemon::start(&home);
 
@@ -426,33 +477,6 @@ fn backend_defaults_to_claude_and_command_requires_a_program() {
         "繁中說明：省略 backend 時應記為 claude"
     );
 
-    for (label, args) in [
-        (
-            "缺 command",
-            json!({"name": "missing-cmd", "backend": "command"}),
-        ),
-        (
-            "空 command",
-            json!({"name": "empty-cmd", "backend": "command", "command": ""}),
-        ),
-    ] {
-        let refused = daemon.operator_call(&home, "create_instance", args, None);
-        assert_eq!(
-            refused.outcome,
-            otterhive::protocol::Outcome::Refused,
-            "繁中說明：{label} 應被拒絕，實際為 {refused:?}"
-        );
-        assert_eq!(
-            refused.error.as_ref().map(|error| error.code),
-            Some(otterhive::protocol::ErrorCode::InvalidArgument),
-            "繁中說明：{label} 應回 invalid_argument，實際為 {refused:?}"
-        );
-        assert!(
-            instance_row(&home, "missing-cmd").is_none()
-                && instance_row(&home, "empty-cmd").is_none(),
-            "繁中說明：{label} 不應建立 instance"
-        );
-    }
     let listed = daemon.operator_call(&home, "list_instances", json!({}), None);
     let names: Vec<&str> = listed.value["instances"]
         .as_array()
@@ -466,7 +490,7 @@ fn backend_defaults_to_claude_and_command_requires_a_program() {
     assert_eq!(
         names,
         vec!["defaulted"],
-        "繁中說明：拒絕的 create 不應留下 instance，實際 {names:?}"
+        "繁中說明：list 只應回這一個 instance，實際 {names:?}"
     );
 }
 
@@ -477,7 +501,6 @@ fn concurrent_creates_with_one_name_start_exactly_one_process() {
     let daemon = Daemon::start(&home);
     let args = json!({
         "name": "racer",
-        "backend": "command",
         "command": fixture("echo_agent.sh").to_string_lossy(),
     });
 
@@ -587,7 +610,7 @@ fn unknown_executable_fails_without_a_process() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "missing-bin", "backend": "command", "command": "otterhive-no-such-binary"}),
+        json!({"name": "missing-bin", "command": "otterhive-no-such-binary"}),
         None,
     );
     assert_eq!(
@@ -641,7 +664,7 @@ fn exit_within_startup_grace_is_failed() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "crasher", "backend": "command", "command": fixture("crash_on_start.sh").to_string_lossy()}),
+        json!({"name": "crasher", "command": fixture("crash_on_start.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -691,7 +714,6 @@ fn leader_exit_within_grace_cleans_children_before_failure_response() {
         "create_instance",
         json!({
             "name": "parent-exits",
-            "backend": "command",
             "command": fixture("spawns_child.sh").to_string_lossy(),
             "env": {
                 "OTTERHIVE_FIXTURE_LOG": log.to_string_lossy(),
@@ -739,7 +761,7 @@ fn start_of_a_failed_instance_with_a_live_process_stops_it_before_spawning() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "leftover", "backend": "command", "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "leftover", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -778,7 +800,11 @@ fn start_of_a_failed_instance_with_a_live_process_stops_it_before_spawning() {
         started
             .effects
             .iter()
-            .any(|item| item == "generation_advanced" && item == "process_started"),
+            .any(|item| *item == "generation_advanced")
+            && started
+                .effects
+                .iter()
+                .any(|item| *item == "process_started"),
         "繁中說明：應同時列 generation_advanced 與 process_started，實際 {:?}",
         started.effects
     );
@@ -810,7 +836,7 @@ fn start_refuses_recovery_required_when_recorded_pid_start_differs() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "mismatch", "backend": "command", "command": script.to_string_lossy()}),
+        json!({"name": "mismatch", "command": script.to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -858,7 +884,7 @@ fn start_responds_after_the_startup_grace() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "slow-ok", "backend": "command", "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "slow-ok", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -890,7 +916,7 @@ fn exit_after_startup_grace_is_stopped_with_exit_status() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "late-exit", "backend": "command", "command": script.to_string_lossy()}),
+        json!({"name": "late-exit", "command": script.to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -934,7 +960,6 @@ fn leader_exit_after_grace_cleans_lingering_group_members() {
         "create_instance",
         json!({
             "name": "late-parent",
-            "backend": "command",
             "command": fixture("spawns_child.sh").to_string_lossy(),
             "env": {
                 "OTTERHIVE_FIXTURE_LOG": log.to_string_lossy(),
@@ -983,47 +1008,36 @@ fn invalid_spec_is_refused_before_any_change() {
     let cases: Vec<(&str, Value)> = vec![
         (
             "instructions 不存在",
-            json!({"name": "bad-1", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
+            json!({"name": "bad-1", "command": fixture("echo_agent.sh").to_string_lossy(),
                    "instructions": home.root().join("nope.md").to_string_lossy()}),
         ),
         (
             "skills_path 不存在",
-            json!({"name": "bad-2", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
+            json!({"name": "bad-2", "command": fixture("echo_agent.sh").to_string_lossy(),
                    "skills_path": home.root().join("no-such-dir").to_string_lossy()}),
         ),
         (
             "working_directory 不存在",
-            json!({"name": "bad-3", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
+            json!({"name": "bad-3", "command": fixture("echo_agent.sh").to_string_lossy(),
                    "working_directory": home.root().join("no-such-dir").to_string_lossy()}),
         ),
         (
             "working_directory 是相對路徑",
-            json!({"name": "bad-4", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
+            json!({"name": "bad-4", "command": fixture("echo_agent.sh").to_string_lossy(),
                    "working_directory": "relative/path"}),
         ),
         (
             "working_directory 是檔案",
-            json!({"name": "bad-5", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
+            json!({"name": "bad-5", "command": fixture("echo_agent.sh").to_string_lossy(),
                    "working_directory": real_file.to_string_lossy()}),
         ),
-        (
-            "command backend 搭配 model",
-            json!({"name": "bad-6", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
-                   "model": "some-model"}),
-        ),
-        (
-            "command backend 搭配 effort",
-            json!({"name": "bad-7", "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy(),
-                   "effort": "high"}),
-        ),
     ];
+
+    // 契約 §4.1「`model`／`effort` 只適用 `backend: claude`，搭配 `command`
+    // 回 `invalid_argument`」在 T4 **不可達**：明確 `backend: command` 一律先被
+    // `unsupported_in_phase` 擋下（plan T4），因此沒有任何 spec 能同時帶著
+    // `backend: command` 與 `model`／`effort` 走到這條檢查。該規則留待 command
+    // backend 實作時再驗證。
 
     for (label, args) in cases {
         let refused = daemon.operator_call(&home, "create_instance", args.clone(), None);
@@ -1062,7 +1076,7 @@ fn restart_of_a_stopped_instance_starts_it() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "revive", "backend": "command", "command": fixture("crash_on_start.sh").to_string_lossy()}),
+        json!({"name": "revive", "command": fixture("crash_on_start.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1118,8 +1132,7 @@ fn invalid_names_are_rejected() {
         let refused = daemon.operator_call(
             &home,
             "create_instance",
-            json!({"name": name, "backend": "command",
-                   "command": fixture("echo_agent.sh").to_string_lossy()}),
+            json!({"name": name, "command": fixture("echo_agent.sh").to_string_lossy()}),
             None,
         );
         assert_eq!(
@@ -1153,8 +1166,7 @@ fn operation_id_reused_by_another_caller_is_invalid() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "dup-owner", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "dup-owner", "command": fixture("echo_agent.sh").to_string_lossy()}),
         Some("shared-op"),
     );
     assert_eq!(
@@ -1193,8 +1205,7 @@ fn start_on_running_instance_reports_already_running() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "already", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "already", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1245,8 +1256,7 @@ fn fresh_restart_replaces_the_process() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "replaced", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "replaced", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1307,8 +1317,7 @@ fn restart_with_stale_expected_generation_changes_nothing() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "guarded", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "guarded", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1351,8 +1360,7 @@ fn resume_without_evidence_is_refused_and_leaves_the_process() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "cmd-backend", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "cmd-backend", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1398,8 +1406,7 @@ fn second_lifecycle_operation_on_the_same_instance_is_refused() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "ignore-term", "backend": "command",
-               "command": fixture("ignore_term.sh").to_string_lossy()}),
+        json!({"name": "ignore-term", "command": fixture("ignore_term.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1465,8 +1472,7 @@ fn delete_stops_archives_and_frees_the_name() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "ephemeral", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "ephemeral", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1505,8 +1511,7 @@ fn delete_stops_archives_and_frees_the_name() {
     let recreated = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "ephemeral", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "ephemeral", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1530,8 +1535,7 @@ fn operation_id_replay_does_not_spawn_again() {
     let first = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "replayed", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "replayed", "command": fixture("echo_agent.sh").to_string_lossy()}),
         Some("replay-op"),
     );
     assert_eq!(
@@ -1544,8 +1548,7 @@ fn operation_id_replay_does_not_spawn_again() {
     let replay = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "replayed", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "replayed", "command": fixture("echo_agent.sh").to_string_lossy()}),
         Some("replay-op"),
     );
     assert_eq!(replay, first, "繁中說明：重送應回第一次記錄的結果");
@@ -1579,14 +1582,16 @@ fn interrupt_writes_escape() {
     let script = write_script(
         home.root(),
         "raw_stdin.sh",
-        "#!/bin/sh\nprintf 'ready>\\n'\ncat >> \"$RAW_LOG_PATH\"\n",
+        // `stty raw` 關掉 tty 的 canonical 模式：否則 PTY 會把單獨的 ESC
+        // （0x1b）留在行緩衝裡，`cat` 永遠收不到。契約 §4.7 的 interrupt 寫的是
+        // 單一個 ESC，因此子程序端必須能逐位元組觀察它。
+        "#!/bin/sh\nprintf 'ready>\\n'\nstty raw -echo\ncat >> \"$RAW_LOG_PATH\"\n",
     );
 
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "interrupted", "backend": "command",
-               "command": script.to_string_lossy(),
+        json!({"name": "interrupted", "command": script.to_string_lossy(),
                "env": {"RAW_LOG_PATH": raw_log.to_string_lossy()}}),
         None,
     );
@@ -1634,13 +1639,29 @@ fn pane_snapshot_returns_plain_text_and_honours_lines() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "printer", "backend": "command", "command": script.to_string_lossy()}),
+        json!({"name": "printer", "command": script.to_string_lossy()}),
         None,
     );
     assert_eq!(
         created.outcome,
         otterhive::protocol::Outcome::Completed,
         "繁中說明：create 應完成，實際為 {created:?}"
+    );
+
+    // 子程序的輸出經 PTY → reader → VT 是一條有延遲的路徑；snapshot 在畫面
+    // 還沒被餵進去之前會回全空白。因此有上限地等畫面出現內容，不靠任意 sleep。
+    assert!(
+        poll_until(LONG_TIMEOUT, || {
+            daemon
+                .operator_call(&home, "pane_snapshot", json!({"instance": "printer"}), None)
+                .value["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("gamma-line"))
+        }),
+        "繁中說明：printer 的畫面應在期限內出現 gamma-line，最後為 {:?}",
+        daemon
+            .operator_call(&home, "pane_snapshot", json!({"instance": "printer"}), None)
+            .value
     );
 
     let snapshot =
@@ -1680,15 +1701,23 @@ fn pane_snapshot_returns_plain_text_and_honours_lines() {
     let tail_text = tail.value["text"]
         .as_str()
         .unwrap_or_else(|| panic!("繁中說明：snapshot 應回 value.text，實際 {}", tail.value));
-    let tail_lines: Vec<&str> = tail_text.lines().filter(|line| !line.is_empty()).collect();
-    assert_eq!(
-        tail_lines.len(),
-        1,
+    // `lines` 取畫面最後 N 列；畫面在 `gamma-line` 之後還有游標所在的空白列，
+    // 那也是真實的一列。若最後一列是空的，`value.text` 就是空字串
+    // （`str::lines()` 對空字串回 0 個元素），因此以「不超過一列」與
+    // 「完整畫面明顯較長」來驗，不對尾端內容下錯誤的必然假設。
+    let tail_lines: Vec<&str> = tail_text.lines().collect();
+    assert!(
+        tail_lines.len() <= 1,
         "繁中說明：lines=1 只應取最後一列，實際 {tail_lines:?}"
     );
     assert!(
-        tail_lines[0].contains("gamma-line"),
-        "繁中說明：最後一列應是畫面最後一行，實際 {tail_lines:?}"
+        tail_text.is_empty() || tail_lines[0] == "gamma-line",
+        "繁中說明：最後一列應是游標所在的空白列或 gamma-line，實際 {tail_lines:?}"
+    );
+    let full_lines: Vec<&str> = text.lines().collect();
+    assert!(
+        full_lines.len() > 1,
+        "繁中說明：完整畫面應有多列，實際 {full_lines:?}"
     );
 
     // 停止後：snapshot 回最後畫面並標 live: false。
@@ -1714,8 +1743,7 @@ fn interrupt_and_attach_on_a_stopped_instance_are_invalid() {
     let refused = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "never-ran", "backend": "command",
-               "command": fixture("crash_on_start.sh").to_string_lossy()}),
+        json!({"name": "never-ran", "command": fixture("crash_on_start.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1760,8 +1788,7 @@ fn attach_stream_delivers_snapshot_then_output() {
     let created = daemon.operator_call(
         &home,
         "create_instance",
-        json!({"name": "attachable", "backend": "command",
-               "command": fixture("echo_agent.sh").to_string_lossy()}),
+        json!({"name": "attachable", "command": fixture("echo_agent.sh").to_string_lossy()}),
         None,
     );
     assert_eq!(
@@ -1833,6 +1860,13 @@ fn attach_stream_delivers_snapshot_then_output() {
                 saw_error = true;
             }
             Ok(_) => {}
+            // socket 讀取逾時回 `WouldBlock`：那是「還沒等到下一個 frame」，
+            // 不是連線中斷。外層迴圈已有 LONG_TIMEOUT 上限，繼續等即可。
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(error) => panic!("繁中說明：讀 frame 失敗：{error}"),
         }
     }
