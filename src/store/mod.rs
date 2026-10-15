@@ -121,8 +121,18 @@ pub struct TeamRow {
 impl TeamRow {
     /// `accept_from` 的 instance 名稱清單。
     ///
-    /// 壞掉的 JSON 回空 vec（而不是讓 team 讀取整個失敗）：`accept_from`
-    /// 只會**放寬**收件權限，把它讀成空清單是 fail-closed 的方向。
+    /// **刻意**把壞掉的 JSON 讀成空 vec，而不是讓 team 讀取整個失敗或降級成
+    /// 「全部允許」：
+    ///
+    /// - `accept_from` 在 §6.2 的作用是**放寬**收件權限（讓跨隊的 sender 能送
+    ///   給 orchestrator）。讀成空清單 = 該 team 的規則 3 永不成立 = 收件權限
+    ///   維持在**最嚴**的那條路徑。
+    /// - 反過來（壞掉時放行全部）會讓一個儲存格式損壞的 team 變成對所有
+    ///   instance 開放，這是 fail-open。
+    ///
+    /// 這個降級是靜默的，所以它只安全到「方向正確」為止——真正的防線是
+    /// `insert_team`／`update_team` 總是寫入合法 JSON，讀到壞值代表資料庫已經
+    /// 被外部改過，那是需要人看的狀況而非能自動修的。
     pub fn accept_from_names(&self) -> Vec<String> {
         serde_json::from_str::<Vec<String>>(&self.accept_from).unwrap_or_default()
     }
