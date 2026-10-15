@@ -1460,6 +1460,10 @@ fn spawn_exit_observer(
                     .last_screens
                     .insert(name.clone(), running.session.plain_text());
             }
+            // §6.4 的「停止即放棄」：程序結束時立刻清掉喚醒狀態，不等重判迴圈
+            // 在最多 250ms 後自己發現（b8 的 B4）。
+            inner.wakers.remove(&name);
+            inner.recheck_running.remove(&name);
             removed.map(|running| running.session)
         };
         let Some(session) = session else {
@@ -1686,10 +1690,13 @@ fn stop_previous(state: &DaemonState, row: &InstanceRow) -> PreviousOutcome {
     // 記憶體中持有（本 daemon 的 owned lease）：走 owned 路徑。
     let session = {
         let mut inner = state.lock();
-        inner
+        let session = inner
             .running
             .remove(&row.name)
-            .map(|running| running.session)
+            .map(|running| running.session);
+        inner.wakers.remove(&row.name);
+        inner.recheck_running.remove(&row.name);
+        session
     };
     if let Some(session) = session {
         let outcome = stop_group(
@@ -2241,8 +2248,17 @@ struct RecheckGuard {
 
 impl Drop for RecheckGuard {
     fn drop(&mut self) {
+        // 兩張表**一起**清（b8 的 B3）：`RecheckGuard` 原先只清 `recheck_running`，
+        // 留下帶非空 pending 的殘留排程器。`catch_unwind` 逃逸後，下一個 `send`
+        // 會拿到那個排程器；若 generation 未變，已放棄的提示就會與新提示合併，
+        // `count=<n>` 算進不該算的訊息。
+        //
+        // 正常路徑（送出、放棄、`NothingToSend`）仍在迴圈內**顯式**清兩張表——
+        // 那三處比等 guard 更清楚，而且它們在知道原因的地方清理。guard 只負責
+        // panic 逃逸這條沒有人能自己清理的路徑。
         let mut inner = self.state.lock();
         inner.recheck_running.remove(&self.instance);
+        inner.wakers.remove(&self.instance);
     }
 }
 
