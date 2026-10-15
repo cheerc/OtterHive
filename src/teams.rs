@@ -396,6 +396,12 @@ fn name_list(args: &Value, field: &str) -> Result<Vec<String>, OpError> {
 
 /// 名稱陣列：去重並保留第一次出現的順序（§6.1 的去重語意；§8.1 的成員清單同理，
 /// `members: ["a","a","b"]` 與 `["a","b"]` 等價）。
+///
+/// **空字串被拒，不靜默丟棄**：`members: ["alpha", "", "beta"]` 若丟掉中間那項就
+/// 照建 team，呼叫端會以為有三個成員而實際只有兩個。§3 要求拒絕發生在任何變更前，
+/// 而靜默丟棄等於改寫呼叫端的意圖——那不是「容錯」，是讓呼叫端依錯誤的模型繼續。
+/// （`members: []` 是另一回事：那是「沒給成員」，`create` 明確要求非空，回
+/// `invalid_argument`；這裡處理的是**陣列裡有**空字串。）
 fn string_list(value: &Value, field: &str) -> Result<Vec<String>, OpError> {
     let Some(array) = value.as_array() else {
         return Err(invalid(format!("{field} 必須是字串陣列")));
@@ -405,7 +411,10 @@ fn string_list(value: &Value, field: &str) -> Result<Vec<String>, OpError> {
         let text = item
             .as_str()
             .ok_or_else(|| invalid(format!("{field} 的每一項都必須是字串")))?;
-        if !text.is_empty() && !names.iter().any(|existing| existing == text) {
+        if text.is_empty() {
+            return Err(invalid(format!("{field} 的每一項都不得為空字串")));
+        }
+        if !names.iter().any(|existing| existing == text) {
             names.push(text.to_owned());
         }
     }

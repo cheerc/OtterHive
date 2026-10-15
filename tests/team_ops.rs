@@ -288,6 +288,29 @@ mod support {
         assert_eq!(changed, 1, "繁中說明：team {team} 應存在（測試前提）");
     }
 
+    /// `team_members` 中某個 instance 名稱（直接讀 SQLite，不經 API）。
+    ///
+    /// 用它觀察 `delete_instance` 之後成員關係**是否真的**被移除——§4.5 明文
+    /// 「移出所屬 team」，而 `list_instances` 的 `team` 欄位只對未刪除的
+    /// instance 有意義，所以刪除後那個欄位觀察不到任何東西。
+    pub fn team_member_names(home: &TestHome, team: &str) -> Vec<String> {
+        let path = home.home.root().join("state.sqlite3");
+        let connection = rusqlite::Connection::open(&path)
+            .unwrap_or_else(|e| panic!("繁中說明：應可開啟 {}：{e}", path.display()));
+        let mut statement = connection
+            .prepare(
+                "SELECT instances.name FROM team_members \
+                 JOIN instances ON instances.id = team_members.instance_id \
+                 WHERE team_members.team = ?1 ORDER BY instances.name",
+            )
+            .unwrap_or_else(|e| panic!("繁中說明：應可準備 team_members 查詢：{e}"));
+        statement
+            .query_map(params![team], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|e| panic!("繁中說明：應可查詢 team_members：{e}"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| panic!("繁中說明：應可收集 team_members：{e}"))
+    }
+
     /// `messages` 表中某收件 instance 的列：`(id, body, state, delivery_count)`，
     /// 依建立順序排列。
     ///
@@ -1001,6 +1024,90 @@ fn deleting_a_team_orchestrator_is_rejected() {
         now_deletable.outcome,
         otterhive::protocol::Outcome::Completed,
         "繁中說明：不再是 orchestrator 的 alpha 應可刪除，實際為 {now_deletable:?}"
+    );
+}
+
+/// §4.5：`delete_instance` 要把 instance **移出所屬 team**。
+///
+/// 這條獨立於 `deleting_a_team_orchestrator_is_rejected`——後者只驗「orchestrator
+/// 不可刪」，從來沒驗過「可刪的那些有沒有真的被移出」。`list_instances` 的 `team`
+/// 欄位對已刪除的 instance 沒有觀察價值，所以直接讀 `team_members`。
+///
+/// 留下的孤兒列不只是資料髒污：§8.1 的單一歸屬約束是 `team_members.instance_id`
+/// 的 UNIQUE，而 `set_team_members` 的「已在這裡就不動」檢查會把孤兒列誤認成
+/// 「已是本 team 成員」而放行——於是那個 ID 可以在多個 team 裡共存。
+#[test]
+fn deleting_an_instance_removes_it_from_its_team() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+    two_instances(&daemon, &home);
+    create_instance(&daemon, &home, "gamma");
+
+    let created = team(
+        &daemon,
+        &home,
+        json!({"action": "create", "name": "squad",
+               "members": ["alpha", "beta", "gamma"], "orchestrator": "alpha"}),
+    );
+    assert_eq!(
+        created.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：create 應完成，實際為 {created:?}"
+    );
+    assert_eq!(
+        team_member_names(&home, "squad"),
+        vec!["alpha", "beta", "gamma"],
+        "繁中說明：建立後 squad 的成員應是三者（測試前提）"
+    );
+
+    // 刪掉一個非 orchestrator 的成員。
+    let deleted = daemon.operator_call(&home, "delete_instance", json!({"instance": "gamma"}));
+    assert_eq!(
+        deleted.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：非 orchestrator 的成員應可刪除，實際為 {deleted:?}"
+    );
+    assert_eq!(
+        team_member_names(&home, "squad"),
+        vec!["alpha", "beta"],
+        "繁中說明：§4.5 要求 delete_instance 把 instance 移出所屬 team；\
+         實際仍留在 team_members：{:?}",
+        team_member_names(&home, "squad")
+    );
+
+    // 刪掉 orchestrator 不可行，但換掉 orchestrator 後它就能被刪——那時它也該被
+    // 移出（否則孤兒列會讓 §8.1 的單一歸屬 fail-open）。
+    let switched = team(
+        &daemon,
+        &home,
+        json!({"action": "update", "name": "squad", "orchestrator": "beta"}),
+    );
+    assert_eq!(
+        switched.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：換 orchestrator 的 update 應完成，實際為 {switched:?}"
+    );
+    let orchestrator_deleted =
+        daemon.operator_call(&home, "delete_instance", json!({"instance": "alpha"}));
+    assert_eq!(
+        orchestrator_deleted.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：換掉 orchestrator 後 alpha 應可刪除，實際為 {orchestrator_deleted:?}"
+    );
+    assert_eq!(
+        team_member_names(&home, "squad"),
+        vec!["beta"],
+        "繁中說明：被刪的 orchestrator 也應移出 team；實際：{:?}",
+        team_member_names(&home, "squad")
+    );
+
+    // team 本身仍在，且仍可被列出（§4.5 只移出成員，不刪 team）。
+    let entry = find_team(&daemon, &home, "squad")
+        .unwrap_or_else(|| panic!("繁中說明：squad 應該還在 list 裡"));
+    assert_eq!(
+        entry["members"],
+        json!(["beta"]),
+        "繁中說明：list 也應反映成員已被移出，實際 {entry}"
     );
 }
 

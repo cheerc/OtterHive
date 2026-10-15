@@ -28,7 +28,6 @@
 
 use serde_json::{json, Value};
 
-use crate::config::Config;
 use crate::daemon::auth::Caller;
 use crate::protocol::{ErrorCode, OpError};
 use crate::store::{AckOutcome, MessageRow, NewMessage, Store, StoreError, TeamRow, Tx};
@@ -100,20 +99,25 @@ struct Sender {
     kind: &'static str,
     id: Option<String>,
     name: String,
-    /// 呼叫端名稱在設定檔的 `managers` 裡（§2）。
-    is_manager: bool,
+    /// 呼叫端在 §6.2 裡可送給任何 instance。
+    ///
+    /// 這個旗標同時代表 operator 與 `managers` 裡的 instance，因為契約 §6.2
+    /// 對兩者的敘述是同一句：「operator 與 manager 可送給任何 instance」。
+    /// 它**不**表示 operator 是某種 manager——operator 是認證層的身分（憑證
+    /// 檔），manager 是設定檔列出的 instance 名稱。兩者只是恰好通過同一個判斷。
+    unrestricted: bool,
     /// 呼叫端所屬的 team 與該 team 的 orchestrator 名稱（§6.2）。
     team: Option<(String, String)>,
 }
 
 impl Sender {
-    fn from(store: &mut Store, caller: &Caller, config: &Config) -> Result<Sender, OpError> {
+    fn from(store: &mut Store, caller: &Caller, managers: &[String]) -> Result<Sender, OpError> {
         match caller {
             Caller::Operator => Ok(Sender {
                 kind: "operator",
                 id: None,
                 name: String::from("operator"),
-                is_manager: true,
+                unrestricted: true,
                 team: None,
             }),
             Caller::Instance(id) => {
@@ -127,7 +131,7 @@ impl Sender {
                         internal(format!("呼叫端 instance {id} 不存在（認證後不應發生）"))
                     })?;
                 let name = instance.name;
-                let is_manager = config.managers.iter().any(|item| item == &name);
+                let unrestricted = managers.iter().any(|item| item == &name);
                 let team = store
                     .transaction(|tx| tx.team_of_instance_name(&name))
                     .map_err(|error| store_error("查詢呼叫端所屬 team 失敗", error))?;
@@ -135,7 +139,7 @@ impl Sender {
                     kind: "instance",
                     id: Some(instance.id),
                     name,
-                    is_manager,
+                    unrestricted,
                     team,
                 })
             }
@@ -225,11 +229,15 @@ impl RecipientSelectors {
 /// 回傳的 `Ok` **不代表**訊息送達：全部收件人被拒時仍然是 `Ok`（向量非空、
 /// 每項都帶 `error`），由 dispatch 端映射成 `refused`。只有形狀層錯誤與
 /// `internal` 走 `Err`。
+///
+/// `managers` 是**啟動時**讀到的那份（daemon 的 `Inner.managers`），不是呼叫時
+/// 重新讀設定檔的結果：§1 明說「`managers` 的變更要重啟 daemon 才生效」，所以
+/// 啟動後的 `send` 不該看到與啟動時不同的答案。
 pub fn send(
     store: &mut Store,
     caller: &Caller,
     args: &Value,
-    config: &Config,
+    managers: &[String],
 ) -> Result<Vec<SendRecipient>, OpError> {
     // --- 形狀層：任何 store 存取之前完成（§3「多數拒絕在任何變更前」）---
     let body = required_message(args)?;
@@ -243,7 +251,7 @@ pub fn send(
     };
     let selectors = RecipientSelectors::parse(args)?;
 
-    let sender = Sender::from(store, caller, config)?;
+    let sender = Sender::from(store, caller, managers)?;
 
     store
         .transaction(|tx| {
@@ -336,7 +344,9 @@ fn check_recipient_permission(
     sender: &Sender,
     recipient: &str,
 ) -> Result<(), OpError> {
-    if sender.kind != "instance" || sender.is_manager {
+    // §6.2 的第一句：「operator 與 manager 可送給任何 instance」。`unrestricted`
+    // 同時涵蓋兩者（見 `Sender` 的欄位說明），所以這裡只需要問一次。
+    if sender.unrestricted {
         return Ok(());
     }
     let Some(recipient_team) = tx
@@ -563,6 +573,11 @@ fn required_name(value: &Value, field: &str) -> Result<String, OpError> {
 }
 
 /// 名稱陣列：去重並保留第一次出現的順序（§6.1「收件人名單去重」）。
+/// 名稱陣列：去重並保留第一次出現的順序（§6.1「收件人名單去重」）。
+///
+/// **空字串被拒，不靜默丟棄**：`instances: ["alpha", "", "beta"]` 若丟掉中間那項
+/// 就照送，呼叫端會以為送給了三個人，而實際只有兩個（§3「多數拒絕在任何變更前
+/// 發生、沒有副作用」要求它在寫入前回絕，而不是改寫呼叫端的意圖）。
 fn string_list(value: &Value, field: &str) -> Result<Vec<String>, OpError> {
     let Some(array) = value.as_array() else {
         return Err(invalid(format!("{field} 必須是字串陣列")));
@@ -572,7 +587,10 @@ fn string_list(value: &Value, field: &str) -> Result<Vec<String>, OpError> {
         let text = item
             .as_str()
             .ok_or_else(|| invalid(format!("{field} 的每一項都必須是字串")))?;
-        if !text.is_empty() && !names.iter().any(|existing| existing == text) {
+        if text.is_empty() {
+            return Err(invalid(format!("{field} 的每一項都不得為空字串")));
+        }
+        if !names.iter().any(|existing| existing == text) {
             names.push(text.to_owned());
         }
     }
