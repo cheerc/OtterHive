@@ -67,6 +67,17 @@ pub struct OpError {
     pub next: Option<String>,
 }
 
+impl std::fmt::Display for OpError {
+    /// 只印錯誤碼與說明。
+    ///
+    /// `retryable` 與 `next` 不在字串裡：它們是**機器可讀**的欄位（§3 的線路
+    /// 形狀），把它們混進給人看的訊息只會讓同一件事有兩個真相。線路上的完整
+    /// 形狀仍然是 `OperationResult.error` 的 JSON。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
 /// 結果的 subject（契約 §3）：目前只有 instance 一種。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subject {

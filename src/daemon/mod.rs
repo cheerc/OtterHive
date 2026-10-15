@@ -37,18 +37,22 @@ use serde_json::{json, Value};
 
 use crate::admission::admit;
 use crate::backend::claude;
+use crate::config::Config;
 use crate::daemon::auth::{Action, Caller, Subject};
 use crate::daemon::lifecycle::{InstanceState, SpecError, ValidatedSpec};
 use crate::daemon::recovery::RESTART_REASON;
 use crate::home::Home;
 use crate::mcp;
+use crate::messaging;
 use crate::procs::{process_start_time, GroupEvidence, StopOutcome};
 use crate::protocol::{
     Auth, ErrorCode, OpError, OperationResult, Outcome, Request, Subject as ResultSubject,
 };
 use crate::store::{InstanceRow, NewInstance, Store, StoreError};
+use crate::teams;
 use crate::terminal::frame;
 use crate::terminal::session::{Session, SessionConfig, StreamEvent};
+use crate::wake;
 
 /// T5 Lane B GREEN：契約預設值的守門測試（§1 的環境變數、§6.3、§6.4）。
 ///
@@ -231,6 +235,13 @@ fn millis(key: &str, default: u64) -> Duration {
 /// 一個正在執行的 instance 的記憶體狀態。
 struct Running {
     session: Session,
+    /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
+    ///
+    /// 喚醒排程器用它判斷「收件人已換了 generation」→ 放棄尚未送出的提示
+    /// （§6.4）。`Session` 本身也記著 generation，但沒有公開的存取子；與其為了
+    /// 喚醒去擴大 `Session` 的公開面，不如在 daemon 這裡留一份——它本來就是
+    /// 這個 generation 的權威來源（SQLite 的 `instances.generation`）。
+    generation: u64,
     /// 最近一次 `pane_snapshot` 的畫面；停止後仍可回（標 `live: false`）。
     last_screen: Option<Vec<String>>,
 }
@@ -252,6 +263,15 @@ struct Inner {
     /// 正在打字時插入提示行會打斷他。**只在收到 Input frame 時更新**——
     /// Resize／Detach 不是輸入。
     last_client_input: HashMap<String, Instant>,
+    /// 契約 §6.4：每個收件人尚未送出的提示排程。
+    ///
+    /// 必須是**跨 `send` 呼叫**持久的：§6.4 的「同一收件人尚未送出的多個提示
+    /// 合併為一行」只有在排程器活到第二則 `send` 時才成立。每次 `send` 新建
+    /// 一個排程器會讓第一則延後中的提示被遺漏，`count=<n>` 永遠是 1。
+    ///
+    /// 放棄提示不需要額外機制：排程器記住建立時的 generation，restart 後
+    /// 世代不符，`check` 就會清空待送清單並回 `Abandoned`（§6.4）。
+    wakers: HashMap<String, Arc<Mutex<wake::Scheduler>>>,
 }
 
 /// 共用的 daemon 狀態。
@@ -363,6 +383,7 @@ pub fn prepare(
             managers,
             last_screens: HashMap::new(),
             last_client_input: HashMap::new(),
+            wakers: HashMap::new(),
         })),
         home: home_root.to_path_buf(),
         bridge: bridge.to_path_buf(),
@@ -797,6 +818,9 @@ fn perform(
         "interrupt" => interrupt_instance(state, operation_id, caller, args),
         "pane_snapshot" => pane_snapshot(state, operation_id, caller, args),
         "tools_list" => tools_list(state, operation_id, caller),
+        "team" => team_operation(state, operation_id, caller, args),
+        "send" => send_operation(state, operation_id, caller, args),
+        "inbox" => inbox_operation(state, operation_id, caller, args),
         other => OperationResult {
             operation_id: operation_id.to_owned(),
             outcome: Outcome::Unsupported,
@@ -1323,6 +1347,7 @@ fn spawn_instance(
         inner.running.insert(
             spec.name.clone(),
             Running {
+                generation: row.as_ref().map(|row| row.generation).unwrap_or_default(),
                 session,
                 last_screen: None,
             },
@@ -1743,6 +1768,334 @@ fn spec_from_row(
             &format!("已儲存的規格不再符合契約：{spec_error}"),
         ))
     })
+}
+
+/// Unix epoch 毫秒（契約 §1：時間一律是 epoch 毫秒整數，欄位名以 `_ms` 結尾）。
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// 交易失敗時的 `internal` 回應（team／send／inbox 共用）。
+/// 把邏輯層的 `OpError` 展開成 `OperationResult`。
+///
+/// `unsupported_in_phase` 的 outcome 是 `Unsupported` 而非 `Refused`（契約 §3）：
+/// 兩者在 §10 的 bridge 層都會設 `isError: true`，但它們是不同的拒絕理由。
+fn result_from_error(operation_id: &str, error: OpError) -> OperationResult {
+    OperationResult {
+        operation_id: operation_id.to_owned(),
+        outcome: match error.code {
+            ErrorCode::UnsupportedInPhase => Outcome::Unsupported,
+            _ => Outcome::Refused,
+        },
+        subject: None,
+        value: Value::Null,
+        effects: Vec::new(),
+        error: Some(error),
+    }
+}
+
+/// `team`：契約 §8.1 的四個 action。
+///
+/// 授權（§2）：team 異動只有 operator；`list` 對四種身分都開放。
+fn team_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    let action = match teams::TeamAction::parse(args) {
+        Ok(action) => action,
+        Err(op_error) => return result_from_error(operation_id, op_error),
+    };
+    let listing = matches!(action, teams::TeamAction::List);
+    if let Some(denied) = require_permission(
+        state,
+        operation_id,
+        caller,
+        if listing {
+            Action::List
+        } else {
+            Action::Manage
+        },
+        None,
+    ) {
+        return denied;
+    }
+    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+    let request = teams::TeamRequest { action, name, args };
+    let mut inner = state.lock();
+    match teams::team_operation(&mut inner.store, request) {
+        Ok(value) => OperationResult::completed(operation_id, value),
+        Err(op_error) => result_from_error(operation_id, op_error),
+    }
+}
+
+/// `send`：契約 §6.1／§6.2。
+///
+/// 順序是契約 §6.1 明定的：訊息的寫入在同一交易內完成，**喚醒在寫入之後**。
+/// 所以喚醒排在 [`messaging::send`] 回應之後——那時交易已提交、鎖已釋放。
+/// 否則會出現「PTY 已寫入提示但交易回滾」的破窗；喚醒失敗也不撤回訊息。
+fn send_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    // 設定檔在 daemon 啟動時讀入（§1：只有 `templates` 與 `managers`，daemon
+    // 只讀不寫）。`send` 需要它判斷 `managers`（§6.2 的收件權限）。
+    let config = match Config::load(&state.home.join("otterhive.yaml")) {
+        Ok(config) => config,
+        Err(config_error) => {
+            return OperationResult::refused(
+                operation_id,
+                ErrorCode::Internal,
+                &format!("讀取設定檔失敗：{config_error}"),
+            );
+        }
+    };
+    let (recipients, wake_targets) = {
+        let mut inner = state.lock();
+        match messaging::send(&mut inner.store, caller, args, &config) {
+            Ok(outcome) => outcome,
+            Err(op_error) => return result_from_error(operation_id, op_error),
+        }
+    };
+
+    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。
+    let mut wakers: BTreeMap<String, String> = BTreeMap::new();
+    for target in &wake_targets {
+        let Some(message_id) = target.message_id.as_deref() else {
+            continue;
+        };
+        wakers.insert(
+            target.instance.clone(),
+            schedule_hint(state, caller, &target.instance, message_id),
+        );
+    }
+
+    let queued = recipients
+        .iter()
+        .filter(|recipient| recipient.message_id.is_some())
+        .count();
+    let first_error = recipients
+        .iter()
+        .find_map(|recipient| recipient.error.as_ref())
+        .map(|error| error.code);
+
+    let recipients_json: Vec<Value> = recipients
+        .iter()
+        .map(|recipient| {
+            let wake = recipient
+                .message_id
+                .as_deref()
+                .and_then(|_| wakers.get(&recipient.instance))
+                .cloned();
+            json!({
+                "instance": recipient.instance,
+                "outcome": if recipient.message_id.is_some() { "queued" } else { "refused" },
+                "message_id": recipient.message_id,
+                "error": recipient.error.as_ref().map(|error| json!({
+                    "code": error.code,
+                    "message": error.message,
+                })),
+                "wake": wake,
+            })
+        })
+        .collect();
+
+    let (outcome, error) = match (queued, recipients.is_empty()) {
+        (0, true) => (
+            Outcome::Refused,
+            Some(OpError {
+                code: ErrorCode::InvalidArgument,
+                message: String::from(
+                    "send 沒有解析出任何收件人（instance／instances／team 三擇一）",
+                ),
+                retryable: false,
+                next: None,
+            }),
+        ),
+        (0, false) => (
+            Outcome::Refused,
+            Some(OpError {
+                code: first_error.unwrap_or(ErrorCode::NotFound),
+                message: String::from("沒有任何收件人被接受"),
+                retryable: false,
+                next: None,
+            }),
+        ),
+        (count, _) if count == recipients.len() => (Outcome::Completed, None),
+        _ => (Outcome::Partial, None),
+    };
+
+    OperationResult {
+        operation_id: operation_id.to_owned(),
+        outcome,
+        subject: None,
+        // 全部被拒時 `value.recipients` 仍逐項回報（§6.1「或回報拒絕原因」）。
+        value: json!({ "recipients": recipients_json }),
+        effects: Vec::new(),
+        error,
+    }
+}
+
+/// 排入一則提示並重判一次，回 `wake` 欄位的線上值（契約 §6.4）。
+///
+/// 排入進**持久化**的排程器（[`Inner::wakers`]），所以：
+/// - 這一則與先前尚未送出的提示合併成一行 `count=<n>`（§6.4）。
+/// - 若延後條件成立，本次回 `deferred`，提示留在排程器裡，由
+///   [`spawn_wake_recheck`] 的背景迴圈每 [`wake::RECHECK_INTERVAL`] 重判一次，
+///   **延後沒有上限**（§6.4）。
+///
+/// `sender` 與 `kind` 取自憑證與請求（§2「sender 一律由憑證推導」、§6.1 的
+/// `request_kind` 省略時記為 `message`），不從 store 反查。
+fn schedule_hint(state: &DaemonState, caller: &Caller, instance: &str, message_id: &str) -> String {
+    let sender_name = match caller {
+        Caller::Operator => String::from("operator"),
+        Caller::Instance(id) => {
+            let inner = state.lock();
+            match inner.store.instance(id) {
+                Ok(Some(row)) => row.name,
+                // 認得出呼叫端（`authenticate` 已做過）但讀不到名稱：這時
+                // 不能編一個 `from`，寧可讓提示晚一輪也不能顯示錯誤的送訊者。
+                Ok(None) | Err(_) => {
+                    return wake::WakeOutcome::Failed.as_wire().to_owned();
+                }
+            }
+        }
+    };
+
+    // 延後條件與排程器都必須在**鎖內**讀取／寫入（`last_client_input`、
+    // `last_output_at` 與 `wakers` 都是 daemon 的可變狀態），但 `inner.running`
+    // 的不可變借用活著時就不能再可變借用 `inner`。所以先把 `Session` 從
+    // `running` 裡**移出**（`running.remove` 拿走 owned 值），再往下走。
+    let mut inner = state.lock();
+    let Some(running) = inner.running.remove(instance) else {
+        return wake::WakeOutcome::NotRunning.as_wire().to_owned();
+    };
+    let generation = running.generation;
+    let inputs = wake::DeferInputs {
+        last_client_input_at: inner.last_client_input.get(instance).copied(),
+        last_output_at: running.session.last_output_at(),
+    };
+    let scheduler = inner
+        .wakers
+        .entry(instance.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(wake::Scheduler::new(generation))))
+        .clone();
+    // 把 `Running` 放回去之後才鎖排程器：鎖排程器期間 daemon 鎖仍然持有
+    // （`inner` 的 guard 還活著），所以 `running` 離開這張表不會被任何
+    // 其他執行緒觀察到。
+    inner.running.insert(instance.to_owned(), running);
+    let mut scheduler = scheduler
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 世代換了（restart）：前一世代的排程器整個丟掉重建，否則它會帶著
+    // 舊的 `generation` 讓每一輪都回 `Abandoned`。
+    if scheduler.generation() != generation {
+        *scheduler = wake::Scheduler::new(generation);
+    }
+    scheduler.enqueue(wake::PendingHint {
+        from: sender_name,
+        kind: String::from("message"),
+        message_id: message_id.to_owned(),
+    });
+    let decision = scheduler.check(
+        inner.running.get(instance).map(|running| &running.session),
+        generation,
+        inputs,
+        state.tuning.wake_input,
+        state.tuning.wake_quiet,
+        Instant::now(),
+    );
+    drop(scheduler);
+    drop(inner);
+
+    if matches!(decision, wake::NextAction::Deferred) {
+        spawn_wake_recheck(state, instance);
+    }
+    match wake::Scheduler::outcome_for(decision) {
+        // 排程器裡還有東西、但這一輪沒送出：回 `deferred`（§6.4 的四個值
+        // 裡，deferred = 排程中）。
+        None => wake::WakeOutcome::Deferred.as_wire().to_owned(),
+        Some(outcome) => outcome.as_wire().to_owned(),
+    }
+}
+
+/// 啟動背景重判迴圈（§6.4 的「每 250 毫秒重新判斷，直到條件解除才送出」）。
+///
+/// 每次延後都會呼叫；迴圈在提示送出或放棄後自行結束，所以這個啟動是冪等的
+/// ——已經有一個迴圈在跑時，最多只是多啟動一個會立刻結束的（因為排程器已空
+/// → `NothingToSend` → 結束）。
+///
+/// fire-and-forget: 迴圈只存活到提示送出或放棄（數個重判週期）；daemon 不需
+/// 要它的結果，只需要知道「已排程」。
+fn spawn_wake_recheck(state: &DaemonState, instance: &str) {
+    let state = state.clone();
+    let instance = instance.to_owned();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(wake::RECHECK_INTERVAL);
+        let decision = {
+            let mut inner = state.lock();
+            let Some(running) = inner.running.get(&instance) else {
+                return;
+            };
+            let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
+                return;
+            };
+            let generation = running.generation;
+            let inputs = wake::DeferInputs {
+                last_client_input_at: inner.last_client_input.get(&instance).copied(),
+                last_output_at: running.session.last_output_at(),
+            };
+            let session = &running.session;
+            let mut scheduler = scheduler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let decision = scheduler.check(
+                Some(session),
+                generation,
+                inputs,
+                state.tuning.wake_input,
+                state.tuning.wake_quiet,
+                Instant::now(),
+            );
+            if matches!(decision, wake::NextAction::NothingToSend) {
+                // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
+                // 在鎖內收，避免與同時到達的另一個 `send` 交错。
+                inner.wakers.remove(&instance);
+                return;
+            }
+            decision
+        };
+        match wake::Scheduler::outcome_for(decision) {
+            Some(wake::WakeOutcome::Deferred) => continue,
+            // `NothingToSend` 已在鎖內回傳，所以這裡的 `None` 與其餘三種結果
+            // 一樣都是「這一輪結束了」。
+            None | Some(_) => return,
+        }
+    });
+}
+
+/// `inbox`：契約 §6.3。
+///
+/// 授權（§2 表格最後一列）：inbox 只有自己。operator 沒有收件匣（§6.1）——
+/// 這個檢查在 [`messaging::inbox`] 內做，daemon 端不重複。
+fn inbox_operation(
+    state: &DaemonState,
+    operation_id: &str,
+    caller: &Caller,
+    args: &Value,
+) -> OperationResult {
+    let lease_ms = state.tuning.lease.as_millis() as u64;
+    let mut inner = state.lock();
+    match messaging::inbox(&mut inner.store, caller, args, lease_ms, now_epoch_ms()) {
+        Ok(value) => OperationResult::completed(operation_id, value),
+        Err(op_error) => result_from_error(operation_id, op_error),
+    }
 }
 
 /// `delete_instance`：依 §4.5 停止後封存。

@@ -27,6 +27,15 @@ fn instance_query(predicate: &str) -> String {
 }
 
 /// Store 層可回報的錯誤。
+///
+/// [`StoreError::Contract`] 讓契約層的拒絕（§6.1／§8.1 的
+/// `invalid_argument`／`not_found`／`name_conflict`／`team_acl_denied`）能穿過
+/// `Store::transaction` 的閉包回傳型別。它們描述的正是「這筆交易不能成立」，
+/// 是 store 交易的一部分，不是外部塞進來的東西——所以不需要任何序列化。
+///
+/// 刻意**不** derive `Clone`／`PartialEq`／`Eq`：`rusqlite::Error` 兩者都沒有，
+/// 而為了讓一個變體可比較去泛化整個型別的 derives 沒有任何好處（現有 call site
+/// 都只做 pattern match）。
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("live instance 名稱已被使用: {0}")]
@@ -39,8 +48,22 @@ pub enum StoreError {
     UnsupportedSchema { found: i64, supported: i64 },
     #[error("{0}")]
     Invalid(String),
+    /// 契約層的拒絕（`ErrorCode` 與契約 §3 一一對應）。
+    ///
+    /// 與 `Invalid(String)` 的差別是**可預期性**：`Invalid` 是本層內部的
+    /// 不變量被破壞（呼叫端給了不該給的東西），而 `Contract` 是「請求本身
+    /// 合法但不成立」（例如 §8.1 的成員已在另一個 team）。兩者都讓交易回滾，
+    /// 但只有 `Contract` 會原樣回到呼叫端。
+    #[error("{0}")]
+    Contract(crate::protocol::OpError),
     #[error("SQLite 錯誤: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+impl From<crate::protocol::OpError> for StoreError {
+    fn from(op_error: crate::protocol::OpError) -> Self {
+        StoreError::Contract(op_error)
+    }
 }
 
 /// 建立 instance 所需的輸入（`spec` 為 JSON 物件）。
