@@ -98,11 +98,23 @@ mod support {
                 .expect("繁中說明：daemon 應可啟動");
             let daemon = Self { child: Some(child) };
             let socket = home.socket_path();
-            assert!(
-                poll_until(LONG_TIMEOUT, || socket.exists()),
-                "繁中說明：daemon 應在期限內建立 {}",
-                socket.display()
-            );
+            // 不能只等 socket 檔存在：daemon 重啟時上一個行程留下的 socket
+            // 檔還在，而新的 daemon 此刻可能仍在 `prepare`（讀設定、開 store、
+            // 依 §4.6 收斂殘留程序）——那段時間裡檔案存在但沒有監聽，連線會
+            // 得到 `Connection refused`。等待條件必須是「真的能送出請求並收到
+            // 回應」。
+            let deadline = Instant::now() + LONG_TIMEOUT;
+            loop {
+                if socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon 應在期限內可服務 {}（啟動自檢或收斂失敗？）",
+                    socket.display()
+                );
+                std::thread::sleep(POLL_STEP);
+            }
             daemon
         }
 
