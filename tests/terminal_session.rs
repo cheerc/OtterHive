@@ -279,14 +279,31 @@ fn slow_subscriber_gets_resync_and_reader_never_blocks() {
         !session.plain_text().is_empty(),
         "繁中說明：flood 期間 plain_text 應持續更新"
     );
-    // 恢復讀取停滯者：先收到 Resync。flood 餘量可能讓佇列在第一個 Resync
-    // 被讀走後再次溢出而產生連續 Resync，故用引流迴圈逐個接續邊界；
-    // 判準不變：Output 必須是「最後一個 Resync.seq 加一」。
-    write_line(session, "stop");
-    write_line(session, "post-resync-probe");
-    let start = Instant::now();
-    let mut saw_resync = false;
+
+    // 恢復讀取停滯者。
+    //
+    // 原測試在這裡 `write_line("stop")` 再 `write_line("post-resync-probe")`，
+    // 然後期待「Resync 之後的 Output」。它低頻 flaky 的原因是**前提依賴排程**。
+    // 實作的規則（契約 §7.1）是：佇列曾滿的訂閱者，在 `Resync` 被取出之前到達的
+    // 每個 chunk 都只把既有 Resync 的邊界更新為最新、**不排** `Output`。所以若
+    // `stop` 造成的最後一批 flood 輸出與探測行的回音都在停滯者讀走 Resync
+    // **之前**到達，`resync_pending` 就會一直為 true 直到最後一次更新為止；
+    // 之後沒有新資料，就永遠不會有「Resync.seq + 1」的 Output。分岔點是 stop
+    // 與 probe 誰先被 reader 讀到——那是排程，不是實作的行為。
+    //
+    // 修法是拿掉「先停 flood」這一步，讓 flood 持續輸出。這不只是「很可能」，
+    // 而是恆等式：`resync_pending` 為 true 時，每個到達的 chunk 都在同一個鎖
+    // 區塊內把待送 Resync 的 Snapshot 更新成當下的 `state.seq`；因此取出 Resync
+    // 的那一刻 `snapshot.seq == state.seq`，而 `resync_pending` 也同時被清除，
+    // 於是下一個 chunk 排出的 Output 必然是 `snapshot.seq + 1`。停止 flood 反而
+    // 會破壞這個不變量（停止造成的最後一批輸出若在 Resync 被取出前到達，就會
+    // 把邊界推走、之後又沒有新資料）。
+    //
+    // 判準不變且不放寬：Output 必須是「最後一個 Resync.seq 加一」，且必須先收到
+    // 過 Resync。引流迴圈保留——flood 期間停滯者還可能再次溢出成新邊界。
     let mut resync_seq = 0u64;
+    let mut saw_resync = false;
+    let start = Instant::now();
     loop {
         assert!(
             start.elapsed() < LONG_TIMEOUT,
@@ -296,9 +313,12 @@ fn slow_subscriber_gets_resync_and_reader_never_blocks() {
             Ok(StreamEvent::Resync { snapshot }) => {
                 saw_resync = true;
                 resync_seq = snapshot.seq;
-                continue;
             }
             Ok(StreamEvent::Output { seq, .. }) => {
+                assert!(
+                    saw_resync,
+                    "繁中說明：佇列滿的停滯者恢復後應先收到 Resync 才收到 Output"
+                );
                 assert_eq!(
                     seq,
                     resync_seq + 1,
@@ -309,10 +329,16 @@ fn slow_subscriber_gets_resync_and_reader_never_blocks() {
             Ok(StreamEvent::Ended) => {
                 panic!("繁中說明：fixture 不應在此結束");
             }
-            Err(_) => continue,
+            // 逾時：flood 持續輸出時不該發生（`RECV_TIMEOUT` 5 秒內應有新
+            // chunk）；發生就繼續等，總期限由上面的 `LONG_TIMEOUT` 守住。
+            Err(_) => {
+                assert!(
+                    saw_resync,
+                    "繁中說明：停滯者逾時前應已收到 Resync（佇列曾滿的邊界）"
+                );
+            }
         }
     }
-    assert!(saw_resync, "繁中說明：佇列滿的停滯者恢復後應先收到 Resync");
     // log_dir 在此 Drop，隔離暫存檔隨測試結束刪除。
     let _ = &log_dir;
 }

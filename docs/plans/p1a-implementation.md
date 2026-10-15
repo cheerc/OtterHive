@@ -10,10 +10,11 @@
 
 ## 目前狀態
 
-- 已完成：P0 與 T2（protocol、admission、home、config、store）；T2 已經由 PR #1 合併。
-- T3 基準：`main`／`origin/main` 為 `b1a42b45f9f65bc2d4ccfc26f7f3378768f90840`；本包使用獨立整合分支，不直接修改 main。
-- T3 已集中 GREEN（本分支 HEAD，b8 審查修復後本地重跑）：procs（`arg=1` zombie 查詢、zombie-pgid 判 raw-errno ESRCH／probe 判 ECHILD、fallible list／reap、單一 lifecycle lock 直取）、terminal Session（reader＋observer JoinHandle、snapshot／seq／resync、resize／input）、Screen（VT 重繪、CJK／寬字元／合併音符、游標）、frame（1 MiB 界限、partial reader）。`cargo test --locked --all-targets` 全綠 106 passed（lib 48＋frame 19＋home_and_config 7＋process_arg1 2＋process_stop 11＋protocol_admission 8＋store_recovery 6＋terminal_session 5）；`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --doc` 通過。
-- H1／H2 已由整合測試驗證（`spawned_child_leads_its_process_group`、`process_start_time_is_stable_for_a_live_pid`）；H3 由 Screen 語意 round-trip 測試驗證；H8 由 `leader_exit_observation_keeps_the_owned_child_unreaped`（WNOWAIT 重複觀測＋`arg=1` 重驗）、`stop_after_leader_exit_cleans_remaining_group_members`、`recorded_leader_without_an_owned_lease_cannot_authorize_a_nonempty_group`、`revoked_lease_on_reused_group_makes_zero_signals`、`concurrent_stops_serialize_on_one_lock_with_exactly_one_reap` 覆蓋。調查證據在工作樹 `evidence/t3-h8-spike/`（未提交，不進 PR）。待雙 review 後發 PR #2。
+- 已完成：P0、T2、T3（T2 由 PR #1 合併，T3 由 PR #2 合併，merge commit `482cd0a`）。
+- T4 基準：`main`／`origin/main` 為 `482cd0ae1b6d8fa0349f4b9341ca97b572903896`；本包使用獨立整合分支，不直接修改 main。
+- T4 已集中 GREEN（本分支 HEAD）：daemon（socket 服務、單一 home 單一 daemon、啟動自檢 fail-closed、dispatch、lifecycle 操作、attach frame 串流、`Tuning` 讀測試環境變數）、授權（§2 權限表）、claude backend（§5.1 argv／協調提示／MCP 設定／skills symlink、§5.3 環境、§5.4 resume 證據）、MCP bridge transport（§10 全數）、client／CLI（§9 lifecycle 指令與 exit code 映射）、store 最小擴充（lifecycle 狀態／程序紀錄 API）。`backend: command` 本期回 `unsupported_in_phase`（見上）。
+- T4 驗證：`cargo test --locked --all-targets --no-fail-fast` 全綠 **226 passed／0 failed**；`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --doc` 通過。
+- T4 期內以三方討論裁決並落地的關鍵修正：`Session::drop` 的 join 改為真有界（`is_finished` 輪詢到單一 deadline、超時 detach；Drop 不持鎖），修正 §4.3-2「不以無限等待 join 冒充有界停止」；`kill(-pgid)` 對已退出 leader 回 `EPERM` 為 macOS 預期行為，EPERM＋probe 已確認 Exited 不視為失敗（活體 EPERM 仍 `Unproven`）；`RecordedLeader` 以 `pbi_status` 區分活體與 zombie（`waitid` 對非本程序子程序必然 `ECHILD`，故 probe 在該路徑為無效證據）。待雙 review 後發 PR #3。
 
 ## 全域約束
 
@@ -212,6 +213,16 @@ pub enum StreamEvent { Output { seq: u64, bytes: Vec<u8> }, Resync { snapshot: S
 pub fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8>;  pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)>;
 pub fn try_encode_frame(tag: u8, payload: &[u8]) -> io::Result<Vec<u8>>;   // 有界寫入；payload 超過 MAX_FRAME_BYTES 回 InvalidData
 ```
+
+`InstanceSpec` 的 `backend` 在 T4 只實作 `claude`（省略時預設；明確 `backend: command` 回 `unsupported_in_phase`，供 T5 之後擴充；`command`／`args` 欄位保留但 T4 不執行）。command backend 的完整行為延到需要它的工作包，不在 T4 以未驗證的 fixture 冒充。`tests/fixtures/backends/fake_claude.sh` 為唯一的 T4 backend fixture。
+
+**T4 只用 fake executable 驗證了 argv 的組裝順序**，不是真 Claude CLI 的行為。契約 §5.1 的以下規則在 canary（`docs/runbooks/native-claude-canary.md`，T8，另行授權）之前一律標為**未驗證**，不得以 fake 測試宣稱已成立：
+
+- `command` 欄位的語意：契約 §4.1 說它「可以是絕對路徑，或在 daemon 的 `PATH` 中查找的名稱」。T4 把它當成絕對路徑直接交給 PTY spawn，**沒有**做 `PATH` 查找，也沒有對相對路徑報錯——也就是說「在 `PATH` 中查找名稱」這條規則目前沒有實作。T4 的測試只用絕對路徑，因此不會發現這個差異。
+- `model`／`effort`：T4 只驗證它們被組裝成 `--model <v>`／`--effort <v>` 並放在正確位置。真 CLI 是否接受這些旗標與其值域，未驗證。
+- `--continue`：T4 只驗證有證據時 argv 取代 `--dangerously-skip-permissions`。真 CLI 是否接續「該目錄最新的 session」、`--continue` 與 MCP 設定／協調提示同時存在時的行為，未驗證。
+
+這個差別是刻意的：T4 的職責是把契約的介面組裝出來並測試組裝結果，不是宣稱真 CLI 接受它。要收斂這些差異需要 canary 的證據，那是 T8 的工作。
 
 `subscriber_queue` 必須大於 0，production 預設 256；daemon 從測試設定傳入，Session 本身不讀環境變數。`Resync { snapshot }` 在同一把 Session 鎖內擷取畫面並重設訂閱邊界；socket writer 將它依序編碼成 Resync 與 Snapshot 兩個 frame。reader 的 seq 計數與 Snapshot.seq 定義依契約 §7.1，不以送到某個 client 的次數計數。
 

@@ -31,6 +31,6 @@ backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 
 | 範圍 | 狀態 |
 |---|---|
 | P0：功能對照、MCP catalog、REA 行為基線 | 完成 |
-| P1a：lifecycle、訊息、終端 attach、team、deployment | T2（protocol、admission、home、config、store）實作完成；T3 程序與終端 Session（procs、terminal session／screen／frame）實作完成，b8 審查修復後本地重跑 `cargo test --locked --all-targets` 全綠 106 passed（lib 48＋frame 19＋home_and_config 7＋process_arg1 2＋process_stop 11＋protocol_admission 8＋store_recovery 6＋terminal_session 5），待 review 與 PR；見 [P1a 實作計畫](plans/p1a-implementation.md) |
+| P1a：lifecycle、訊息、終端 attach、team、deployment | T2（protocol、admission、home、config、store）與 T3 程序／終端 Session（procs、terminal session／screen／frame）實作完成並合併（PR #1、#2）；T4 daemon、授權、lifecycle、claude backend、bridge transport 與 CLI 實作完成，集中驗證 `cargo test --locked --all-targets` 全綠 226 passed，待 review 與 PR；見 [P1a 實作計畫](plans/p1a-implementation.md) |
 | P1b：TUI、resume／handoff 觸發、`set_metadata` 等 | 未開始 |
 | P2 以後：task、decision、worktree、review、CI、channel | 未開始；清單在 [`mcp-catalog.json`](reverse-engineering/mcp-catalog.json) |
