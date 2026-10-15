@@ -65,6 +65,9 @@ mod support {
     /// 期限，但仍有上限（逾時時報出最後觀測到的 log）。
     pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(45);
 
+    /// 單次 socket／process 回應的等待上限。
+    pub const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn daemon_bin() -> &'static str {
         match option_env!("CARGO_BIN_EXE_otterhive") {
             Some(path) => path,
@@ -465,5 +468,74 @@ fn two_agents_exchange_query_and_report_through_the_bridge() {
         "繁中說明：a 的兩則訊息（relay 與 pong）最終都應被 ack，\
          最後觀測：\n a 的 log：{:#?}",
         read_log(&log_a)
+    );
+}
+
+/// 建立一個**不讀 stdin** 的 instance（[`non_reader.sh`]）。
+fn create_non_reader(daemon: &support::Daemon, home: &support::TestHome, name: &str) {
+    let created = daemon.operator_call(
+        home,
+        "create_instance",
+        json!({
+            "name": name,
+            "command": support::fixture("non_reader.sh").to_string_lossy(),
+        }),
+    );
+    assert_eq!(
+        created.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：不讀 stdin 的 instance 應能啟動（測試前提），實際為 {created:?}"
+    );
+}
+
+/// 一個不讀 stdin 的 agent 收到喚醒提示時，daemon 對**其他**呼叫端仍然可用。
+///
+/// 這條測試**不是** D-1（阻塞式 PTY 寫入持有全域鎖）的迴歸防護，而且證明不了
+/// 那件事：實測在讀端不動時，macOS PTY 的寫端接受 64 MiB 都沒有阻塞，所以「寫入
+/// 阻塞 → 鎖死 daemon」沒有可達路徑。`Arc<Session>` 的改動仍值得保留（它讓寫入
+/// 不持鎖成為型別保證而非註解紀律），但它防的不是一個會發生的問題。
+///
+/// 這條測試驗的是另一件事：§6.4 的延後**沒有上限**，所以一個永遠安靜的收件人會讓
+/// 重判迴圈無限期地重判。它不該讓 `list_instances`／`pane_snapshot`／attach 對其他
+/// 呼叫端失效。
+#[test]
+fn a_non_reading_agent_does_not_stop_the_daemon_from_serving_other_callers() {
+    let home = support::TestHome::new();
+    let daemon = support::Daemon::start(&home);
+    create_non_reader(&daemon, &home, "mute");
+
+    // 反覆送：單一提示約 70 bytes，量測顯示 PTY 寫端即使完全不阻塞，累積起來也
+    // 需要足夠的量才能讓這個情境有代表性；而送多少都不會被「太多」擋下
+    // （§6.4 的延後沒有上限）。
+    for index in 0..200 {
+        let sent = daemon.operator_call(
+            &home,
+            "send",
+            json!({"instance": "mute", "message": format!("填充 {index}")}),
+        );
+        assert_eq!(
+            sent.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：send 應完成（訊息寫入與喚醒分開，§6.1），實際為 {sent:?}"
+        );
+    }
+
+    // 關鍵斷言：daemon 仍然能回應。
+    let responsive = support::poll_until(support::SHORT_TIMEOUT, || {
+        daemon
+            .operator_call(&home, "list_instances", json!({}))
+            .outcome
+            == otterhive::protocol::Outcome::Completed
+    });
+    assert!(
+        responsive,
+        "繁中說明：不讀 stdin 的 agent 收到提示時，daemon 仍必須能回應其他請求"
+    );
+
+    let snapshot = daemon.operator_call(&home, "pane_snapshot", json!({"instance": "mute"}));
+    assert_eq!(
+        snapshot.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：pane_snapshot 應仍能執行，實際為 {snapshot:?}"
     );
 }
