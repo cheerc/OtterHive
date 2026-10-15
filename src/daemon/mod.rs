@@ -234,7 +234,18 @@ fn millis(key: &str, default: u64) -> Duration {
 
 /// 一個正在執行的 instance 的記憶體狀態。
 struct Running {
-    session: Session,
+    /// `Arc<Session>` 而不是 owned `Session`（D-1 的結構性修法）。
+    ///
+    /// 喚醒排程器必須能在**不持有 daemon 全域鎖**的情況下寫入 PTY。若
+    /// `Inner::running` 存的是 owned `Session`，要拿到它就只能持有鎖遍歷
+    /// `running`，而 `Session` 不可 `Clone`（它的 `_child` 欄位持有 child
+    /// handle、`threads` 欄位在 `Drop` 時做有界 join——複製會讓同一個 child 被
+    /// drop 兩次）。
+    ///
+    /// 所以存 `Arc`：鎖內 `Arc::clone` 取得一個不借用 `inner` 的擁有者，放掉鎖
+    /// 之後才寫入。鎖的生命週期與寫入完全分離，這是型別強制的，不是靠註解
+    /// 提醒。
+    session: Arc<Session>,
     /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
     ///
     /// 喚醒排程器用它判斷「收件人已換了 generation」→ 放棄尚未送出的提示
@@ -1358,7 +1369,7 @@ fn spawn_instance(
             spec.name.clone(),
             Running {
                 generation: row.as_ref().map(|row| row.generation).unwrap_or_default(),
-                session,
+                session: Arc::new(session),
                 last_screen: None,
             },
         );
@@ -2076,11 +2087,26 @@ fn schedule_hint(
 /// 必須分別回報。失敗時排程器已被 `commit_delivery` 清空，所以這則提示不會
 /// 重試——延續「PTY master 已關時重試沒意義」的裁決（實作判斷，非契約推導）。
 fn write_hint(state: &DaemonState, instance: &str, bytes: &[u8]) -> Result<(), ()> {
-    let inner = state.lock();
-    match inner.running.get(instance) {
-        Some(running) => running.session.write_input(bytes).map_err(|_| ()),
-        None => Err(()),
-    }
+    // **鎖內只做 clone，寫入在鎖外。**
+    //
+    // `Inner::running` 存的是 `Arc<Session>`，所以能在鎖內取得一個不借用 `inner`
+    // 的擁有者；`session` 這個綁定離開區塊時鎖已釋放，之後的 `write_input`
+    // （可能因 PTY 緩衝區滿而阻塞）不再持有 daemon 的全域鎖。
+    //
+    // 這個函式第一次寫成「取得鎖 → 在 match 內寫入」，那與原本
+    // `schedule_hint` 裡的行為一模一樣，只是把缺陷搬到輔助函式。`cargo clippy`
+    // 抓不到（鎖的型別沒變），`wake_delivery` 的 8 支也綠（提示只有約 70 bytes，
+    // 從來沒填滿過緩衝區）。**註解與函式名不能保證不變量，型別可以。**
+    let session = {
+        let inner = state.lock();
+        match inner.running.get(instance) {
+            Some(running) => Arc::clone(&running.session),
+            // 收件人已不在 `running`：提示無處可去。回 `Err` 而不靜靜丟棄——
+            // 呼叫端會把它翻成 `failed`（§6.4），不會假裝送達。
+            None => return Err(()),
+        }
+    };
+    session.write_input(bytes).map_err(|_| ())
 }
 
 /// 啟動背景重判迴圈（§6.4 的「每 250 毫秒重新判斷，直到條件解除才送出」）。
