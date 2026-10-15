@@ -405,20 +405,21 @@ fn two_agents_exchange_query_and_report_through_the_bridge() {
     );
 
     // b 收到 a 的 query（§6.3：至少一次，所以是「有」而不是「恰好一則」）。
-    let query_bodies = received_bodies(&log_b_final, "ping");
-    assert!(
-        !query_bodies.is_empty(),
-        "繁中說明：b 應收到 body 含 ping 的 query，實際 log：{log_b_final:#?}"
-    );
+    //
+    // 找的是 body **完全等於** `ping` 的那則：`received_bodies(.., "ping")` 用
+    // `contains`，會把 b 自己收到的 report `pong:ping` 也算進來（它的 body 含有
+    // `ping`）——那樣會挑到錯誤的訊息，後面的 `kind == "query"` 斷言就成了運氣。
     let query = events_named(&log_b_final, "received")
         .into_iter()
-        .find(|item| {
-            item["message"]["body"]
-                .as_str()
-                .is_some_and(|body| body.contains("ping"))
-        })
-        .expect("繁中說明：exchange 成立時應有對應的 received 記錄")["message"]
-        .clone();
+        .find(|item| item["message"]["body"] == json!("ping"))
+        .map(|item| item["message"].clone())
+        .unwrap_or_else(|| {
+            panic!("繁中說明：b 應收到 body 為 ping 的 query，實際 b 的 log：{log_b_final:#?}")
+        });
+    assert!(
+        !received_bodies(&log_b_final, "ping").is_empty(),
+        "繁中說明：b 應收到含 ping 的 query，實際 log：{log_b_final:#?}"
+    );
     assert_eq!(
         query["kind"],
         json!("query"),
