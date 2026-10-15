@@ -1638,6 +1638,28 @@ fn delete_instance(
             Ok(row) => row,
             Err(result) => return *result,
         };
+        // 契約 §4.5：刪除某 team 的 orchestrator 回 `invalid_argument`，要求先
+        // 更換 orchestrator 或刪除 team。**在停止程序之前**拒絕——停止是這個
+        // instance 最重的副作用，讓一個只要換個 orchestrator 就能解決的設定問題
+        // 先把程序殺掉並封存 inbox，會讓呼叫端以為「刪除已完成一半」。
+        let orchestrator_of = {
+            let mut inner = state.lock();
+            inner
+                .store
+                .transaction(|tx| tx.team_of_instance_name(&name))
+                .unwrap_or(None)
+        };
+        if let Some((team, orchestrator)) = orchestrator_of {
+            if orchestrator == name {
+                return OperationResult::refused(
+                    operation_id,
+                    ErrorCode::InvalidArgument,
+                    &format!(
+                        "{name} 是 team {team} 的 orchestrator；請先更換 orchestrator 或刪除該 team"
+                    ),
+                );
+            }
+        }
         let mut effects = Vec::new();
         if row.pid.is_some() {
             match stop_previous(state, &row) {
