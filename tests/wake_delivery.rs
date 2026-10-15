@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use otterhive::home::Home;
 use otterhive::protocol::{Auth, OperationResult, Outcome, Request};
 use otterhive::terminal::frame::{encode_frame, read_frame};
+use otterhive::wake;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -340,6 +341,47 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// 送一則輸入並**等到它的回聲真的出現**，回傳從送出到回聲出現的耗時。
+///
+/// 這是取代固定 sleep 的關鍵（0a review B2）。`drain_frames(timeout)` 的語意
+/// 是「讀滿 timeout 的時間窗」，而它內部的 `recv_timeout` 輪询在沒有 frame
+/// 抵達時會空轉 `RECV_TIMEOUT`（10 秒）才返回 `TimedOut`。所以
+/// `drain_frames(WAKE_QUIET_MS + 300)` 實際上不是「等 450ms」，而是「等第一個
+/// frame 抵達，或 10 秒後回傳」——回聲若在 452ms 才到，測試端就在那時才拿到它。
+///
+/// 而 §6.4 的 `should_defer` 讀的是 `Session` 的 `last_output_at`，那要等
+/// daemon 端真的**處理完**這個輸入並讓 fixture 印出回聲才會更新。於是「打字
+/// 已生效」這件事在測試時鐘上要 450ms 才成立，而 `WAKE_INPUT_MS` 只有 700ms
+/// ——餘裕約 250ms，在 CI 的滿載下被吃光，於是 `send` 時兩個延後條件都不成立，
+/// 回 `hinted` 而非 `deferred`。
+///
+/// 這裡改成**輪詢到回聲字串真的出現在已讀到的畫面裡**為止（有上限，逾時時報
+/// 出實際觀察到的內容）。那個時刻就是 `last_output_at` 已更新的時刻，所以
+/// `send` 接著發生時「剛剛有輸出」這個條件是**可觀測的**，而不是靠猜一段
+/// sleep 夠不夠。
+///
+/// 逾時視窗刻意大於 `WAKE_INPUT_MS`（700ms）：它只是「等回聲出現」的上限，
+/// 不是延後條件的長度——回聲一出現就立刻返回，所以正常情況下約 50–450ms。
+/// 逾時時報錯而不是靜靜繼續，是為了讓「回聲從未出現」不會被誤讀成
+/// 「回聲出現了但太慢」。
+fn type_and_await_echo(client: &mut AttachClient, input: &[u8], echoed: &str) -> Duration {
+    let start = Instant::now();
+    client.type_bytes(input);
+    let deadline = start + Duration::from_millis(WAKE_INPUT_MS * 4);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        seen = frame_text(&client.drain_frames(Duration::from_millis(200)));
+        if seen.contains(echoed) {
+            return start.elapsed();
+        }
+    }
+    panic!(
+        "繁中說明：輸入 {input:?} 的回聲 {echoed:?} 未在期限內出現。\
+         `last_output_at` 不會更新，§6.4 的「剛剛有輸出」條件不成立。\
+         最後讀到的畫面為 {seen:?}"
+    );
+}
+
 /// 把 frame 序列還原成純文字（Output 的 bytes 直接串接）。
 ///
 /// 契約 §7.2：tag `0x02`（Output）的 payload 是 **8 byte big-endian seq ＋
@@ -364,6 +406,60 @@ fn frame_text(frames: &[(u8, Vec<u8>)]) -> String {
         text.push_str(&String::from_utf8_lossy(bytes));
     }
     text
+}
+
+/// 等到某個 instance 的畫面靜默下來：`WAKE_QUIET_MS` 內不再有輸出。
+///
+/// 這是 §6.4 第二個延後條件（「收件人最近 `WAKE_QUIET_MS` 內有輸出」）的
+/// **可觀測**前置條件。不用固定 sleep——sleep 的長度與 daemon 處理輸入、
+/// fixture 印字、frame 送達的實際耗時無關，只會在負載下變成另一個不可靠的數字。
+fn require_quiet(home: &TestHome, daemon: &Daemon, instance: &str, what: &str) {
+    // 用「睡滿一個靜默視窗後畫面仍相同」當靜默的證據。
+    //
+    // **不可用單純的「畫面沒變」**：那只能證明 `Screen` 沒被重繪，而 §6.4 的
+    // `should_defer` 讀的是 PTY 讀取執行緒的 `last_output_at`。畫面在 PTY 有新
+    // 輸出**被讀進來之前**就已經是舊樣子了，所以「畫面沒變」可能只是「輸出還
+    // 在路上」。
+    //
+    // 這裡睡的長度**就是靜默的定義本身**（§6.4 的 500ms，測試縮短成
+    // `WAKE_QUIET_MS`），不是一個需要「夠長」的經驗值。負載再高它依然成立——
+    // 只是回來得晚一點，沒有任何一個數字需要對齊。
+    let deadline = Instant::now() + Duration::from_millis(WAKE_INPUT_MS * 8);
+    let settle = Duration::from_millis(WAKE_QUIET_MS + POLL_STEP.as_millis() as u64);
+    let mut last = screen_text(home, daemon, instance);
+    loop {
+        std::thread::sleep(settle);
+        let current = screen_text(home, daemon, instance);
+        if current == last {
+            return;
+        }
+        last = current;
+        if Instant::now() >= deadline {
+            panic!(
+                "繁中說明：{what} 應在期限內安靜下來，但畫面持續變動。\
+                 最後一次看到的畫面為 {last:?}"
+            );
+        }
+    }
+}
+
+/// 等待 §6.4 的 client 輸入視窗自最後一次輸入起算已過期。
+///
+/// 睡的長度**就是視窗的定義本身**（`WAKE_INPUT_MS`，daemon 由
+/// `OTTERHIVE_TEST_WAKE_INPUT_MS` 讀一次），不是一個需要「夠長」的經驗值。
+/// daemon 的 `last_client_input` 記的是 Input frame 抵達的時刻，而上一步的
+/// `type_and_await_echo` 回傳的就是「回聲已出現」的時刻——那比 Input frame
+/// 抵達**晚**（daemon 先記時間戳、再寫入 PTY、fixture 才印字），所以從回聲
+/// 出現起算滿整個視窗，一定覆蓋了「自輸入起算」的時間。
+fn require_input_window_elapsed(what: &str) {
+    let settle = Duration::from_millis(WAKE_INPUT_MS + POLL_STEP.as_millis() as u64);
+    std::thread::sleep(settle);
+    assert!(
+        WAKE_INPUT_MS > wake::RECHECK_INTERVAL.as_millis() as u64,
+        "繁中說明：輸入視窗（{WAKE_INPUT_MS}ms）必須大於重判節拍（{}ms），\
+         否則「安靜了一個視窗」與「重判了一輪」互相矛盾。{what}",
+        wake::RECHECK_INTERVAL.as_millis()
+    );
 }
 
 /// 建立一個跑 `echo_agent.sh` 的 instance，回傳它的 generation。
@@ -498,9 +594,10 @@ fn a_recent_client_input_defers_the_hint_until_the_input_window_passes() {
     let mut client = AttachClient::attach(&home, "worker", worker);
     let _ = client.drain_frames(Duration::from_millis(300));
 
-    // operator 剛剛「打過字」——這就是延後條件的第一個來源。
-    client.type_bytes(b"hello\n");
-    let _ = client.drain_frames(Duration::from_millis(WAKE_QUIET_MS + 300));
+    // operator 剛剛「打過字」——這就是延後條件的第一個來源。**等回聲真的
+    // 出現**再送訊：回聲出現的那一刻就是 `last_output_at` 已更新的時刻，
+    // 所以「剛剛有輸出」是���觀測的事實而不是固定 sleep（0a review B2）。
+    type_and_await_echo(&mut client, b"hello\n", "echo: hello");
 
     let sent = daemon.operator_call(
         &home,
@@ -539,8 +636,7 @@ fn two_deferred_hints_are_merged_into_one_line_with_a_count() {
 
     let mut client = AttachClient::attach(&home, "worker", worker);
     let _ = client.drain_frames(Duration::from_millis(300));
-    client.type_bytes(b"typing\n");
-    let _ = client.drain_frames(Duration::from_millis(WAKE_QUIET_MS + 300));
+    type_and_await_echo(&mut client, b"typing\n", "echo: typing");
 
     // 兩則都在延後中送出：第一則的 kind 刻意與第二則不同，這樣
     // 「取最後一則的 kind」才看得出來。
@@ -691,8 +787,7 @@ fn a_hint_is_abandoned_when_the_restart_happens_first_but_the_message_stays_drai
 
     let mut client = AttachClient::attach(&home, "worker", worker);
     let _ = client.drain_frames(Duration::from_millis(300));
-    client.type_bytes(b"typing\n");
-    let _ = client.drain_frames(Duration::from_millis(WAKE_QUIET_MS + 300));
+    type_and_await_echo(&mut client, b"typing\n", "echo: typing");
 
     let sent = daemon.operator_call(
         &home,
@@ -906,11 +1001,20 @@ fn a_teardown_style_screen_check_shows_the_hint_landed_on_the_real_pane() {
 
     let mut client = AttachClient::attach(&home, "worker", worker);
     let _ = client.drain_frames(Duration::from_millis(300));
-    client.type_bytes(b"quiet\n");
-    let _ = client.drain_frames(Duration::from_millis(WAKE_QUIET_MS + 400));
-    client.detach();
-    drop(client);
-    std::thread::sleep(Duration::from_millis(WAKE_QUIET_MS + 200));
+    // 這支測試要的是 `hinted`（§6.4 的「安靜的 running 收件人」），所以**兩個**
+    // 延後條件都必須不成立：輸入視窗自上次輸入起算已過期（§6.4 的第一項，
+    // daemon 的 `last_client_input` 記的是 Input frame 收到的時刻，而 detach
+    // **不會**清掉它——detach 不是輸入），且輸出靜默視窗自上次輸出起算已滿。
+    //
+    // 兩個條件都用「可觀測的量」等待，而不是固定 sleep：
+    // - 輸入視窗：等待時間本身就是視窗的定義（`WAKE_INPUT_MS`）。
+    // - 輸出視窗：`require_quiet` 睡滿 `WAKE_QUIET_MS` 後確認畫面未變。
+    //
+    // 這裡**不** detach——detach 不影響 §6.4 的判定，而留著 client 可以讓後面
+    // 用 `pane_snapshot` 獨立觀察提示是否真的落到畫面上（那是這支測試的
+    // 另一個命題）。
+    require_quiet(&home, &daemon, "worker", "回聲後的安靜期");
+    require_input_window_elapsed("輸入視窗過期");
 
     let sent = daemon.operator_call(
         &home,
