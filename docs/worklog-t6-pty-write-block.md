@@ -56,7 +56,18 @@ spawn_wake_recheck
 - 不引入新的無界結構（相較於「單一 writer 執行緒 + 有界佇列」，後者需要在「延後沒有上限」之下再引入一個上限）。
 - 呼叫端不被阻塞。
 
-### 技術障礙（動工前必讀）
+### 待決分支：兩條路線**不對稱**（動工前必須選定）
+
+「裁決成 `O_NONBLOCK`」與「fd 私有」是**同一個發現的兩面**，而它們的工程量差一個數量級：
+
+| 路線 | 工程量與風險 | 前置工作 |
+|---|---|---|
+| **對既有 fd 做 `fcntl`** | portable-pty **不開窗**：`take_writer()` 回傳 `Box<dyn Write>`、fd 私有，`UnixMasterPty` 的公開方法只有 `resize`／`get_size`／`try_clone_reader`／`take_writer`。要拿到 fd 只能在它的 PTY 建立上打洞——依賴其內部實作細節，上游一改版就失效。 | 需要先確認是否有任何間接途徑取得 fd（目前看沒有） |
+| **自建 `libc::openpty`** | 直接得到 fd，但等於**重建 T3 驗證過的 PTY 建立路徑**：命令組裝、環境過濾、session leader 設定（§4.2-3 的 `pgid == pid`）、`OwnedLeaderLease` 建立。**特別是 H8**（`waitid(WEXITED\|WNOHANG\|WNOWAIT)` 不提前 reap、pgid 綁定）——那不是「動到不變量」，而是**重新驗證不變量**。 | T3 的 H8 驗證必須重做一遍 |
+
+**所以「選定路線」應是動工前的待決分支，不是動工時才決定。** 排程上前者小、後者大得多，而後者還帶著一整輪 PTY 建立的不變量重驗。
+
+## 技術障礙（動工前必讀）
 
 `Session::spawn`（`src/terminal/session.rs:181`）呼叫 `pair.master.take_writer()`，而 portable-pty 0.9 的 `take_writer`（`unix.rs:357`）回傳 `Box<dyn Write + Send>`，**內部 fd 私有、無法事後 `fcntl(F_SETFL, O_NONBLOCK)`**。`UnixMasterPty` 的公開方法只有 `resize`／`get_size`／`try_clone_reader`／`take_writer`。
 

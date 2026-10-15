@@ -242,11 +242,15 @@ struct Running {
     /// `Arc::clone` 取得一個不借用 `inner` 的擁有者，放掉鎖之後才寫入。鎖的生命
     /// 週期與寫入完全分離，這是型別強制的，不是靠註解提醒。
     ///
-    /// **這個型別強制本身防的威脅經實測不可達**：量測顯示 macOS PTY 在讀端不動
-    /// 時接受 64 MiB 都沒有阻塞，而提示行的長度由 §6.4 的機制決定（`count` 加
-    /// 36 字元 UUID），永遠遠低於那個容量。所以「寫入阻塞 → 鎖死 daemon」沒有
-    /// 可達路徑。保留 `Arc` 是因為它讓正確的性質由型別保證、且 `Session` 不可
-    /// clone 使它成為唯一選項——**不是**因為已證實有那個缺陷。
+    /// **這個型別強制解決的是鎖的粒度，不是「寫入不會阻塞」。** `write_input`
+    /// 內部仍要鎖 `core.writer`（`Mutex<Box<dyn Write>>`），而 PTY 的 `write(2)`
+    /// 在收件人不讀 stdin 時**確實會阻塞**——`interrupt`、attach Input 與喚醒
+    /// 三條路徑都走它。證據（CI 兩次因此紅、`sample` 取得的執行緒堆疊、累積門檻）
+    /// 見 [`docs/worklog-t6-pty-write-block.md`](crate::docs)。已裁決的修法是 writer
+    /// 改 `O_NONBLOCK`，作為 T6 開工前的第一項工作包。
+    ///
+    /// 所以保留 `Arc` 的理由是：它讓「寫入不持 daemon 鎖」由型別保證、且
+    /// `Session` 不可 `Clone` 使它成為唯一選項——**不是**因為寫入不會阻塞。
     session: Arc<Session>,
     /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
     ///
