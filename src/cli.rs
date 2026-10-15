@@ -1,4 +1,4 @@
-//! T4 Lane B：operator CLI 的指令表與 exit code 映射（契約 §9）。
+//! T5 Lane B：operator CLI 的指令表與 exit code 映射（契約 §9）。
 //!
 //! - 全域選項 `--home <dir>` 優先於 `OTTERHIVE_HOME`。CLI 從
 //!   `secrets/operator.token` 讀 operator 憑證。
@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::protocol::Outcome;
+use crate::protocol::{OperationResult, Outcome};
 
 /// CLI 的預設逾時（與 [`client::DEFAULT_TIMEOUT`] 同源）。
 pub const DEFAULT_TIMEOUT: Duration = client::DEFAULT_TIMEOUT;
@@ -45,11 +45,24 @@ pub const OPERATIONS: [&str; 7] = [
     "snapshot",
 ];
 
+/// T5 新增的 CLI 指令（契約 §9 的 `send` 與 `team`）。
+///
+/// 這是**指令名稱**，不是操作名稱：`team` 是一個帶 `action` 的操作
+/// （create／update／delete／list），`send` 對應同名操作。
+pub const T5_COMMANDS: [&str; 6] = [
+    "send",
+    "team",
+    "team create",
+    "team update",
+    "team delete",
+    "team list",
+];
+
 /// 只經 socket、不經 CLI 表格的兩個操作（契約 §1）。
 pub const SOCKET_ONLY_OPERATIONS: [&str; 2] = ["attach", "tools_list"];
 
 /// CLI 指令名稱 → 操作名稱（與 MCP 工具同名，契約 §1）。
-const COMMAND_TO_OP: [(&str, &str); 7] = [
+const COMMAND_TO_OP: [(&str, &str); 8] = [
     ("create", "create_instance"),
     ("start", "start_instance"),
     ("delete", "delete_instance"),
@@ -57,6 +70,7 @@ const COMMAND_TO_OP: [(&str, &str); 7] = [
     ("list", "list_instances"),
     ("interrupt", INTERRUPT_OP),
     ("snapshot", "pane_snapshot"),
+    ("send", "send"),
 ];
 
 /// `interrupt` 的 socket 操作名稱。
@@ -122,6 +136,8 @@ pub fn parse(args: &[String]) -> Parsed {
             Command::List(call) => lifecycle(cli.home, "list", call),
             Command::Interrupt(call) => lifecycle(cli.home, "interrupt", call),
             Command::Snapshot(call) => lifecycle(cli.home, "snapshot", call),
+            Command::Send(call) => send(cli.home, call),
+            Command::Team(action) => team(cli.home, action.as_wire().to_owned(), action.args()),
             Command::Call(raw) => match serde_json::from_str::<Value>(&raw.json) {
                 Ok(args) => Parsed::RawCall {
                     home: cli.home,
@@ -153,6 +169,108 @@ fn lifecycle(home: Option<PathBuf>, command: &str, call: CallArgs) -> Parsed {
     let op = operation_for(command);
     let args = build_args(&op, &call);
     Parsed::Call { home, op, args }
+}
+
+/// `otterhive send (--to <name>… | --team <team>) [--kind …] <message>`
+/// → `send`（契約 §6.1、§9）。
+///
+/// 收件人三擇一（`instance`／`instances`／`team`）的**選擇**在 CLI 層做完：
+/// `--to <name>` 出現一次給 `instance`，兩次以上給 `instances`，`--team`
+/// 給 `team`。三個欄位一個都不給時，這裡不自行補上任何一個——那是 daemon
+/// 端以 `invalid_argument` 表達的契約句（§3），CLI 不預判。
+///
+/// `--kind` 映射到 `request_kind`（`query`／`report`／`update`）。省略時
+/// **不送** `request_kind`，讓 daemon 記為 `message`（§6.1）。
+fn send(home: Option<PathBuf>, call: SendArgs) -> Parsed {
+    let mut args = json!({
+        "message": call.message.unwrap_or_default(),
+    });
+    let insert = |args: &mut Value, key: &str, value: Option<&String>| {
+        if let Some(value) = value {
+            args.as_object_mut()
+                .expect("args 應為物件")
+                .insert(key.to_owned(), json!(value));
+        }
+    };
+    match call.to.len() {
+        0 => {}
+        1 => insert(&mut args, "instance", Some(&call.to[0])),
+        _ => {
+            // 契約 §6.1 的 `instances` 是**名稱陣列**（與 `team.members`
+            // 同形），因此多個 `--to` 合成一個陣列而不是逗號字串。
+            let names: Vec<Value> = call
+                .to
+                .iter()
+                .flat_map(|entry| split_names(entry))
+                .map(Value::from)
+                .collect();
+            args.as_object_mut()
+                .expect("args 應為物件")
+                .insert("instances".to_owned(), Value::Array(names));
+        }
+    }
+    insert(&mut args, "team", call.team.as_ref());
+    insert(&mut args, "request_kind", call.kind.as_ref());
+    Parsed::Call {
+        home,
+        op: "send".to_owned(),
+        args,
+    }
+}
+
+/// `otterhive team <action> …` → `team` 操作（契約 §8.1、§9）。
+///
+/// `action` 直接沿用 CLI 子指令名（create／update／delete／list），它同時
+/// 是 `team` 操作的 `action` 欄位值；沒有隱藏對應，因此不會出現
+/// 「CLI 指令叫一個名字、daemon 收另一個名字」的分歧。
+///
+/// `name` 是位置參數：create／update／delete 必填（daemon 以
+/// `invalid_argument` 表達缺漏，§8.1），`list` 省略時不送 `name`。
+fn team(home: Option<PathBuf>, action: String, call: TeamArgs) -> Parsed {
+    let mut args = json!({ "action": action });
+    let insert = |args: &mut Value, key: &str, value: Option<&String>| {
+        if let Some(value) = value {
+            args.as_object_mut()
+                .expect("args 應為物件")
+                .insert(key.to_owned(), json!(value));
+        }
+    };
+    insert(&mut args, "name", call.name.as_ref());
+    insert(&mut args, "orchestrator", call.orchestrator.as_ref());
+    insert(&mut args, "description", call.description.as_ref());
+    for (key, list) in [
+        ("members", call.members),
+        ("add", call.add),
+        ("remove", call.remove),
+        ("accept_from", call.accept_from),
+    ] {
+        if let Some(list) = list {
+            let names: Vec<Value> = split_names(&list).into_iter().map(Value::from).collect();
+            args.as_object_mut()
+                .expect("args 應為物件")
+                .insert(key.to_owned(), Value::Array(names));
+        }
+    }
+    Parsed::Call {
+        home,
+        op: "team".to_owned(),
+        args,
+    }
+}
+
+/// 把 `--members <a,b>` 這類的逗號分隔旗標拆成名稱陣列。
+///
+/// 去空白、丟空項，讓 `--members "a, b"` 與 `--members a,b` 等價；重複的
+/// 名稱**不**在此去掉（§8.1 說「member 名稱去重後必須是已存在、未刪除的
+/// instance」——去重是規則的一部分，但重複名稱該不該被接受是 daemon 端的
+/// 判斷；CLI 把它原樣送出，讓該判斷有一個明確的輸入）。
+fn split_names(entry: &str) -> Vec<String> {
+    entry
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// 由操作名稱與旗標組成 `args`（契約 §9 的旗標對應操作的欄位）。
@@ -260,6 +378,13 @@ pub fn read_operator_token(home: &Path) -> Option<String> {
     Some(token.to_owned())
 }
 
+/// 把 `OperationResult` 的 outcome 轉成 CLI 的 exit code（契約 §9）。
+///
+/// 這是純函式的轉換，讓 CLI 的執行迴圈與它的測試共用同一份映射。
+pub fn exit_code_of(result: &OperationResult) -> i32 {
+    exit_code_for(result.outcome)
+}
+
 // ------------------------------------------------------------------ clap
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -294,8 +419,101 @@ enum Command {
     Interrupt(CallArgs),
     /// 取得畫面純文字。
     Snapshot(CallArgs),
+    /// 送訊息（契約 §6.1）。
+    Send(SendArgs),
+    /// team 的建立／更新／刪除／列出（契約 §8.1）。
+    #[command(subcommand)]
+    Team(TeamAction),
     /// 任何操作的原始呼叫，供除錯。
     Call(RawArgs),
+}
+
+/// `otterhive team …` 的四個 action（契約 §8.1）。
+///
+/// 名稱沿用操作的 `action` 欄位值：create／update／delete／list。
+#[derive(Debug, Subcommand)]
+enum TeamAction {
+    /// 建立 team。
+    Create(TeamArgs),
+    /// 更新既有 team 的成員／orchestrator／accept_from／description。
+    Update(TeamArgs),
+    /// 刪除 team（不刪 instance）。
+    Delete(TeamArgs),
+    /// 列出所有 team。
+    List(TeamArgs),
+}
+
+impl TeamAction {
+    /// 操作的 `action` 欄位值。
+    fn as_wire(&self) -> &'static str {
+        match self {
+            TeamAction::Create(_) => "create",
+            TeamAction::Update(_) => "update",
+            TeamAction::Delete(_) => "delete",
+            TeamAction::List(_) => "list",
+        }
+    }
+
+    fn args(self) -> TeamArgs {
+        match self {
+            TeamAction::Create(args)
+            | TeamAction::Update(args)
+            | TeamAction::Delete(args)
+            | TeamAction::List(args) => args,
+        }
+    }
+}
+
+/// `otterhive send …` 的旗標（契約 §6.1、§9 的表格）。
+///
+/// 收件人三擇一由 `--to`（可重複）與 `--team` 表達；兩者都不給時不預設，
+/// 由 daemon 以 `invalid_argument` 拒絕。
+#[derive(Debug, ClapArgs)]
+struct SendArgs {
+    /// 收件人 instance 名稱（可重複；一個給 `instance`，多個給 `instances`）。
+    #[arg(long = "to", value_name = "NAME")]
+    to: Vec<String>,
+    /// 收件人 team（其成員除 sender 外都收得到）。
+    #[arg(long = "team", value_name = "TEAM")]
+    team: Option<String>,
+    /// 訊息種類：`query`／`report`／`update`；省略由 daemon 記為 `message`。
+    #[arg(long = "kind", value_name = "KIND")]
+    kind: Option<String>,
+    /// 訊息本文（位置參數）。
+    #[arg(value_name = "MESSAGE")]
+    message: Option<String>,
+}
+
+/// `otterhive team …` 的旗標（契約 §8.1、§9 的表格）。
+///
+/// 成員類的欄位都是逗號分隔（`--members <a,b>`），解析後成為名稱陣列。
+/// `members`／`orchestrator` 對 `create` 是必填，但**不在 clap 層標為必填**：
+/// §8.1 的規則是「缺少必填參數 → `invalid_argument`」，那是 daemon 端的
+/// 拒絕；CLI 在解析層就擋掉會讓 exit code 與錯誤碼對不上（§9 的 1 是
+/// 「請求格式錯誤」，但缺必填參數是契約明文的 `invalid_argument`，該走 3）。
+#[derive(Debug, ClapArgs)]
+struct TeamArgs {
+    /// team 名稱（`list` 可省略）。
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// `--members <a,b>`：建立時的成員。
+    #[arg(long = "members", value_name = "A,B")]
+    members: Option<String>,
+    /// `--add <a,b>`：update 時加入的成員。
+    #[arg(long = "add", value_name = "A,B")]
+    add: Option<String>,
+    /// `--remove <a,b>`：update 時移除的成員。
+    #[arg(long = "remove", value_name = "A,B")]
+    remove: Option<String>,
+    /// orchestrator（必須是 members 之一，§8.1）。
+    #[arg(long = "orchestrator", value_name = "NAME")]
+    orchestrator: Option<String>,
+    /// `--accept-from <x,y>`：允許送訊息給 orchestrator 的 instance 名稱（§6.2）。
+    #[arg(long = "accept-from", value_name = "X,Y")]
+    accept_from: Option<String>,
+    /// 描述。
+    #[arg(long = "description", value_name = "D")]
+    description: Option<String>,
 }
 
 /// 一個 lifecycle 指令的旗標（契約 §9 的表格）。
@@ -370,14 +588,21 @@ struct RawArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_code_for, parse, read_operator_token, Parsed};
+    use super::{exit_code_for, exit_code_of, parse, read_operator_token, Parsed};
     use crate::cli::exit_code;
-    use crate::protocol::Outcome;
+    use crate::protocol::{ErrorCode, OperationResult, Outcome};
 
     fn argv(parts: &[&str]) -> Vec<String> {
         std::iter::once("otterhive")
             .chain(parts.iter().copied())
             .map(|part| part.to_owned())
+            .collect()
+    }
+
+    /// 允許傳入 `Vec<String>`（需要組出旗標時用）。
+    fn argv_owned(parts: Vec<String>) -> Vec<String> {
+        std::iter::once("otterhive".to_owned())
+            .chain(parts)
             .collect()
     }
 
@@ -589,12 +814,265 @@ mod tests {
 
     #[test]
     fn an_unknown_command_is_malformed_not_a_silent_success() {
-        match parse(&argv(&["deploy", "x"])) {
-            Parsed::Malformed { reason } => {
-                assert!(!reason.is_empty(), "繁中說明：未認得的指令應有說明")
+        // `deploy`／`teardown`／`deployments` 屬於 T6（§8.3），T5 尚未實作。
+        for command in ["deploy", "teardown", "deployments"] {
+            match parse(&argv(&[command, "x"])) {
+                Parsed::Malformed { reason } => {
+                    assert!(!reason.is_empty(), "繁中說明：未認得的指令應有說明")
+                }
+                other => {
+                    panic!("繁中說明：{command} 屬 T6，T5 應解析為 Malformed，實際為 {other:?}")
+                }
             }
-            other => panic!("應解析為 Malformed（T4 尚無 deploy），實際為 {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_to_one_instance_sends_the_singular_recipient_field() {
+        match parse(&argv(&["send", "--to", "worker", "請回報進度"])) {
+            Parsed::Call { op, args, .. } => {
+                assert_eq!(op, "send", "契約 §9：send 對應 send 操作");
+                assert_eq!(args["instance"], "worker", "單一收件人用 instance");
+                assert!(
+                    args.get("instances").is_none(),
+                    "繁中說明：單一收件人不該送 instances，實際為 {args}"
+                );
+                assert_eq!(args["message"], "請回報進度");
+                assert!(
+                    args.get("request_kind").is_none(),
+                    "繁中說明：--kind 省略時不送 request_kind，由 daemon 記為 message（契約 §6.1），實際為 {args}"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_to_several_instances_sends_the_plural_field() {
+        match parse(&argv(&[
+            "send", "--to", "a", "--to", "b", "--to", "c", "內容",
+        ])) {
+            Parsed::Call { op, args, .. } => {
+                assert_eq!(op, "send");
+                assert!(
+                    args.get("instance").is_none(),
+                    "繁中說明：多個收件人時不該送 instance，實際為 {args}"
+                );
+                assert_eq!(
+                    args["instances"],
+                    serde_json::json!(["a", "b", "c"]),
+                    "繁中說明：多個 --to 應成為 instances 陣列（契約 §6.1）"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_to_a_team_maps_to_the_team_field_with_no_recipient_instance() {
+        match parse(&argv(&[
+            "send", "--team", "platform", "--kind", "query", "進度?",
+        ])) {
+            Parsed::Call { args, .. } => {
+                assert_eq!(args["team"], "platform");
+                assert_eq!(args["request_kind"], "query");
+                assert_eq!(args["message"], "進度?");
+                assert!(
+                    args.get("instance").is_none() && args.get("instances").is_none(),
+                    "繁中說明：--team 不該同時送出 instance／instances（§6.1 三擇一），實際為 {args}"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_without_a_recipient_omits_all_three_recipient_fields() {
+        // 收件人三擇一由 daemon 以 `invalid_argument` 拒絕（§3）；CLI 不在
+        // 解析層替呼叫端猜一個收件人，也不得為了「讓它過」而塞一個空字串。
+        match parse(&argv(&["send", "--kind", "report", "內容"])) {
+            Parsed::Call { args, .. } => {
+                for field in ["instance", "instances", "team"] {
+                    assert!(
+                        args.get(field).is_none(),
+                        "繁中說明：send 未指定收件人時不該送 {field}，實際為 {args}"
+                    );
+                }
+                assert_eq!(args["message"], "內容");
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_create_maps_every_flag_from_the_contract() {
+        match parse(&argv(&[
+            "team",
+            "create",
+            "platform",
+            "--members",
+            "lead, worker",
+            "--orchestrator",
+            "lead",
+            "--accept-from",
+            "worker, auditor",
+            "--description",
+            "平台組",
+        ])) {
+            Parsed::Call { op, args, .. } => {
+                assert_eq!(op, "team", "契約 §1：team 指令對應 team 操作");
+                assert_eq!(args["action"], "create");
+                assert_eq!(args["name"], "platform");
+                assert_eq!(args["members"], serde_json::json!(["lead", "worker"]));
+                assert_eq!(args["orchestrator"], "lead");
+                assert_eq!(
+                    args["accept_from"],
+                    serde_json::json!(["worker", "auditor"]),
+                    "繁中說明：逗號分隔的 accept_from 應成為名稱陣列（契約 §6.2）"
+                );
+                assert_eq!(args["description"], "平台組");
+                assert!(
+                    args.get("add").is_none() && args.get("remove").is_none(),
+                    "繁中說明：create 不該送 update 專屬欄位，實際為 {args}"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_update_sends_add_and_remove_as_name_arrays() {
+        match parse(&argv(&[
+            "team",
+            "update",
+            "platform",
+            "--add",
+            "sre",
+            "--remove",
+            "old, older",
+            "--accept-from",
+            "sre",
+        ])) {
+            Parsed::Call { args, .. } => {
+                assert_eq!(args["action"], "update");
+                assert_eq!(args["name"], "platform");
+                assert_eq!(args["add"], serde_json::json!(["sre"]));
+                assert_eq!(args["remove"], serde_json::json!(["old", "older"]));
+                assert_eq!(args["accept_from"], serde_json::json!(["sre"]));
+                assert!(
+                    args.get("members").is_none(),
+                    "繁中說明：update 不該送 create 專屬的 members，實際為 {args}"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_delete_and_list_map_to_their_actions() {
+        match parse(&argv(&["team", "delete", "platform"])) {
+            Parsed::Call { op, args, .. } => {
+                assert_eq!(op, "team");
+                assert_eq!(args["action"], "delete");
+                assert_eq!(args["name"], "platform");
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+        match parse(&argv(&["team", "list"])) {
+            Parsed::Call { op, args, .. } => {
+                assert_eq!(op, "team");
+                assert_eq!(args["action"], "list");
+                assert!(
+                    args.get("name").is_none(),
+                    "繁中說明：team list 不帶名稱時不應送 name，實際為 {args}"
+                );
+            }
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_five_contract_team_and_send_commands_all_parse() {
+        // 契約 §9 的表格逐字列出這五個指令。這個測試是「表格與 CLI 一致」的
+        // 對照：任一個被漏掉或改名都會在這裡紅。
+        for (parts, expected_action, expected_name) in [
+            (
+                vec![
+                    "team",
+                    "create",
+                    "n",
+                    "--members",
+                    "a",
+                    "--orchestrator",
+                    "a",
+                ],
+                Some("create"),
+                Some("n"),
+            ),
+            (vec!["team", "update", "n"], Some("update"), Some("n")),
+            (vec!["team", "delete", "n"], Some("delete"), Some("n")),
+            (vec!["team", "list"], Some("list"), None),
+        ] {
+            match parse(&argv(&parts)) {
+                Parsed::Call { op, args, .. } => {
+                    assert_eq!(op, "team");
+                    assert_eq!(args["action"], expected_action.unwrap_or_default());
+                    if let Some(name) = expected_name {
+                        assert_eq!(args["name"], name);
+                    }
+                }
+                other => panic!("{parts:?} 應解析為 Call，實際為 {other:?}"),
+            }
+        }
+        match parse(&argv(&["send", "--to", "a", "hi"])) {
+            Parsed::Call { op, .. } => assert_eq!(op, "send"),
+            other => panic!("應解析為 Call，實際為 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn home_is_global_for_the_t5_commands_too() {
+        let cases: [&[&str]; 3] = [
+            &["send", "--to", "a", "hi"],
+            &["team", "list"],
+            &[
+                "team",
+                "create",
+                "n",
+                "--members",
+                "a",
+                "--orchestrator",
+                "a",
+            ],
+        ];
+        for parts in cases {
+            let mut with_flag = vec!["--home".to_owned(), "/tmp/h".to_owned()];
+            with_flag.extend(parts.iter().map(|part| (*part).to_owned()));
+            match parse(&argv_owned(with_flag)) {
+                Parsed::Call { home, .. } => assert_eq!(
+                    home.map(|h| h.to_string_lossy().into_owned()).as_deref(),
+                    Some("/tmp/h"),
+                    "繁中說明：--home 對 T5 的指令同樣是全域選項（{parts:?}）"
+                ),
+                other => panic!("{parts:?} 應解析為 Call，實際為 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exit_code_of_uses_the_operation_result_outcome() {
+        let result = OperationResult::completed("op-1", serde_json::json!({}));
+        assert_eq!(
+            exit_code_of(&result),
+            exit_code::OK,
+            "繁中說明：completed 應對應 exit 0（契約 §9）"
+        );
+        let refused = OperationResult::refused("op-2", ErrorCode::TeamAclDenied, "跨 team");
+        assert_eq!(
+            exit_code_of(&refused),
+            exit_code::REFUSED,
+            "繁中說明：refused 應對應 exit 3（契約 §9）"
+        );
     }
 
     #[test]

@@ -10,3 +10,4 @@ pub mod procs;
 pub mod protocol;
 pub mod store;
 pub mod terminal;
+pub mod wake;

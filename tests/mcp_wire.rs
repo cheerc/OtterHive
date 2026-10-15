@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use common::TempHome;
-use otterhive::mcp::{tool_names, T4_LIFECYCLE_TOOLS};
+use otterhive::mcp::{tool_names, P1A_INSTANCE_TOOLS, P1A_PRIVILEGED_TOOLS};
 use serde_json::{json, Value};
 
 /// bridge 讀不到 daemon 時的 JSON-RPC 錯誤碼（契約 §10）。
@@ -45,17 +45,36 @@ const SILENCE_TIMEOUT: Duration = Duration::from_millis(400);
 /// bridge 因前提缺失而退出的等待上限。
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// T4 的一般 instance 工具清單（plan T4：只列已完成的 lifecycle 工具）。
-const T4_INSTANCE_TOOLS: [&str; 3] = ["list_instances", "pane_snapshot", "restart_instance"];
-/// T4 的 manager 工具清單（多了 `interrupt`）。
-const T4_MANAGER_TOOLS: [&str; 4] = [
+/// T5 之後一般 instance 看得到的工具（契約 §10，恰 6 個）。
+const P1A_INSTANCE: [&str; 6] = [
     "list_instances",
-    "pane_snapshot",
     "restart_instance",
+    "send",
+    "inbox",
+    "team",
+    "pane_snapshot",
+];
+/// T5 之後 manager／orchestrator 看得到的工具（契約 §10，恰 7 個）。
+const P1A_PRIVILEGED: [&str; 7] = [
+    "list_instances",
+    "restart_instance",
+    "send",
+    "inbox",
+    "team",
+    "pane_snapshot",
     "interrupt",
 ];
-/// T4 尚未實作、因此不列入工具清單的 P1a 工具（handler 在 T5）。
-const DEFERRED_TO_T5: [&str; 3] = ["send", "inbox", "team"];
+/// P1a 已實作但 `tools_list` 不列出的工具（契約 §10 明文）。
+const NOT_LISTED_IN_P1A: [&str; 8] = [
+    "create_instance",
+    "delete_instance",
+    "start_instance",
+    "deployment",
+    "decision",
+    "task",
+    "set_metadata",
+    "schedule",
+];
 
 struct Bridge {
     child: Child,
@@ -512,7 +531,7 @@ fn daemon_unreachable_is_reported_for_every_calling_method() {
     let mut bridge = Bridge::start(home.home(), &[("OTTERHIVE_INSTANCE_TOKEN", "token-wire")]);
     bridge.handshake();
 
-    for (index, tool) in T4_MANAGER_TOOLS.iter().enumerate() {
+    for (index, tool) in P1A_PRIVILEGED.iter().enumerate() {
         let id = 100 + index as i64;
         let response = bridge.call(&json!({
             "jsonrpc": "2.0",
@@ -531,38 +550,41 @@ fn daemon_unreachable_is_reported_for_every_calling_method() {
 // ------------------------------------------------- lifecycle 工具（registry）
 
 #[test]
-fn t4_lists_only_the_three_completed_lifecycle_tools_for_an_instance() {
-    // plan T4：T4 只列已完成的 lifecycle 工具，一般 instance 為三個。
+fn lists_exactly_six_tools_for_an_instance() {
+    // 契約 §10：instance 一律看得到 list_instances／restart_instance／send／
+    // inbox／team／pane_snapshot。取代 T4 的「只列三個 lifecycle 工具」。
     let names = tool_names(false);
     assert_eq!(
-        names, T4_INSTANCE_TOOLS,
-        "繁中說明：一般 instance 的工具清單應恰為 T4 已完成的三個 lifecycle 工具"
+        names, P1A_INSTANCE,
+        "繁中說明：一般 instance 的工具清單應恰為契約 §10 的 6 個"
     );
 }
 
 #[test]
-fn t4_adds_interrupt_only_for_a_manager() {
+fn adds_interrupt_only_for_a_manager_or_orchestrator() {
     let names = tool_names(true);
     assert_eq!(
-        names, T4_MANAGER_TOOLS,
-        "繁中說明：manager 的工具清單應在一般 instance 的三個之外多一個 interrupt"
+        names, P1A_PRIVILEGED,
+        "繁中說明：manager 的工具清單應恰為契約 §10 的 7 個"
     );
 }
 
 #[test]
-fn t4_does_not_list_tools_whose_handlers_land_in_t5() {
-    let mut listed = tool_names(true);
+fn lists_the_three_tools_whose_handlers_landed_in_t5() {
+    // T4 時 send／inbox／team 的 handler 未落地，因此不在清單裡；T5 落地後
+    // 三個都必須看得到（契約 §10 明文點名）。
+    let mut listed = tool_names(false);
     listed.sort();
-    for tool in DEFERRED_TO_T5 {
+    for tool in ["send", "inbox", "team"] {
         assert!(
-            !listed.contains(&tool.to_owned()),
-            "繁中說明：{tool} 的 handler 在 T5，T4 不應列出（契約 §10：只列已實作的工具）"
+            listed.contains(&tool.to_owned()),
+            "繁中說明：{tool} 的 handler 已在 T5 落地，一般 instance 應看得到"
         );
     }
 }
 
 #[test]
-fn t4_does_not_list_create_delete_start_or_deployment() {
+fn does_not_list_create_delete_start_or_deployment() {
     // 契約 §10：create／delete／start／deployment 不列出。
     let mut listed = tool_names(true);
     listed.sort();
@@ -580,18 +602,60 @@ fn t4_does_not_list_create_delete_start_or_deployment() {
 }
 
 #[test]
-fn t4_lifecycle_tool_set_is_pinned_by_the_plan() {
-    // 把範圍常數與模組層的清單綁在一起，避免兩處各自漂移。
+fn the_p1a_tool_set_is_pinned_by_the_contract() {
+    // 把模組公開的契約清單與測試認定的清單綁在一起，避免兩處各自漂移。
     assert_eq!(
-        T4_LIFECYCLE_TOOLS, T4_MANAGER_TOOLS,
-        "繁中說明：模組公開的 T4 lifecycle 清單應等於測試認定的 manager 清單"
+        P1A_INSTANCE_TOOLS, P1A_INSTANCE,
+        "繁中說明：模組公開的一般 instance 清單應等於測試認定的契約集合"
     );
+    assert_eq!(
+        P1A_PRIVILEGED_TOOLS, P1A_PRIVILEGED,
+        "繁中說明：模組公開的 manager 清單應等於測試認定的契約集合"
+    );
+    assert_eq!(
+        P1A_INSTANCE.len(),
+        6,
+        "繁中說明：契約 §10 的一般 instance 工具數是 6"
+    );
+    assert_eq!(
+        P1A_PRIVILEGED.len(),
+        7,
+        "繁中說明：契約 §10 的 manager／orchestrator 工具數是 7"
+    );
+}
+
+#[test]
+fn every_not_listed_tool_is_absent_for_both_caller_kinds() {
+    // 「不列出」對兩種 caller 都成立：manager 多一個 interrupt，不代表
+    // create／delete／start／deployment 就浮出來。
+    for absent in NOT_LISTED_IN_P1A {
+        for is_manager in [false, true] {
+            assert!(
+                !tool_names(is_manager).contains(&absent.to_owned()),
+                "繁中說明：{absent} 對 is_manager={is_manager} 都不應被列出（契約 §10）"
+            );
+        }
+    }
+}
+
+#[test]
+fn does_not_list_any_non_p1a_tool() {
+    // 契約 §10：「所有非 P1a 工具不列出」。`NOT_LISTED_IN_P1A` 裡的後半段
+    // （decision／task／set_metadata／schedule）屬於 catalog 的後續期別。
+    let mut listed = tool_names(true);
+    listed.sort();
+    for tool in ["decision", "task", "set_metadata", "schedule"] {
+        assert!(
+            !listed.contains(&tool.to_owned()),
+            "繁中說明：非 P1a 工具 {tool} 不應出現在工具清單"
+        );
+    }
 }
 
 #[test]
 fn schema_properties_equal_the_catalog_supported_and_added_fields() {
     let catalog = load_catalog();
-    for tool in T4_MANAGER_TOOLS {
+    for tool in P1A_PRIVILEGED {
         let expected = catalog_schema_fields(&catalog, tool);
         let actual = otterhive::mcp::input_schema_fields(tool);
         assert_eq!(
@@ -606,7 +670,7 @@ fn schema_omits_every_refused_field() {
     // 契約 §10：schema 只含支援的欄位；舊版有但 P1a 拒收的欄位不得出現在
     // schema 裡，否則 backend 會照著 schema 送、`admission` 再拒一次。
     let catalog = load_catalog();
-    for tool in T4_MANAGER_TOOLS {
+    for tool in P1A_PRIVILEGED {
         let entry = catalog["tools"]
             .as_array()
             .expect("catalog tools 必須是陣列")
@@ -657,4 +721,99 @@ fn restart_schema_keeps_expected_generation_because_it_is_added_in_p1a() {
         !actual.contains(&"force".to_owned()),
         "繁中說明：restart_instance 的 schema 不應含 P1a 拒收的 force"
     );
+}
+
+// ------------------------------------------------- refused 與 isError（§10）
+
+/// daemon 在線時，`tools/call` 的工具結果一律是
+/// `{content: [{type:"text", text: <OperationResult JSON>}], isError}`；
+/// `isError` 只在 `refused`／`unsupported` 時為 `true`（契約 §10）。
+///
+/// 本檔的 bridge harness 啟動時**不**帶 daemon，因此線上行為走不到。
+/// 這裡驗的是 bridge 端形狀不變的那一層：`-32001` 是 JSON-RPC 錯誤、沒有
+/// `isError`；一旦有人在 bridge 裡把「daemon 不可連」改寫成
+/// `isError: true` 的工具結果，就會被這個測試擋下。
+#[test]
+fn daemon_unreachable_is_an_rpc_error_not_a_tool_result_with_is_error() {
+    let home = TempHome::new("is_error_shape");
+    let mut bridge = Bridge::start(home.home(), &[("OTTERHIVE_INSTANCE_TOKEN", "token-wire")]);
+    bridge.handshake();
+
+    let response = bridge.call(&json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": {"name": "send", "arguments": {"message": "hi"}}
+    }));
+    assert_error_code(&response, ERR_DAEMON_UNREACHABLE, "send");
+    assert!(
+        rpc_result(&response).is_none(),
+        "繁中說明：daemon 不可連不得偽裝成工具結果（契約 §10「不假裝成功」），實際為 {response}"
+    );
+    assert!(
+        response.get("result").is_none() || response["result"].get("isError").is_none(),
+        "繁中說明：JSON-RPC 錯誤層沒有 isError，實際為 {response}"
+    );
+}
+
+/// `unsupported` 的工具／欄位在 admission 層就回 `unsupported_in_phase`
+/// （契約 §3），因此 `isError: true` 的內容必須帶著可行動的訊息。
+///
+/// 這裡以 `admission` 對**非 P1a 工具**做一次端到端形狀檢查：訊息必須同時
+/// 指出被拒的工具、並說明「P1a 不支援」，讓 backend 讀到 `isError` 的內容
+/// 時知道下一步是什麼，而不是只看到一個失敗旗標。
+#[test]
+fn an_unsupported_tool_result_carries_a_message_naming_it_and_the_phase() {
+    let error = otterhive::admission::admit("decision", &json!({}))
+        .expect_err("繁中說明：非 P1a 工具應被 admission 拒絕");
+    assert_eq!(
+        error.code,
+        otterhive::protocol::ErrorCode::UnsupportedInPhase,
+        "繁中說明：decision 應回 unsupported_in_phase（契約 §3）"
+    );
+    assert!(
+        error.message.contains("P1a 不支援"),
+        "繁中說明：訊息應說明 P1a 不支援，實際為 {:?}",
+        error.message
+    );
+    assert!(
+        error.message.contains("decision"),
+        "繁中說明：訊息應指出被拒的工具，實際為 {:?}",
+        error.message
+    );
+    assert!(
+        !error.retryable,
+        "繁中說明：同一請求永遠同樣被拒，重試無意義（契約 §3）"
+    );
+}
+
+/// 契約 §10 明文：「`create_instance`、`delete_instance`、
+/// `start_instance`、`deployment` 與所有非 P1a 工具不列出；**直接呼叫依 §2、
+/// §3 拒絕**」。
+///
+/// 因此「不列出」必須配對「直接呼叫不沉默」。`admission` 對這四個工具的
+/// 形狀檢查是**通過**的（它們在 catalog 中是 P1a 工具，規格存在），所以這
+/// 條斷言它們**不得**因為形狀合法就被當成可呼叫——判斷必須發生在 daemon
+/// 端的 handler。
+#[test]
+fn unlisted_p1a_tools_pass_shape_but_are_not_callable() {
+    for (tool, args) in [
+        ("create_instance", json!({"name": "worker"})),
+        ("delete_instance", json!({"instance": "worker"})),
+        ("start_instance", json!({"instance": "worker"})),
+        ("deployment", json!({"action": "list"})),
+    ] {
+        assert!(
+            otterhive::admission::admit(tool, &args).is_ok(),
+            "繁中說明：{tool} 是 catalog 中的 P1a 工具，形狀檢查應通過"
+        );
+        assert!(
+            !tool_names(true).contains(&tool.to_owned()),
+            "繁中說明：{tool} 不得出現在工具清單（契約 §10）"
+        );
+        assert!(
+            !tool_names(false).contains(&tool.to_owned()),
+            "繁中說明：{tool} 對一般 instance 也不得出現在工具清單"
+        );
+    }
 }
