@@ -289,13 +289,14 @@ pub fn send(
                     thread_id: thread_id.clone(),
                 });
                 // ID 要等寫入後才知道（§6.1 的「給 message ID」），先用空字串佔住
-                // 槽位；它不會出現在回應裡（下面從 `outcomes` 重建 `queued`）。
+                // 槽位；下面 `insert_message_batch` 會把它原位換成真正的 ID。
                 outcomes.push(SendRecipient::queued(name, String::new()));
                 queued_slots.push(slot);
             }
 
-            // §6.1：寫入在同一交易內完成。`insert_message_batch` 回傳的 ID 依
-            // 順序對應 `messages`，所以逐一回填到 `queued`。
+            // §6.1：寫入在同一交易內完成。`insert_message_batch` 回傳的 ID 依順序
+            // 對應 `messages`，所以依 `queued_slots` 原位回填，保持 `outcomes` 的請求
+            // 順序不變（§6.1 的 `value.recipients` 依請求順序逐項列出）。
             let ids = tx
                 .insert_message_batch(&messages)
                 .map_err(|error| store_error("寫入訊息失敗", error))?;
@@ -304,7 +305,7 @@ pub fn send(
             }
             // 成功的收件人早已佔好槽位（`queued_slots`），ID 也已原位回填，所以
             // 這裡**不需要** `outcomes.append(&mut queued)`：`Vec::append` 會把來源
-            // 清空，而 `queued` 在單一向量的形狀下只是待寫入的副本。
+            // 清空，而待寫入的副本在單一向量的形狀下已經沒用了。
             Ok::<Vec<SendRecipient>, StoreError>(outcomes)
         })
         // 交易層的失敗（`BEGIN`／`COMMIT`／回滾）與閉包內的契約拒絕都在這裡還原。
