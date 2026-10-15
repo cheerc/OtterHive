@@ -406,7 +406,11 @@ fn an_instance_belongs_to_at_most_one_team() {
         .transaction(|tx| {
             tx.insert_team("left", &alpha, None, &[], None)?;
             tx.set_team_members("left", std::slice::from_ref(&alpha))?;
-            tx.insert_team("right", &beta, None, &[], None)
+            tx.insert_team("right", &beta, None, &[], None)?;
+            // beta 必須**真的**加入 right，否則它不屬於任何 team，下面那個
+            // 斷言就沒有測到 §8.1 的約束（`insert_team` 只建 team 紀錄，不動
+            // 成員關係）。
+            tx.set_team_members("right", std::slice::from_ref(&beta))
         })
         .expect("繁中說明：建立兩個 team 應成功");
 
