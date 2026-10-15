@@ -24,7 +24,7 @@ use crate::procs;
 
 pub use crate::procs::stop_group;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -272,6 +272,15 @@ struct Inner {
     /// 放棄提示不需要額外機制：排程器記住建立時的 generation，restart 後
     /// 世代不符，`check` 就會清空待送清單並回 `Abandoned`（§6.4）。
     wakers: HashMap<String, Arc<Mutex<wake::Scheduler>>>,
+    /// D-3：哪些 instance 已經有重判迴圈在跑。
+    ///
+    /// §6.4 的延後沒有上限，而每延後一則訊息若都 spawn 一個迴圈，執行緒會無界
+    /// 累積（operator 反覆送訊給卡住的 agent）。有了這個旗標，每個 instance 同時
+    /// 最多一個迴圈。
+    ///
+    /// **正確性不依賴它**——同一個排程器被鎖序列化，多的迴圈會自然結束。旗標只是
+    /// 資源上限，而沒有它時那個上限是無界的（見 [`spawn_wake_recheck`]）。
+    recheck_running: HashSet<String>,
 }
 
 /// 共用的 daemon 狀態。
@@ -384,6 +393,7 @@ pub fn prepare(
             last_screens: HashMap::new(),
             last_client_input: HashMap::new(),
             wakers: HashMap::new(),
+            recheck_running: HashSet::new(),
         })),
         home: home_root.to_path_buf(),
         bridge: bridge.to_path_buf(),
@@ -2008,20 +2018,51 @@ fn schedule_hint(
         message_id: message_id.to_owned(),
     });
     let decision = scheduler.check(
-        inner.running.get(instance).map(|running| &running.session),
+        inner.running.contains_key(instance),
         generation,
         inputs,
         state.tuning.wake_input,
         state.tuning.wake_quiet,
         Instant::now(),
     );
+    // **拿到要寫入的 bytes 之後、釋放 daemon 鎖之前**，清空排程器。
+    //
+    // 不變量（簽章分離之後唯一能造成重複寫入的地方）：`Deliver(bytes)` 回傳時
+    // pending **仍在**排程器裡。若這裡不先清掉，另一個執行緒（另一個重判迴圈
+    // 或並發的 `send`）在鎖排程器時會看到非空 pending、拿到**同一格提示**，
+    // 並在 PTY 上再寫一次。§6.4 沒有「重複提示」的語意，所以提示重複本身就是
+    // 契約外的行為。
+    //
+    // 寫入放在鎖外（[`wake::Scheduler::check`] 不做 I-O，見 D-1）：daemon 鎖是
+    // 全域的，阻塞式 PTY 寫入不能持有它。寫入失敗不回滾（已清空），延續「PTY
+    // master 已關時重試沒意義」的裁決。
+    let (to_write, outcome) = match decision {
+        wake::NextAction::Deliver(bytes) => {
+            scheduler.commit_delivery();
+            (Some(bytes), Some(wake::WakeOutcome::Hinted))
+        }
+        other => (None, wake::Scheduler::outcome_for(other)),
+    };
+    let deferred = matches!(outcome, Some(wake::WakeOutcome::Deferred));
     drop(scheduler);
     drop(inner);
 
-    if matches!(decision, wake::NextAction::Deferred) {
+    // 鎖全部釋放之後才寫入（D-1）：daemon 鎖是全域的，阻塞式 PTY 寫入不能
+    // 持有它——PTY master 的緩衝區填滿時 `write_all` 會阻塞，那會讓 attach 的
+    // frame 串流、`pane_snapshot`、所有 socket 請求與 exit observer 全部停擺。
+    //
+    // 寫入失敗要如實回報 `failed`（§6.4 的四個值），不能因為「排程器已經清空」
+    // 就假裝送達。
+    if let Some(bytes) = to_write {
+        return match write_hint(state, instance, &bytes) {
+            Ok(()) => wake::WakeOutcome::Hinted.as_wire().to_owned(),
+            Err(()) => wake::WakeOutcome::Failed.as_wire().to_owned(),
+        };
+    }
+    if deferred {
         spawn_wake_recheck(state, instance);
     }
-    match wake::Scheduler::outcome_for(decision) {
+    match outcome {
         // 排程器裡還有東西、但這一輪沒送出：回 `deferred`（§6.4 的四個值
         // 裡，deferred = 排程中）。
         None => wake::WakeOutcome::Deferred.as_wire().to_owned(),
@@ -2029,59 +2070,132 @@ fn schedule_hint(
     }
 }
 
+/// 把提示行寫入收件人的 PTY（**只在 daemon 鎖之外呼叫**）。
+///
+/// 失敗回 [`Result`]：§6.4 的 `failed` 與 `not_running` 是兩個不同的事實，
+/// 必須分別回報。失敗時排程器已被 `commit_delivery` 清空，所以這則提示不會
+/// 重試——延續「PTY master 已關時重試沒意義」的裁決（實作判斷，非契約推導）。
+fn write_hint(state: &DaemonState, instance: &str, bytes: &[u8]) -> Result<(), ()> {
+    let inner = state.lock();
+    match inner.running.get(instance) {
+        Some(running) => running.session.write_input(bytes).map_err(|_| ()),
+        None => Err(()),
+    }
+}
+
 /// 啟動背景重判迴圈（§6.4 的「每 250 毫秒重新判斷，直到條件解除才送出」）。
 ///
-/// 每次延後都會呼叫；迴圈在提示送出或放棄後自行結束，所以這個啟動是冪等的
-/// ——已經有一個迴圈在跑時，最多只是多啟動一個會立刻結束的（因為排程器已空
-/// → `NothingToSend` → 結束）。
+/// **每個 instance 同時最多一個迴圈**（D-3）：`Inner::recheck_running` 是旗標，
+/// 已存在就不再 spawn。沒有這個旗標時，每延後一則訊息就多一個睡到條件解除的
+/// 執行緒，而 §6.4 的延後**沒有上限**——operator 反覆送訊給一個卡住的 agent
+/// 會讓執行緒無界累積，每 250ms 搶同一把 daemon 鎖。鎖競爭讓延後條件更容易成立
+/// （輸出間隔變長 → `quiet_window` 更容易滿足），形成正回饋：那是資源上限問題，
+/// 不是單純的線性成本。
+///
+/// 冪等性**不**來自「多開的執行緒會自己死掉」（那是我先前的錯誤理解）。它來自
+/// 同一個 `Arc<Mutex<Scheduler>>` 的共享狀態 ＋ `state.lock()` 之後才鎖排程器
+/// 的序列化 ＋ 送出或放棄後清空。已有一個迴圈在跑時，多開的只會讓它們輪流搶同一把
+/// 鎖，最後一個送出時其餘看到 `NothingToSend` 而結束——所以旗標只是資源上限，
+/// 正確性不依賴它。
 ///
 /// fire-and-forget: 迴圈只存活到提示送出或放棄（數個重判週期）；daemon 不需
 /// 要它的結果，只需要知道「已排程」。
 fn spawn_wake_recheck(state: &DaemonState, instance: &str) {
+    {
+        let mut inner = state.lock();
+        if !inner.recheck_running.insert(instance.to_owned()) {
+            // 已經有迴圈在跑（D-3）：不重複啟動。
+            return;
+        }
+    }
     let state = state.clone();
     let instance = instance.to_owned();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(wake::RECHECK_INTERVAL);
-        let decision = {
-            let mut inner = state.lock();
-            let Some(running) = inner.running.get(&instance) else {
-                return;
+    std::thread::spawn(move || {
+        // 迴圈結束（送出、放棄或 panic）時一定要清旗標，否則這個 instance 之後
+        // 再也沒有重判迴圈。
+        let _guard = RecheckGuard {
+            state: state.clone(),
+            instance: instance.clone(),
+        };
+        loop {
+            std::thread::sleep(wake::RECHECK_INTERVAL);
+            let (to_write, outcome) = {
+                let mut inner = state.lock();
+                let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
+                    return;
+                };
+                let (generation, inputs, session_present) = {
+                    let Some(running) = inner.running.get(&instance) else {
+                        inner.recheck_running.remove(&instance);
+                        inner.wakers.remove(&instance);
+                        return;
+                    };
+                    (
+                        running.generation,
+                        wake::DeferInputs {
+                            last_client_input_at: inner.last_client_input.get(&instance).copied(),
+                            last_output_at: running.session.last_output_at(),
+                        },
+                        true,
+                    )
+                };
+                let mut scheduler = scheduler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let decision = scheduler.check(
+                    session_present,
+                    generation,
+                    inputs,
+                    state.tuning.wake_input,
+                    state.tuning.wake_quiet,
+                    Instant::now(),
+                );
+                if matches!(decision, wake::NextAction::NothingToSend) {
+                    // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
+                    // 在鎖內收，避免與同時到達的另一個 `send` 交错。
+                    inner.wakers.remove(&instance);
+                    inner.recheck_running.remove(&instance);
+                    return;
+                }
+                let (to_write, outcome) = match decision {
+                    wake::NextAction::Deliver(bytes) => {
+                        // 與 `schedule_hint` 同一個不變量：**釋放鎖之前**清空，
+                        // 否則另一個執行緒會拿到同一格提示並再寫一次。
+                        scheduler.commit_delivery();
+                        (Some(bytes), Some(wake::WakeOutcome::Hinted))
+                    }
+                    other => (None, wake::Scheduler::outcome_for(other)),
+                };
+                (to_write, outcome)
             };
-            let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
-                return;
-            };
-            let generation = running.generation;
-            let inputs = wake::DeferInputs {
-                last_client_input_at: inner.last_client_input.get(&instance).copied(),
-                last_output_at: running.session.last_output_at(),
-            };
-            let session = &running.session;
-            let mut scheduler = scheduler
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let decision = scheduler.check(
-                Some(session),
-                generation,
-                inputs,
-                state.tuning.wake_input,
-                state.tuning.wake_quiet,
-                Instant::now(),
-            );
-            if matches!(decision, wake::NextAction::NothingToSend) {
-                // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
-                // 在鎖內收，避免與同時到達的另一個 `send` 交错。
-                inner.wakers.remove(&instance);
+            // 鎖已釋放：寫入與「是否重試」都在鎖外決定（D-1）。
+            if let Some(bytes) = to_write {
+                let _ = write_hint(&state, &instance, &bytes);
                 return;
             }
-            decision
-        };
-        match wake::Scheduler::outcome_for(decision) {
-            Some(wake::WakeOutcome::Deferred) => continue,
-            // `NothingToSend` 已在鎖內回傳，所以這裡的 `None` 與其餘三種結果
-            // 一樣都是「這一輪結束了」。
-            None | Some(_) => return,
+            match outcome {
+                Some(wake::WakeOutcome::Deferred) => continue,
+                None | Some(_) => return,
+            }
         }
     });
+}
+
+/// 重判迴圈的結束清理（清 D-3 的旗標）。
+///
+/// 用 RAII 而不是在每個 `return` 前手動清理：迴圈有五個出口，手動清理必然漏掉
+/// 某一個，而漏掉的後果是「這個 instance 之後再也沒有重判迴圈」——那會讓 §6.4
+/// 的提示永遠停在 `deferred`。
+struct RecheckGuard {
+    state: DaemonState,
+    instance: String,
+}
+
+impl Drop for RecheckGuard {
+    fn drop(&mut self) {
+        let mut inner = self.state.lock();
+        inner.recheck_running.remove(&self.instance);
+    }
 }
 
 /// `inbox`：契約 §6.3。
