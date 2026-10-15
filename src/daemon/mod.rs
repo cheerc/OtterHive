@@ -2137,73 +2137,85 @@ fn spawn_wake_recheck(state: &DaemonState, instance: &str) {
     let state = state.clone();
     let instance = instance.to_owned();
     std::thread::spawn(move || {
-        // 迴圈結束（送出、放棄或 panic）時一定要清旗標，否則這個 instance 之後
-        // 再也沒有重判迴圈。
-        let _guard = RecheckGuard {
-            state: state.clone(),
-            instance: instance.clone(),
-        };
-        loop {
-            std::thread::sleep(wake::RECHECK_INTERVAL);
-            let (to_write, outcome) = {
-                let mut inner = state.lock();
-                let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
-                    return;
-                };
-                let (generation, inputs, session_present) = {
-                    let Some(running) = inner.running.get(&instance) else {
-                        inner.recheck_running.remove(&instance);
-                        inner.wakers.remove(&instance);
+        // 防禦性：與 [`handle_connection`]、exit observer 的 spawn 路徑一致。
+        //
+        // 這裡**不是**為了修一個會發生的缺陷——`RecheckGuard` 的 `Drop` 會在
+        // panic 時照常執行（旗標因此仍會被清掉），而 `DaemonState::lock` 用
+        // `into_inner()` 處理 poison，所以唯一剩下的風險是 `Drop` 裡的 `lock()`
+        // 本身 panic（需要同一執行緒重複鎖同一把鎖），而目前結構不會發生。
+        // 純為與 codebase 的其他 spawn 路徑一致。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 迴圈結束（送出、放棄或 panic）時一定要清旗標，否則這個 instance 之後
+            // 再也沒有重判迴圈。
+            let _guard = RecheckGuard {
+                state: state.clone(),
+                instance: instance.clone(),
+            };
+            loop {
+                std::thread::sleep(wake::RECHECK_INTERVAL);
+                let (to_write, outcome) = {
+                    let mut inner = state.lock();
+                    let Some(scheduler) = inner.wakers.get(&instance).cloned() else {
                         return;
                     };
-                    (
-                        running.generation,
-                        wake::DeferInputs {
-                            last_client_input_at: inner.last_client_input.get(&instance).copied(),
-                            last_output_at: running.session.last_output_at(),
-                        },
-                        true,
-                    )
+                    let (generation, inputs, session_present) = {
+                        let Some(running) = inner.running.get(&instance) else {
+                            inner.recheck_running.remove(&instance);
+                            inner.wakers.remove(&instance);
+                            return;
+                        };
+                        (
+                            running.generation,
+                            wake::DeferInputs {
+                                last_client_input_at: inner
+                                    .last_client_input
+                                    .get(&instance)
+                                    .copied(),
+                                last_output_at: running.session.last_output_at(),
+                            },
+                            true,
+                        )
+                    };
+                    let mut scheduler = scheduler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let decision = scheduler.check(
+                        session_present,
+                        generation,
+                        inputs,
+                        state.tuning.wake_input,
+                        state.tuning.wake_quiet,
+                        Instant::now(),
+                    );
+                    if matches!(decision, wake::NextAction::NothingToSend) {
+                        // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
+                        // 在鎖內收，避免與同時到達的另一個 `send` 交错。
+                        inner.wakers.remove(&instance);
+                        inner.recheck_running.remove(&instance);
+                        return;
+                    }
+                    let (to_write, outcome) = match decision {
+                        wake::NextAction::Deliver(bytes) => {
+                            // 與 `schedule_hint` 同一個不變量：**釋放鎖之前**清空，
+                            // 否則另一個執行緒會拿到同一格提示並再寫一次。
+                            scheduler.commit_delivery();
+                            (Some(bytes), Some(wake::WakeOutcome::Hinted))
+                        }
+                        other => (None, wake::Scheduler::outcome_for(other)),
+                    };
+                    (to_write, outcome)
                 };
-                let mut scheduler = scheduler
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let decision = scheduler.check(
-                    session_present,
-                    generation,
-                    inputs,
-                    state.tuning.wake_input,
-                    state.tuning.wake_quiet,
-                    Instant::now(),
-                );
-                if matches!(decision, wake::NextAction::NothingToSend) {
-                    // 沒東西可送：把排程器收掉，讓下一次 `send` 從乾淨狀態開始。
-                    // 在鎖內收，避免與同時到達的另一個 `send` 交错。
-                    inner.wakers.remove(&instance);
-                    inner.recheck_running.remove(&instance);
+                // 鎖已釋放：寫入與「是否重試」都在鎖外決定（D-1）。
+                if let Some(bytes) = to_write {
+                    let _ = write_hint(&state, &instance, &bytes);
                     return;
                 }
-                let (to_write, outcome) = match decision {
-                    wake::NextAction::Deliver(bytes) => {
-                        // 與 `schedule_hint` 同一個不變量：**釋放鎖之前**清空，
-                        // 否則另一個執行緒會拿到同一格提示並再寫一次。
-                        scheduler.commit_delivery();
-                        (Some(bytes), Some(wake::WakeOutcome::Hinted))
-                    }
-                    other => (None, wake::Scheduler::outcome_for(other)),
-                };
-                (to_write, outcome)
-            };
-            // 鎖已釋放：寫入與「是否重試」都在鎖外決定（D-1）。
-            if let Some(bytes) = to_write {
-                let _ = write_hint(&state, &instance, &bytes);
-                return;
+                match outcome {
+                    Some(wake::WakeOutcome::Deferred) => continue,
+                    None | Some(_) => return,
+                }
             }
-            match outcome {
-                Some(wake::WakeOutcome::Deferred) => continue,
-                None | Some(_) => return,
-            }
-        }
+        }));
     });
 }
 
