@@ -2692,16 +2692,32 @@ fn pane_snapshot(
 
 /// `tools_list`（契約 §10）：只列 P1a 已實作且該 instance 可執行的工具。
 fn tools_list(state: &DaemonState, operation_id: &str, caller: &Caller) -> OperationResult {
-    let is_manager = match caller {
+    // 契約 §10：「instance 一律看得到 `list_instances`、`restart_instance`、
+    // `send`、`inbox`、`team`、`pane_snapshot`；**manager 與 orchestrator** 另外
+    // 看得到 `interrupt`」。
+    //
+    // 判準是 §2 授權表裡「可對 `interrupt` 執行」的**聯集**：`managers`（設定檔
+    // 列出的 instance 名稱）或某個 team 的 orchestrator。orchestrator 那一支
+    // 必須真的去查 team——只看 `managers` 會讓 orchestrator 看不到該工具，而
+    // agent 看不到就永遠不會呼叫它，於是 §10 那半句等於沒實作（儘管 §2 的授權
+    // 本身是通的）。
+    let privileged = match caller {
         Caller::Operator => true,
         Caller::Instance(id) => {
-            let inner = state.lock();
-            inner
-                .store
-                .instance(id)
-                .unwrap_or(None)
-                .map(|row| inner.managers.contains(&row.name))
-                .unwrap_or(false)
+            let mut inner = state.lock();
+            let Some(row) = inner.store.instance(id).unwrap_or(None) else {
+                return OperationResult::refused(
+                    operation_id,
+                    ErrorCode::Unauthorized,
+                    "無法辨識呼叫端的身分",
+                );
+            };
+            inner.managers.contains(&row.name)
+                || inner
+                    .store
+                    .transaction(|tx| tx.team_of_instance_name(&row.name))
+                    .unwrap_or(None)
+                    .is_some_and(|(_, orchestrator)| orchestrator == row.name)
         }
     };
     OperationResult {
@@ -2709,8 +2725,8 @@ fn tools_list(state: &DaemonState, operation_id: &str, caller: &Caller) -> Opera
         outcome: Outcome::Completed,
         subject: None,
         value: json!({
-            "tools": mcp::tool_definitions(is_manager),
-            "tool_names": mcp::tool_names(is_manager),
+            "tools": mcp::tool_definitions(privileged),
+            "tool_names": mcp::tool_names(privileged),
         }),
         effects: Vec::new(),
         error: None,
