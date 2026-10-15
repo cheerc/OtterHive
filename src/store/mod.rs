@@ -785,28 +785,19 @@ impl Tx<'_> {
     /// `team_members.instance_id` 是 UNIQUE（§8.1「一個 instance 最多屬於一個
     /// team」），所以先把不在新集合裡的關係刪掉，再插入新的。
     pub fn set_team_members(&self, team: &str, instance_ids: &[String]) -> Result<(), StoreError> {
-        // **先插入、再刪除**，順序不能反。
+        // 順序是**先刪本 team 多餘的列，再插入**，而且刪除只限本 team。
         //
-        // §8.1「一個 instance 最多屬於一個 team」由 `team_members.instance_id`
-        // 的 UNIQUE 約束把關。若先刪「不在新集合裡」的列再插入，那個 instance
-        // 的舊列（屬於另一個 team）已被刪掉，約束檢查看到的是「它已經沒有 team
-        // 了」而放行——契約的規則就這樣被繞過。先插入讓約束在舊列還在時發作。
+        // §8.1「一個 instance 最多屬於一個 team」在這裡有兩條不同的失敗要區分，
+        // 而 `team_members` 的 PRIMARY KEY `(team, instance_id)` 把兩者混成同一個
+        // UNIQUE 違規：插入一個**已經是本 team 成員**的 instance 會撞 PK；而插入一個
+        // **已在別的 team** 的 instance 撞的是「一個 instance 只屬於一個 team」。
+        // `INSERT OR IGNORE` 會把兩者一起吞掉，所以不能單靠它。
         //
-        // 保留集合用「過濾器」而不是 `NOT IN (...)`：`json_each('[]')` 回空結果集，
-        // 而 SQL 的 `NOT IN (空集合)` **恆為真**——那會讓每次 `add` 都清空整個
-        // team，再重新插入時撞上自己剛插入的列。`EXISTS` 對空集合恆為假，
-        // 語意正好相反。
+        // 修法：插入用 `OR IGNORE`（容忍「已經是成員」這個無害的重複），然後
+        // **逐行檢查有沒有真的進來**——沒進來且它不是本 team 的成員，就是它已在
+        // 別的 team，該回 `name_conflict`（§8.1），讓交易回滾。
         let encoded = serde_json::to_string(instance_ids)
             .map_err(|error| StoreError::Invalid(format!("序列化成員清單失敗: {error}")))?;
-        for id in instance_ids {
-            // 刻意**不用** `INSERT OR IGNORE`：那會把「這個 instance 已在另一個
-            // team」這個契約規則（§8.1）的違規一起吞掉，讓它靜靜地回 `Ok(())`。
-            // 衝突必須冒泡成交易失敗，讓 §8.1 的檢查在呼叫端翻成 `name_conflict`。
-            self.connection.execute(
-                "INSERT INTO team_members(team, instance_id) VALUES (?1, ?2)",
-                params![team, id],
-            )?;
-        }
         let mut statement = self.connection.prepare(
             "DELETE FROM team_members WHERE team = ?1 AND NOT EXISTS ( \
                SELECT 1 FROM json_each(?2) WHERE json_each.value = team_members.instance_id \
@@ -814,6 +805,32 @@ impl Tx<'_> {
         )?;
         statement.execute(params![team, encoded])?;
         drop(statement);
+        for id in instance_ids {
+            let changed = self.connection.execute(
+                "INSERT OR IGNORE INTO team_members(team, instance_id) VALUES (?1, ?2)",
+                params![team, id],
+            )?;
+            if changed == 0 {
+                // 沒插進來：兩種可能——它已是本 team 成員（無害，維持原狀），或
+                // 它已在別的 team（契約違規）。
+                let already_here = self
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM team_members WHERE team = ?1 AND instance_id = ?2)",
+                        params![team, id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(StoreError::from)?;
+                if already_here == 0 {
+                    // §3：instance 名稱／歸屬已被使用是 `name_conflict`。這裡是
+                    // 「這個 instance 已經屬於某個 team」，語意上同類——它已被
+                    // 別的 team 佔用，不能再被另一個 team 收編。
+                    return Err(StoreError::NameConflict(format!(
+                        "instance {id} 已屬於另一個 team（§8.1 的單一 team 歸屬）"
+                    )));
+                }
+            }
+        }
         self.append_journal(None, None, "team_members_set", Some(team))?;
         Ok(())
     }
