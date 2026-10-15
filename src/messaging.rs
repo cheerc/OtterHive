@@ -40,8 +40,7 @@ pub const DRAIN_BUDGET_BYTES: usize = 48 * 1024;
 /// §6.1：`correlation_id`／`parent_id`／`thread_id` 的上限。
 pub const MAX_IDENTIFIER_CHARS: usize = 256;
 
-/// `send` 的收件人結果（**不含** `wake`——§6.4 的喚醒由 dispatch 端在交易提交
-/// 後補進去）。
+/// `send` 的收件人結果。
 ///
 /// `message_id` 與 `error` 互斥：`queued` 前者為 `Some`、後者為 `None`；
 /// `refused` 反之。
@@ -53,6 +52,22 @@ pub struct SendRecipient {
     pub message_id: Option<String>,
     /// 被拒絕的原因（契約的錯誤碼）。
     pub error: Option<OpError>,
+    /// 契約 §6.1 的 `wake` 欄位（值為 §6.4 的四個之一）。
+    ///
+    /// **`messaging` 本身不填這個欄位。** 本模組到這裡為止完全不知道 §6.4 的
+    /// 存在：訊息寫入與喚醒是兩件事，喚醒發生在交易提交**之後**（§6.1「喚醒
+    /// 失敗不撤回訊息」），而那時資料庫鎖已經釋放。
+    ///
+    /// 填值者是 daemon 的 dispatch 端：成功寫入的收件人填 [`crate::wake`] 的
+    /// 排程結果，被拒的收件人填 `not_running`——§6.4 把 `not_running` 定義成
+    /// 「收件人不在 `running`」，而被拒的收件人（`not_found`／`team_acl_denied`
+    /// …）確實不在 `running`。把它留成 `None` 會讓呼叫端無法區分「被拒所以
+    /// 沒有 wake 值」與「喚醒機制本身壞了」，而 §10 的設計重點正是「不假裝
+    /// 成功、不靜默忽略」。
+    ///
+    /// 這個欄位在 `messaging` 內恆為 `None`；它是**接收端**的槽，不是本模組
+    /// 的輸出。
+    pub wake: Option<String>,
 }
 
 impl SendRecipient {
@@ -61,6 +76,7 @@ impl SendRecipient {
             instance: instance.to_owned(),
             message_id: Some(message_id),
             error: None,
+            wake: None,
         }
     }
 
@@ -69,6 +85,7 @@ impl SendRecipient {
             instance: instance.to_owned(),
             message_id: None,
             error: Some(error),
+            wake: None,
         }
     }
 
@@ -77,11 +94,6 @@ impl SendRecipient {
         self.message_id.is_some()
     }
 }
-
-/// `send` 的回傳：第一個向量是全部收件人（含被拒的），第二個是**成功寫入、
-/// 待喚醒**的收件人。dispatch 端以 `message_id` 配對回第一個向量填 `wake`
-/// ——不用位置。
-pub type SendOutcome = (Vec<SendRecipient>, Vec<SendRecipient>);
 
 /// 呼叫端的身分（§2：sender 一律由憑證推導，不從請求讀）。
 struct Sender {
@@ -218,7 +230,7 @@ pub fn send(
     caller: &Caller,
     args: &Value,
     config: &Config,
-) -> Result<SendOutcome, OpError> {
+) -> Result<Vec<SendRecipient>, OpError> {
     // --- 形狀層：任何 store 存取之前完成（§3「多數拒絕在任何變更前」）---
     let body = required_message(args)?;
     let correlation_id = optional_identifier(args, "correlation_id")?;
@@ -284,8 +296,16 @@ pub fn send(
             for (recipient, id) in queued.iter_mut().zip(&ids) {
                 recipient.message_id = Some(id.clone());
             }
+            // 單一向量回傳：每個收件人一筆結果，`wake` 欄位由 dispatch 端在
+            // 交易提交後填入。
+            //
+            // 這裡**不是** `(outcomes, queued.clone())`——那是把同一份資料回傳
+            // 兩次，讓 dispatch 端必須再查一次把它對回去（`Vec::append` 會清空
+            // 來源，所以「把 queued 搬到 outcomes 之外的同時保留它」根本做不到，
+            // 舊的 `SendOutcome` tuple 別名正是因此恆回空向量，讓 `wake_targets`
+            // 永遠是空的）。`wake` 現在是每一筆自己的欄位，不需要第二份清單。
             outcomes.append(&mut queued);
-            Ok::<SendOutcome, StoreError>((outcomes, queued))
+            Ok::<Vec<SendRecipient>, StoreError>(outcomes)
         })
         // 交易層的失敗（`BEGIN`／`COMMIT`／回滾）與被 `abort` 包起來的契約錯誤
         // 都在這裡還原：前者是 `internal`，後者取回原本的錯誤碼。

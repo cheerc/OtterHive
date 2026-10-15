@@ -1856,46 +1856,21 @@ fn send_operation(
             );
         }
     };
-    let (recipients, wake_targets) = {
+    let mut recipients = {
         let mut inner = state.lock();
         match messaging::send(&mut inner.store, caller, args, &config) {
             Ok(outcome) => outcome,
             Err(op_error) => return result_from_error(operation_id, op_error),
         }
     };
-
-    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。用 `message_id` 做 key 而不是
-    // instance 名稱：同一個收件人可能有多則訊息待喚醒，按名稱做 key 會讓後一則
-    // 覆蓋前一則的結果。
-    let mut wakers: BTreeMap<String, String> = BTreeMap::new();
-    // 每個成功寫入的收件人都必須有一個 `wake` 值（§6.1：queued 的收件人帶
-    // `wake`）。先為每一則填入預設值，再由實際排程結果覆蓋——所以 `wake_targets`
-    // 少列或名稱對不上時，欄位仍然是合法的契約值而不是缺漏。
-    for recipient in &recipients {
-        if let Some(message_id) = recipient.message_id.as_deref() {
-            wakers.insert(
-                message_id.to_owned(),
-                wake::WakeOutcome::NotRunning.as_wire().to_owned(),
-            );
-        }
-    }
-    for target in &wake_targets {
-        let Some(message_id) = target.message_id.as_deref() else {
-            continue;
-        };
-        // `wake_targets` 的元素是 `recipients` 中已寫入那些的副本，所以名稱
-        // 一定對得上；找不到只是不應該發生的情形，跳過而不是編一個值。
-        let Some(instance) = recipients
-            .iter()
-            .find(|recipient| recipient.message_id.as_deref() == Some(message_id))
-            .map(|recipient| recipient.instance.clone())
-        else {
-            continue;
-        };
-        wakers.insert(
-            message_id.to_owned(),
-            schedule_hint(state, caller, &instance, message_id, args),
-        );
+    // 交易已提交、鎖已釋放：現在才排喚醒（§6.4）。每一個收件人都有自己的
+    // `wake` 欄位——成功寫入的填排程結果，被拒的填 `not_running`（§6.4 把
+    // `not_running` 定義成「收件人不在 `running`」，而被拒的收件人確實不在）。
+    for recipient in &mut recipients {
+        recipient.wake = Some(match recipient.message_id.as_deref() {
+            Some(message_id) => schedule_hint(state, caller, &recipient.instance, message_id, args),
+            None => wake::WakeOutcome::NotRunning.as_wire().to_owned(),
+        });
     }
 
     let queued = recipients
@@ -1910,11 +1885,7 @@ fn send_operation(
     let recipients_json: Vec<Value> = recipients
         .iter()
         .map(|recipient| {
-            let wake = recipient
-                .message_id
-                .as_deref()
-                .and_then(|message_id| wakers.get(message_id))
-                .cloned();
+            let wake = recipient.wake.clone();
             json!({
                 "instance": recipient.instance,
                 "outcome": if recipient.message_id.is_some() { "queued" } else { "refused" },
