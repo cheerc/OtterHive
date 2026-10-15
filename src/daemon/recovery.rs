@@ -21,11 +21,11 @@ pub const RESTART_REASON: &str = "daemon_restarted";
 /// 該 instance 是否需要在 daemon 啟動時收斂（契約 §4.6）。
 ///
 /// 涵蓋記錄為 `starting`／`running`／`stopping`，或仍帶程序紀錄的
-/// `failed`／`stopped`。`recovery_required` 回 `false`：既有的收斂狀態不因
-/// 重啟而解除，也不自動重新啟動。
+/// `failed`／`stopped`；不在契約列舉內的狀態也必須收斂——它同樣可能是個
+/// 已經留下殘留程序的 instance，daemon 沒有理由假設它「不需要處理」。
+///
+/// `recovery_required` 回 `false`：既有的收斂狀態不因重啟而解除，也不自動
+/// 重新啟動。
 pub fn needs_convergence(state: &str) -> bool {
-    matches!(
-        state,
-        "starting" | "running" | "stopping" | "failed" | "stopped"
-    )
+    state != "recovery_required"
 }

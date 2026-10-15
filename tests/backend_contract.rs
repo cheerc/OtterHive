@@ -1100,7 +1100,12 @@ fn bridge_path_in_env_matches_mcp_config() {
 
 /// 編碼規則（§5.4）：canonical working directory 中非 `[A-Za-z0-9-]` 換成 `-`。
 fn encode_working_directory(workdir: &std::path::Path) -> String {
-    workdir
+    // §5.4 的編碼取自 **canonical** working directory。`TempDir` 在
+    // macOS 上給的是 `/var/folders/...`，而 `/var` 是指向 `/private/var` 的
+    // symlink；daemon 會把規格正規化，所以這裡也要正規化，否則兩邊算出來的
+    // 目錄名稱不同——測試會以為「沒有證據」，而實際上證據寫錯了地方。
+    let canonical = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    canonical
         .to_string_lossy()
         .chars()
         .map(|ch| {

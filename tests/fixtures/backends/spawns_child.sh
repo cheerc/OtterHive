@@ -7,6 +7,11 @@
 # SIGHUP，避免非預期的 SIGHUP 破壞 leader-exit 殘留情境。
 trap '' HUP
 log="${OTTERHIVE_FIXTURE_LOG:-/dev/null}"
+# 測試需要 leader 自己的 pid 時（例如 §4.6 的孤兒 zombie 收斂：`failed` 路徑
+# 會清掉 SQLite 的 pid 紀錄，而結果裡也不含 pid）。設了變數就寫出。
+if [ -n "$FIXTURE_LEADER_PID_FILE" ]; then
+    printf '%s\n' "$$" >"$FIXTURE_LEADER_PID_FILE"
+fi
 sleep 600 &
 child=$!
 printf '%s\n' "$child" >>"$log"
