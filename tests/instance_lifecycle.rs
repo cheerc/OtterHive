@@ -1443,14 +1443,35 @@ fn second_lifecycle_operation_on_the_same_instance_is_refused() {
         response
     });
 
-    // ignore_term.sh 讓 stop 需要數秒；趁進行中再 restart。
-    let refused = daemon.operator_call(
-        &home,
-        "restart_instance",
-        json!({"instance": "ignore-term"}),
-        None,
-    );
+    // `ignore_term.sh` 忽略 SIGTERM，所以 delete 必須走完 TERM（1000ms）＋
+    // KILL（500ms）才會結束——那段時間就是「同一 instance 已有 lifecycle 操作
+    // 進行中」的視窗。
+    //
+    // 撞擊方式：連續送出 restart 直到觀察到 `operation_in_progress`。只送一次的
+    // 話，兩次 syscall 之間的排程延遲決定是否落在視窗內，那是賭時序而不是驗
+    // 行為。判準不變：期限內必須觀察到 `operation_in_progress`。
+    let mut refused = None;
+    let attempt_start = std::time::Instant::now();
+    while refused.is_none() && attempt_start.elapsed() < LONG_TIMEOUT {
+        let attempt = daemon.operator_call(
+            &home,
+            "restart_instance",
+            json!({"instance": "ignore-term"}),
+            None,
+        );
+        if attempt.error.as_ref().map(|error| error.code)
+            == Some(otterhive::protocol::ErrorCode::OperationInProgress)
+        {
+            refused = Some(attempt);
+            break;
+        }
+        // 撞上視窗外（delete 已結束）就再試一次。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let _ = busy.join().expect("繁中說明：並行 delete 執行緒應結束");
+    let refused = refused.unwrap_or_else(|| {
+        panic!("繁中說明：期限內應觀察到 operation_in_progress（delete 進行中）")
+    });
     assert_eq!(
         refused.outcome,
         otterhive::protocol::Outcome::Refused,

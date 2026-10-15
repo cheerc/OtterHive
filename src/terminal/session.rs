@@ -585,9 +585,11 @@ fn push_output(core: &Core, bytes: &[u8]) {
 fn mark_ended(core: &Core) {
     let mut state = core.state.lock().expect("繁中說明：Session 鎖不應中毒");
     *core.ended.lock().unwrap_or_else(|guard| guard.into_inner()) = true;
-    // reader 看到 EOF：PTY 已關閉，沒有更多輸出。標記 stop 讓 observer 與
-    // `wait_exit` 的等待有明確終點。
-    *core.stop.lock().unwrap_or_else(|guard| guard.into_inner()) = true;
+    // 刻意**不**在此設 `stop`：`stop` 的語意是「observer 已停止觀測 exit」。
+    // reader 的 EOF 與 observer 的 exit 觀測是兩件事——child 退出時 reader
+    // 先看到 PTY EOF，observer 才寫入 exit status。若這裡也設 stop，
+    // `wait_exit` 會在 observer 寫入 exit 之前就回 `None`，讓
+    // `child_exit_is_observed` 之類的等待看不到 exit status。
     // 先算好最新 Snapshot（借用結束後再進可變迴圈），供待 Resync 的訂閱者使用。
     let final_snapshot = Snapshot {
         generation: core.generation,
