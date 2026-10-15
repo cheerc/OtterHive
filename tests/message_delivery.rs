@@ -1380,13 +1380,20 @@ fn undelivered_and_unacked_messages_survive_daemon_kill() {
     create_instance(&daemon, &home, "alpha");
     operator_send(&daemon, &home, "alpha", "未投遞");
     operator_send(&daemon, &home, "alpha", "已投遞未 ack");
+    // 兩則都是 `unread`，§6.3 的 drain 沒有筆數上限（只有 48 KiB 的 byte 預算），
+    // 所以第一次就會**兩則都取到**——lease 機制擋不住 `unread`，它只擋住尚未
+    // 過期的 `delivering`。
     let (_, _token, messages) = drain(&daemon, &home, "alpha");
-    assert_eq!(messages.len(), 1, "繁中說明：應取到一則，實際 {messages:?}");
+    assert_eq!(
+        messages.len(),
+        2,
+        "繁中說明：兩則都是 unread，應一次取到兩則，實際 {messages:?}"
+    );
     let acked_id = messages[0]["id"].as_str().unwrap_or_default().to_owned();
     assert_eq!(
         messages[0]["body"],
-        json!("已投遞未 ack"),
-        "繁中說明：依建立順序先取到第二則，實際 {messages:?}"
+        json!("未投遞"),
+        "繁中說明：依建立順序先取到第一則，實際 {messages:?}"
     );
 
     daemon.terminate();
@@ -1546,7 +1553,7 @@ fn accept_from_gates_delivery_to_an_orchestrator() {
     let daemon = Daemon::start(&home);
     create_instance(&daemon, &home, "lead");
     create_instance(&daemon, &home, "peer");
-    create_instance(&daemon, &home, "stranger");
+    create_instance(&daemon, &home, "outsider");
     create_team(
         &daemon,
         &home,
@@ -1554,39 +1561,53 @@ fn accept_from_gates_delivery_to_an_orchestrator() {
         json!({"members": ["lead", "peer"], "orchestrator": "lead",
                "accept_from": ["peer"]}),
     );
+    // outsider 必須屬於**另一個** team 才測得到規則 3／4：不屬任何 team 的 sender
+    // 會命中規則 1 而一律允許，`accept_from` 對它完全沒有作用。
+    create_team(
+        &daemon,
+        &home,
+        "rival",
+        json!({"members": ["outsider"], "orchestrator": "outsider"}),
+    );
 
-    // 在 accept_from 裡 → 允許。
-    let allowed = daemon.instance_call(
+    // 同隊一律允許（規則 2），無論 accept_from 怎麼寫。這段釘住規則的**次序**：
+    // 若哪天有人把規則 3 挪到規則 2 前面，這裡就會紅。
+    let same_team = daemon.instance_call(
         &home,
         "peer",
         "send",
-        json!({"instance": "lead", "message": "回報"}),
+        json!({"instance": "lead", "message": "同隊"}),
     );
     assert_eq!(
-        allowed.outcome,
+        same_team.outcome,
         otterhive::protocol::Outcome::Completed,
-        "繁中說明：accept_from 內的 sender 應可送給 orchestrator，實際為 {allowed:?}"
+        "繁中說明：同隊通訊不受 accept_from 限制，實際為 {same_team:?}"
     );
 
-    // 不在 accept_from 裡 → team_acl_denied。
+    // 跨隊且不在 accept_from 裡 → 規則 4 的 team_acl_denied。
     let refused = daemon.instance_call(
         &home,
-        "stranger",
+        "outsider",
         "send",
         json!({"instance": "lead", "message": "越權"}),
     );
     assert_code(&refused, otterhive::protocol::ErrorCode::TeamAclDenied);
-    assert!(
-        message_rows(&home, "lead").len() == 1,
+    // lead 此刻應有 1 則（peer 的同隊那一次）；outsider 被拒的那次不寫入任何訊息
+    // （§3「多數拒絕在任何變更前發生、沒有副作用」）。
+    assert_eq!(
+        message_rows(&home, "lead").len(),
+        1,
         "繁中說明：被拒的 send 不得留下訊息，實際 {:?}",
         message_rows(&home, "lead")
     );
 
-    // accept_from 取代後，改用新名單比對。
+    // accept_from 取代後，改用新名單比對。`accept_from: ["peer"]` 對跨隊的
+    // outsider 而言不含它，所以此時它仍被拒——這證明規則 3 的比對確實發生在送出
+    // 當下（§2 的刻意設計：名稱表達 operator 的意圖）。
     let updated = daemon.operator_call(
         &home,
         "team",
-        json!({"action": "update", "name": "squad", "accept_from": ["stranger"]}),
+        json!({"action": "update", "name": "squad", "accept_from": ["outsider"]}),
     );
     assert_eq!(
         updated.outcome,
@@ -1595,7 +1616,7 @@ fn accept_from_gates_delivery_to_an_orchestrator() {
     );
     let now_allowed = daemon.instance_call(
         &home,
-        "stranger",
+        "outsider",
         "send",
         json!({"instance": "lead", "message": "現在可以了"}),
     );
@@ -1604,13 +1625,38 @@ fn accept_from_gates_delivery_to_an_orchestrator() {
         otterhive::protocol::Outcome::Completed,
         "繁中說明：accept_from 更新後應允許，實際為 {now_allowed:?}"
     );
+
+    // 名單換掉後 outsider 再次被拒，而 peer（同隊，規則 2）不受影響——這兩點一起
+    // 證明規則 2 與規則 3 是**互斥的兩條路**，不是同一條路的兩種結果。
+    let swapped = daemon.operator_call(
+        &home,
+        "team",
+        json!({"action": "update", "name": "squad", "accept_from": ["peer"]}),
+    );
+    assert_eq!(
+        swapped.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：update 應完成，實際為 {swapped:?}"
+    );
     let now_refused = daemon.instance_call(
         &home,
-        "peer",
+        "outsider",
         "send",
         json!({"instance": "lead", "message": "現在不行了"}),
     );
     assert_code(&now_refused, otterhive::protocol::ErrorCode::TeamAclDenied);
+
+    let peer_still_allowed = daemon.instance_call(
+        &home,
+        "peer",
+        "send",
+        json!({"instance": "lead", "message": "同隊不受影響"}),
+    );
+    assert_eq!(
+        peer_still_allowed.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "繁中說明：同隊的 peer 應仍被允許，實際為 {peer_still_allowed:?}"
+    );
 }
 
 /// §6.2：manager 可送給任何 instance。

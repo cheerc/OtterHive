@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 
 use crate::daemon::lifecycle::validate_name;
-use crate::messaging::{abort, resume};
+use crate::messaging::resume;
 use crate::protocol::{ErrorCode, OpError};
 use crate::store::{Store, StoreError, TeamRow, Tx};
 
@@ -82,8 +82,10 @@ fn team_value(store: &mut Store, name: &str) -> Result<Value, OpError> {
             let row = tx
                 .team(name)
                 .map_err(|error| store_error("讀取 team 失敗", error))?
-                .ok_or_else(|| abort(internal(format!("team {name} 有成員卻沒有紀錄"))))?;
-            let orchestrator = orchestrator_name(tx, &row).map_err(abort)?;
+                .ok_or_else(|| {
+                    StoreError::from(internal(format!("team {name} 有成員卻沒有紀錄")))
+                })?;
+            let orchestrator = orchestrator_name(tx, &row).map_err(StoreError::from)?;
             let members = tx
                 .team_members(name)
                 .map_err(|error| store_error("讀取 team 成員失敗", error))?;
@@ -129,8 +131,10 @@ fn list_teams(store: &mut Store) -> Result<Value, OpError> {
                 let row = tx
                     .team(&name)
                     .map_err(|error| store_error("讀取 team 失敗", error))?
-                    .ok_or_else(|| abort(internal(format!("team {name} 有成員卻沒有紀錄"))))?;
-                let orchestrator = orchestrator_name(tx, &row).map_err(abort)?;
+                    .ok_or_else(|| {
+                        StoreError::from(internal(format!("team {name} 有成員卻沒有紀錄")))
+                    })?;
+                let orchestrator = orchestrator_name(tx, &row).map_err(StoreError::from)?;
                 let members = tx
                     .team_members(&name)
                     .map_err(|error| store_error("讀取 team 成員失敗", error))?;
@@ -173,7 +177,9 @@ fn create_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
                 .map_err(|error| store_error("查詢 team 失敗", error))?
                 .is_some()
             {
-                return Err(abort(name_conflict(format!("team {name} 已被使用"))));
+                return Err(StoreError::from(name_conflict(format!(
+                    "team {name} 已被使用"
+                ))));
             }
             let ids = resolve_members(tx, &members, None)?;
             let orchestrator_id = ids
@@ -182,7 +188,7 @@ fn create_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
                 .find(|(_, member)| *member == &orchestrator)
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| {
-                    abort(invalid(format!(
+                    StoreError::from(invalid(format!(
                         "orchestrator {orchestrator} 不在 members 裡"
                     )))
                 })?;
@@ -237,7 +243,7 @@ fn update_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
             let row = tx
                 .team(&name)
                 .map_err(|error| store_error("讀取 team 失敗", error))?
-                .ok_or_else(|| abort(not_found(format!("team {name} 不存在"))))?;
+                .ok_or_else(|| StoreError::from(not_found(format!("team {name} 不存在"))))?;
 
             let mut members = tx
                 .team_members(&name)
@@ -253,13 +259,13 @@ fn update_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
 
             let orchestrator = match &new_orchestrator {
                 Some(orchestrator) => orchestrator.clone(),
-                None => orchestrator_name(tx, &row).map_err(abort)?,
+                None => orchestrator_name(tx, &row).map_err(StoreError::from)?,
             };
             if !members.contains(&orchestrator) {
                 // §8.1：「update 若 remove 原 orchestrator，須在同一次操作指定
                 // 仍在成員中的新 orchestrator」——移除與指定矛盾這兩種情況在這裡
                 // 是同一個錯誤。
-                return Err(abort(invalid(format!(
+                return Err(StoreError::from(invalid(format!(
                     "orchestrator {orchestrator} 不在變更後的 members 裡"
                 ))));
             }
@@ -270,7 +276,9 @@ fn update_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
                 .zip(&members)
                 .find(|(_, member)| *member == &orchestrator)
                 .map(|(id, _)| id.clone())
-                .ok_or_else(|| abort(internal(String::from("orchestrator 不在成員清單裡"))))?;
+                .ok_or_else(|| {
+                    StoreError::from(internal(String::from("orchestrator 不在成員清單裡")))
+                })?;
 
             let description = new_description.clone().or(row.description.clone());
             let accept_from = new_accept_from
@@ -305,9 +313,9 @@ fn delete_team(store: &mut Store, request: TeamRequest<'_>) -> Result<Value, OpE
             let row = tx
                 .team(&name)
                 .map_err(|error| store_error("讀取 team 失敗", error))?
-                .ok_or_else(|| abort(not_found(format!("team {name} 不存在"))))?;
+                .ok_or_else(|| StoreError::from(not_found(format!("team {name} 不存在"))))?;
             if let Some(deployment) = row.deployment.clone() {
-                return Err(abort(invalid(format!(
+                return Err(StoreError::from(invalid(format!(
                     "team {name} 屬於 deployment {deployment}，只能由 teardown 刪除（§8.4）"
                 ))));
             }
@@ -336,14 +344,16 @@ fn resolve_members(
             .live_instance_id(member)
             .map_err(|error| store_error("查詢成員失敗", error))?
         else {
-            return Err(abort(not_found(format!("成員 {member} 不存在或已刪除"))));
+            return Err(StoreError::from(not_found(format!(
+                "成員 {member} 不存在或已刪除"
+            ))));
         };
         if let Some(existing) = tx
             .team_name_of_instance(member)
             .map_err(|error| store_error("查詢成員所屬 team 失敗", error))?
         {
             if Some(existing.as_str()) != current_team {
-                return Err(abort(name_conflict(format!(
+                return Err(StoreError::from(name_conflict(format!(
                     "instance {member} 已屬於 team {existing}"
                 ))));
             }
@@ -458,8 +468,8 @@ fn internal(message: String) -> OpError {
 fn store_error(context: &str, error: StoreError) -> StoreError {
     match error {
         StoreError::NameConflict(name) => {
-            abort(name_conflict(format!("{context}：{name} 已被使用")))
+            StoreError::from(name_conflict(format!("{context}：{name} 已被使用")))
         }
-        other => abort(internal(format!("{context}：{other}"))),
+        other => StoreError::from(internal(format!("{context}：{other}"))),
     }
 }

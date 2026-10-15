@@ -247,31 +247,35 @@ pub fn send(
 
     store
         .transaction(|tx| {
-            let mut names = selectors.resolve(tx).map_err(abort)?;
+            let mut names = selectors.resolve(tx)?;
             selectors.exclude_team_sender(&mut names, &sender);
 
             // --- 逐收件人：先判收件權限（§6.2），再準備寫入 ---
+            // 順序契約：§6.1 的 `value.recipients` **依請求順序**逐項列出，所以被拒
+            // 與成功要交錯在 `names` 的順序裡。不能先把拒絕的收進去、再把成功的
+            // append 在後面——那會讓所有 refused 排在所有 queued 之前。
+            // 做法是每個名稱都佔一個槽位，寫入後把 ID 原位回填。
             let mut outcomes: Vec<SendRecipient> = Vec::with_capacity(names.len());
             let mut messages: Vec<NewMessage> = Vec::with_capacity(names.len());
-            let mut queued: Vec<SendRecipient> = Vec::new();
+            let mut queued_slots: Vec<usize> = Vec::new();
             for name in &names {
+                let slot = outcomes.len();
                 if let Err(error) = check_recipient_permission(tx, &sender, name) {
                     outcomes.push(SendRecipient::refused(name, error));
                     continue;
                 }
                 let recipient_id = match tx
                     .live_instance_id(name)
-                    .map_err(|error| internal(format!("查詢收件人 {name} 失敗：{error}")))
+                    .map_err(|error| internal(format!("查詢收件人 {name} 失敗：{error}")))?
                 {
-                    Ok(Some(id)) => id,
-                    Ok(None) => {
+                    Some(id) => id,
+                    None => {
                         outcomes.push(SendRecipient::refused(
                             name,
                             not_found(format!("instance {name} 不存在或已刪除")),
                         ));
                         continue;
                     }
-                    Err(error) => return Err(abort(error)),
                 };
                 messages.push(NewMessage {
                     recipient_id,
@@ -284,67 +288,37 @@ pub fn send(
                     parent_id: parent_id.clone(),
                     thread_id: thread_id.clone(),
                 });
-                queued.push(SendRecipient::queued(name, String::new()));
+                // ID 要等寫入後才知道（§6.1 的「給 message ID」），先用空字串佔住
+                // 槽位；它不會出現在回應裡（下面從 `outcomes` 重建 `queued`）。
+                outcomes.push(SendRecipient::queued(name, String::new()));
+                queued_slots.push(slot);
             }
 
             // §6.1：寫入在同一交易內完成。`insert_message_batch` 回傳的 ID 依
             // 順序對應 `messages`，所以逐一回填到 `queued`。
             let ids = tx
                 .insert_message_batch(&messages)
-                .map_err(|error| store_error("寫入訊息失敗", error))
-                .map_err(abort)?;
-            for (recipient, id) in queued.iter_mut().zip(&ids) {
-                recipient.message_id = Some(id.clone());
+                .map_err(|error| store_error("寫入訊息失敗", error))?;
+            for (slot, id) in queued_slots.iter().zip(&ids) {
+                outcomes[*slot].message_id = Some(id.clone());
             }
-            // 單一向量回傳：每個收件人一筆結果，`wake` 欄位由 dispatch 端在
-            // 交易提交後填入。
-            //
-            // 這裡**不是** `(outcomes, queued.clone())`——那是把同一份資料回傳
-            // 兩次，讓 dispatch 端必須再查一次把它對回去（`Vec::append` 會清空
-            // 來源，所以「把 queued 搬到 outcomes 之外的同時保留它」根本做不到，
-            // 舊的 `SendOutcome` tuple 別名正是因此恆回空向量，讓 `wake_targets`
-            // 永遠是空的）。`wake` 現在是每一筆自己的欄位，不需要第二份清單。
-            outcomes.append(&mut queued);
+            // 成功的收件人早已佔好槽位（`queued_slots`），ID 也已原位回填，所以
+            // 這裡**不需要** `outcomes.append(&mut queued)`：`Vec::append` 會把來源
+            // 清空，而 `queued` 在單一向量的形狀下只是待寫入的副本。
             Ok::<Vec<SendRecipient>, StoreError>(outcomes)
         })
-        // 交易層的失敗（`BEGIN`／`COMMIT`／回滾）與被 `abort` 包起來的契約錯誤
-        // 都在這裡還原：前者是 `internal`，後者取回原本的錯誤碼。
+        // 交易層的失敗（`BEGIN`／`COMMIT`／回滾）與閉包內的契約拒絕都在這裡還原。
         .map_err(resume)
 }
 
-/// 把契約錯誤包進 [`StoreError::Invalid`]，讓它穿過 `Store::transaction` 的閉包。
+/// 把 `StoreError` 翻回契約錯誤（交易提交的出口）。
 ///
-/// 這是刻意的：閉包回 `Err` 會整筆回滾（§6.1／§8.1 的「拒絕時不留下部分變更」
-/// 正是靠它），所以契約層的拒絕也必須走 `Err` 才會觸發回滾。`StoreError` 只有
-/// `Invalid(String)` 能承載 `OpError` 而不被誤判成別種錯誤，所以把 `OpError`
-/// **完整序列化**（保留 code／message／retryable／next）加上一個不可能與他人
-/// 衝突的前綴，由 [`resume`] 還原。
-///
-/// `pub(crate)` 是因為 `teams` 的 create／update／delete 有同樣的需求——共用
-/// 同一份實作，而不是複製一份會漂移的。
-pub(crate) const ABORT_PREFIX: &str = "otterhive-op-error\u{1}";
-
-pub(crate) fn abort(error: OpError) -> StoreError {
-    let encoded = serde_json::to_string(&error)
-        .unwrap_or_else(|_| format!("{{\"code\":\"internal\",\"message\":{:?}}}", error.message));
-    StoreError::Invalid(format!("{ABORT_PREFIX}{encoded}"))
-}
-
-/// [`abort`] 的逆操作：還原完整的契約錯誤。
-///
-/// 前綴對不上就當成一般的 store 錯誤（`internal`）——那代表 abort 從未被使用，
-/// 是真正的內部失敗，不該被誤標成某個契約碼。序列化本身壞掉也走 `internal`
-/// （fail-closed：不猜）。
+/// 已經是 `Contract` 的就原樣放行——再包一次會把它變成 `internal`；其餘
+/// （`BEGIN`／`COMMIT`／回滾，以及 `NameConflict`）由 [`store_error`] 翻譯。
 pub(crate) fn resume(error: StoreError) -> OpError {
-    let StoreError::Invalid(message) = error else {
-        return store_error("交易失敗", error);
-    };
-    let Some(encoded) = message.strip_prefix(ABORT_PREFIX) else {
-        return internal(message);
-    };
-    match serde_json::from_str::<OpError>(encoded) {
-        Ok(op_error) => op_error,
-        Err(_) => internal(String::from("交易錯誤無法還原（內部失敗）")),
+    match error {
+        StoreError::Contract(op_error) => op_error,
+        other => store_error("交易失敗", other),
     }
 }
 
@@ -543,6 +517,13 @@ fn required_message(args: &Value) -> Result<String, OpError> {
         Some(_) => return Err(invalid(String::from("message 不得為空"))),
         None => return Err(invalid(String::from("send 需要 message"))),
     };
+    // §6.1 的「非空」是 **trim 後非空**：只有空白的訊息在 §6.4 的喚醒流程裡
+    // 毫無意義（提示行只帶 from／kind／id，不帶 body），而 §6.3 的 `body` 會把
+    // 空白原樣送給 agent。回傳的是**原樣**的 `text`，不是 trim 過的——
+    // 「不得為空」是准入條件，不是「把內容改寫成別的東西」的授權。
+    if text.trim().is_empty() {
+        return Err(invalid(String::from("message 不得為空白")));
+    }
     // §6.1 的上限是 **bytes**：多字元 UTF-8 的訊息在字符數遠小於 64 KiB 時就
     // 已經超標。
     if text.len() > MAX_MESSAGE_BYTES {
