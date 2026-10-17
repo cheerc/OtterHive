@@ -7,12 +7,14 @@
 # （§6.4 的延後沒有上限，所以這樣的收件人會讓重判迴圈持續重判）。
 #
 # **這個阻塞已經證實可達**：daemon 曾兩次因此紅（CI），`sample` 取得的執行緒堆疊
-# 顯示喚醒的重判執行緒卡在 `write(2)`，而處理該次 `send` 的執行緒在等同一把
-# `core.writer` 鎖。證據、累積門檻與已裁決的修法（writer 改 `O_NONBLOCK`）見
-# `docs/worklog-t6-pty-write-block.md`。
+# 顯示喚醒的重判執行緒卡在 `write(2)`。機制與處置見
+# `docs/worklog-pty-write-block.md`：`write(2)` 在 master→slave 的輸入佇列滿時
+# 阻塞，而那個佇列**只由子程序讀 stdin 才會排空**——所以本 fixture（不讀 stdin）
+# 一定會踩到，且不會自己好。
 #
-# 這支 fixture 存在的原因就是它：**`Arc<Session>` 只解決了鎖的粒度**（寫入不持
-# daemon 鎖），沒有解決 `write_input` 內部那把 `core.writer` 仍被佔住的問題。
+# 處置已實作：`Session::write_input` 改用 `try_lock`（其他呼叫端不排隊），且
+# `interrupt`／attach Input 的寫入移出 daemon 鎖。**`O_NONBLOCK` 那條路線已
+# 否決**（dup 不隔離旗標、slave 方向送不到 child stdin、`write_all` 會切斷提示行）。
 #
 # 收到 SIGTERM 就結束（daemon 的停止路徑需要它能乾淨退出）。
 trap 'exit 0' TERM INT

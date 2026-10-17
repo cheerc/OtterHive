@@ -169,6 +169,13 @@ impl Session {
         builder.args(cfg.args.iter().map(String::as_str));
         builder.cwd(&cfg.cwd);
         for (key, value) in &cfg.env {
+            // 契約 §5.3 的過濾涵蓋**兩個來源**：呼叫端指定的 `cfg.env`（這裡）
+            // 與繼承來的環境（下面 `operator_prefixed_keys`）。先前只做了後者，
+            // 所以直接以 `SessionConfig::env` 傳入的 `OTTERHIVE_OPERATOR_…`
+            // 會漏進子程序——而這段註解當時已聲稱它是「最後一道」。
+            if key.starts_with("OTTERHIVE_OPERATOR") {
+                continue;
+            }
             builder.env(key, value);
         }
         // 契約 §5.3：子程序不得看到名稱以 `OTTERHIVE_OPERATOR` 開頭的變數。
@@ -280,12 +287,33 @@ impl Session {
             .expect("繁中說明：child_released 槽不應中毒") = true;
     }
 
+    /// 寫入 PTY 輸入。
+    ///
+    /// **不等待寫端鎖**（§6.4／§4.7 的可用性要求）：`core.writer` 可能被另一個
+    /// 執行緒長時間佔住——PTY 的 `write(2)` 在輸入佇列滿時會阻塞，而那個佇列
+    /// 只有子程序讀 stdin 才會排空（見 `docs/worklog-pty-write-block.md`）。
+    /// 用 `lock()` 會讓每一個後續呼叫端一起排隊，等一個不知道何時結束的寫入；
+    /// `try_lock()` 讓「正在寫入」變成一個**立刻可見的狀態**，呼叫端可以據此回
+    /// `failed`（§6.4）或讓操作失敗，而不是無限期地等。
+    ///
+    /// poison 用 `into_inner()` 取回（與 `Drop`、`mark_ended`、`DaemonState::lock`
+    /// 一致）：本函式的 panic 會被 daemon 的 `catch_unwind` 吞掉而變成靜默失敗，
+    /// 那比取回一個可能不一致的 guard 更糟。
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.core
-            .writer
-            .lock()
-            .expect("繁中說明：Session 寫端不應中毒")
-            .write_all(bytes)
+        let mut writer = match self.core.writer.try_lock() {
+            Ok(writer) => writer,
+            // 另一個執行緒正在寫入（可能已阻塞在 write(2)）：不等待，讓呼叫端
+            // 立刻知道這個寫入沒有送出去。
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "PTY 寫端正被另一個寫入佔用",
+                ));
+            }
+            // poison：取回可能不一致的 guard 並繼續，與本 crate 其他鎖一致。
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        writer.write_all(bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -673,7 +701,7 @@ mod tests {
     //! `write_input` 的確定性單元測試（§6.4／§4.7）。
     //!
     //! 這裡**不**製造真正的 PTY 阻塞（要填滿 1022 B 的輸入佇列、且寫入不含 `\r`
-    //! 時永遠不 EAGAIN——見 `docs/worklog-t6-pty-write-block.md`）。直接佔住
+    //! 時永遠不 EAGAIN——見 `docs/worklog-pty-write-block.md`）。直接佔住
     //! `core.writer` 精確重現「另一個執行緒正在寫入」這個狀態，毫秒內完成且完全
     //! 確定。
     //!

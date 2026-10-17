@@ -257,6 +257,14 @@ pub fn child_environment(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     for (key, value) in spec_env {
+        // §5.3 的移除必須涵蓋 `env` 指定的變數，不能只過濾繼承來的 `base`。
+        // 否則 `create_instance` 的 `env: {"OTTERHIVE_OPERATOR_…": …}` 就會把
+        // operator 憑證送進子程序——契約那句是無條件的（「子程序不得看到名稱以
+        // `OTTERHIVE_OPERATOR` 開頭的變數」），而 `session.rs` 的 `spawn` 層
+        // 過濾用的是**繼承環境**，同樣看不到這裡指定的鍵。
+        if key.starts_with("OTTERHIVE_OPERATOR") {
+            continue;
+        }
         env.insert(key.clone(), value.clone());
     }
     env.insert(

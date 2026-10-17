@@ -490,21 +490,23 @@ fn create_non_reader(daemon: &support::Daemon, home: &support::TestHome, name: &
 
 /// 一個不讀 stdin 的 agent 收到喚醒提示時，daemon 對**其他**呼叫端仍然可用。
 ///
-/// 這條測試**不是** D-1（阻塞式 PTY 寫入持有全域鎖）的迴歸防護，而且證明不了
-/// 那件事：那個阻塞**已經證實可達**（`docs/worklog-t6-pty-write-block.md`——CI 紅過
-/// 兩次、`sample` 取得的執行緒堆疊顯示卡在 `write(2)`）。`Arc<Session>` 的改動解決
-/// 的是**鎖的粒度**（寫入不持 daemon 鎖），不是「寫入不會阻塞」——真正的修法
-/// （writer 改 `O_NONBLOCK`）是 T6 的第一項工作包。
+/// 這條測試**不是**阻塞式 PTY 寫入的迴歸防護，而且證明不了那件事：那個阻塞
+/// **已經證實可達**（`docs/worklog-pty-write-block.md`——CI 紅過兩次、`sample`
+/// 取得的執行緒堆疊顯示卡在 `write(2)`）。真正的迴歸防護在
+/// `src/terminal/session.rs` 的 `write_input` 單元測試（確定性地佔住
+/// `core.writer`），以及「寫入移出 daemon 鎖」那兩處。
 ///
 /// 它驗的是另一件事：§6.4 的延後**沒有上限**，所以一個永遠安靜的收件人會讓重判迴圈
 /// 無限期地重判。而每次 `send` 都要取 daemon 鎖（`send_operation` → `schedule_hint`），
 /// 所以那個迴圈與呼叫端是在爭同一把鎖——**不讀 stdin 的收件人不該讓其他呼叫端
 /// 餓死**。
 ///
-/// 送出次數刻意**低**：這條測試驗的是「鎖競爭下的可用性」，不是「緩衝區填滿」
-/// ——而「填滿」的門檻與證據見 worklog（本缺陷證實可達，門檻是累積量而非單次寫入
-/// 大小）。送出太多只會讓測試變成長跑（本來
-/// 6 秒、CI 上 26 秒）並提高它在其他負載下再失敗的機率，卻不增加任何覆蓋。
+/// 送出次數刻意**低**：這條測試驗的是「鎖競爭下的可用性」，不是「填滿輸入佇列」
+/// ——而那個門檻見 worklog（**1022 bytes，是 master→slave 的單行輸入佇列上限，
+/// 不是累積量**；早期流傳的「約 200 MiB」是被總時限截斷的量測）。要確定性觸發
+/// 缺陷請用 `session.rs` 的單元測試（直接佔住 `core.writer`），不要靠這裡送足夠
+/// 多次。送出太多只會讓測試變成長跑（本來 6 秒、CI 上 26 秒）並提高它在其他負載
+/// 下再失敗的機率，卻不增加任何覆蓋。
 #[test]
 fn a_non_reading_agent_does_not_stop_the_daemon_from_serving_other_callers() {
     let home = support::TestHome::new();
