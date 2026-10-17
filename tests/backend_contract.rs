@@ -236,6 +236,18 @@ mod support {
     /// 用於 fixture **先建立／截斷檔案、再寫內容** 的情形（`cat x > dump`、
     /// `env > out`）：`wait_for_file` 的 `exists()` 在那種寫法下會早於內容完成
     /// 就回真，讀到空檔。判準要對準真正想等的那個狀態。
+    ///
+    /// **邊界：本函式保證「`needle` 已出現」，不保證「檔案已完整」。**
+    ///
+    /// 它只等到 needle 那一刻就讀，所以 needle 之後若還有內容沒寫完，回傳的是
+    /// 截斷的檔案。對**正面斷言**（「檔案要含 X」）把 needle 取在欲斷言的字串上
+    /// 就足夠；但對**負面斷言**（「檔案不得含 Y」，例如
+    /// `!env_names.any(|n| n.starts_with("OTTERHIVE_OPERATOR"))`）**只能提高機率，
+    /// 不是保證**——needle 之後才寫進去的 `Y` 會被漏看。
+    ///
+    /// 要真正保證完整得讓 fixture 改成 **write-then-rename**（`tmp` 寫完再
+    /// `mv` 成終名，rename 是原子的），那是 fixture 的改動，不在本處範圍。
+    /// 讀到這裡的人不該以為換成這個 helper 就萬無一失。
     pub fn wait_for_file_containing(path: &Path, needle: &str) -> Option<String> {
         let mut last = String::new();
         let found = poll_until(LONG_TIMEOUT, || {
@@ -275,8 +287,10 @@ fn claude_argv_order_matches_the_contract() {
         "繁中說明：create 應完成，實際為 {created:?}"
     );
     let workdir = home.workspace("argv-check");
+    // argv log 是**逐行 append**（`printf >>`），行程被殺在中途會留下前綴。
+    // 等真正的終態：最後一個 argv（`args` 附加在最後，`claude.rs:57-59`）。
     assert!(
-        wait_for_file(&argv_log),
+        wait_for_file_containing(&argv_log, "custom-value").is_some(),
         "繁中說明：fake_claude.sh 應寫入 argv log {}",
         argv_log.display()
     );
@@ -356,8 +370,12 @@ fn coordination_prompt_contains_name_and_instructions() {
         "繁中說明：create 應完成，實際為 {created:?}"
     );
     let prompt_file = home.workspace("prompted").join(".claude/otterhive.md");
+    // `cat > dump` 先截斷再寫：`exists()` 會早於內容完成就回真。
+    // needle 用**最後寫入**的那段（instructions 附在協調提示之後，
+    // `claude.rs:95-97`），而不是開頭就會出現的 instance 名稱——名稱早寫，
+    // 不能當終態；而且它正是下方 `contains` 斷言用的字串。
     assert!(
-        wait_for_file(&prompt_dump),
+        wait_for_file_containing(&prompt_dump, "這是 instance 專屬的指示原文。").is_some(),
         "繁中說明：fake_claude.sh 應轉儲協調提示 {}",
         prompt_dump.display()
     );
@@ -499,16 +517,27 @@ fn mcp_config_and_child_environment_match_the_contract() {
         "繁中說明：MCP 設定權限應為 0600，實際 {:o}",
         permissions.mode() & 0o777
     );
+    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它是 JSON 的**最後**欄位
+    // （`claude.rs:114-126`），也就是終態。若只等到 `"otterhive"` 就讀走，JSON
+    // 會截斷而解析失敗，變成誤導性的「應是合法 JSON」紅。
     assert!(
-        wait_for_file(&mcp_dump),
+        wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：fake_claude 應轉儲 MCP 設定"
     );
+    // env dump 是 `env | sed | sort`：先截斷再寫，且幾百個變數要數毫秒。
+    // `OTTERHIVE_HOME` 是 sort 後的第一位，等它即代表前面那些 OTTERHIVE 行寫完了。
+    //
+    // **但下面的負面斷言（「不得有 `OTTERHIVE_OPERATOR`」）不因此有保證**：
+    // 本 helper 只保證 needle 已出現。`OTTERHIVE_OPERATOR_*` 排序在後面，
+    // 若檔案在它寫入前就在這裡被讀走，那條斷言會假綠。詳見
+    // `wait_for_file_containing` 的「邊界」註解——要真正保證得改 fixture 成
+    // write-then-rename。
     assert!(
-        wait_for_file(&env_dump),
+        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數名稱"
     );
     assert!(
-        wait_for_file(&term_dump),
+        wait_for_file_containing(&term_dump, "xterm-256color").is_some(),
         "繁中說明：fake_claude 應轉儲 TERM 的值"
     );
 
@@ -766,8 +795,9 @@ fn claude_resume_uses_continue_when_evidence_exists() {
         ),
         "繁中說明：有證據時 resume 應成功，實際為 {resumed:?}"
     );
+    // argv log 逐行 append；等測試真正要斷言的那一行（`--continue`）。
     assert!(
-        wait_for_file(&argv_log),
+        wait_for_file_containing(&argv_log, "--continue").is_some(),
         "繁中說明：resume 後 fake_claude 應再寫一次 argv"
     );
     let argv = read_lines(&argv_log);
@@ -775,8 +805,11 @@ fn claude_resume_uses_continue_when_evidence_exists() {
         argv.iter().any(|arg| arg == "--continue"),
         "繁中說明：有證據的 resume 應加 --continue，實際：{argv:?}"
     );
+    // 這一行在 `restart_instance` **之後**（在該測試稍早處），所以 `resume_dump`
+    // 已被 resume 那次 spawn 覆寫。等 `evidence`——它是這個位置的終態，也是本測試
+    // 建立的條件（`$HOME/.claude/projects/<編碼>/session.jsonl` 含 `"type":"user"`）。
     assert!(
-        wait_for_file(&resume_dump),
+        wait_for_file_containing(&resume_dump, "evidence").is_some(),
         "繁中說明：fake_claude 應轉儲證據判定"
     );
 }
@@ -976,7 +1009,7 @@ fn spec_env_is_passed_to_the_child() {
         "實際為 {created:?}"
     );
     assert!(
-        wait_for_file(&env_dump),
+        wait_for_file_containing(&env_dump, "CUSTOM_VAR").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數"
     );
     let names = read_lines(&env_dump);
@@ -1251,8 +1284,14 @@ fn bridge_path_in_env_matches_mcp_config() {
         otterhive::protocol::Outcome::Completed,
         "實際為 {created:?}"
     );
-    assert!(wait_for_file(&mcp_dump), "繁中說明：應轉儲 MCP 設定");
-    assert!(wait_for_file(&env_dump), "繁中說明：應轉儲環境變數");
+    assert!(
+        wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
+        "繁中說明：應轉儲 MCP 設定"
+    );
+    assert!(
+        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        "繁中說明：應轉儲環境變數"
+    );
     let mcp: Value = serde_json::from_str(&read_text(&mcp_dump))
         .unwrap_or_else(|e| panic!("繁中說明：MCP 設定應是 JSON：{e}"));
     let bridge_in_config = mcp["mcpServers"]["otterhive"]["command"]
