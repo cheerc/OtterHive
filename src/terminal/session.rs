@@ -667,3 +667,131 @@ impl Subscriber {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `write_input` 的確定性單元測試（§6.4／§4.7）。
+    //!
+    //! 這裡**不**製造真正的 PTY 阻塞（要填滿 1022 B 的輸入佇列、且寫入不含 `\r`
+    //! 時永遠不 EAGAIN——見 `docs/worklog-t6-pty-write-block.md`）。直接佔住
+    //! `core.writer` 精確重現「另一個執行緒正在寫入」這個狀態，毫秒內完成且完全
+    //! 確定。
+    //!
+    //! **這些測試在修正前的版本上會 hang，不是紅**：舊的 `write_input` 用
+    //! `lock().expect(...)`，佔住鎖之後它會阻塞在 `lock()`，而 `cargo test` 沒有
+    //! per-test timeout，結果是跑到 CI timeout。修正後 `try_lock` 立刻回
+    //! `WouldBlock`——所以「有界時間內回 `Err`」本身就是斷言。
+    use super::{Session, SessionConfig};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backends")
+            .join(name)
+    }
+
+    /// 起一個用 `non_reader.sh`（不讀 stdin）的 Session，只在 macOS 上有意義。
+    fn non_reading_session() -> (Session, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("繁中說明：應能建立暫存目錄");
+        let cfg = SessionConfig {
+            program: fixture("non_reader.sh").to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: tmp.path().to_path_buf(),
+            env: Vec::new(),
+            size: (120, 40),
+            generation: 1,
+            subscriber_queue: 8,
+        };
+        let session = Session::spawn(cfg).expect("繁中說明：non_reader fixture 應可啟動");
+        (session, tmp)
+    }
+
+    /// writer 被佔住時，`write_input` 必須**立刻**回 `WouldBlock`，而不是等待。
+    #[test]
+    fn write_input_returns_would_block_without_waiting_when_writer_is_held() {
+        let (session, _tmp) = non_reading_session();
+
+        // 佔住 writer（模擬另一個執行緒正在寫入，且已阻塞在 write(2)）。
+        // 這個 guard 活到函式結束，所以 `write_input` 期間鎖一直是被佔住的。
+        let _held = session
+            .core
+            .writer
+            .lock()
+            .expect("繁中說明：測試應能取得寫端");
+
+        let start = Instant::now();
+        let result = session.write_input(b"input line");
+        let elapsed = start.elapsed();
+
+        // 關鍵斷言：不等待。舊實作會在這裡 hang（沒有上限），所以只要它回來，
+        // 就證明走的是 try_lock 而非 lock。
+        let error = result.expect_err("繁中說明：writer 被佔住時 write_input 應回 Err");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "繁中說明：writer 被佔住應回 WouldBlock"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "繁中說明：write_input 不應等待 writer 鎖，耗時 {elapsed:?}"
+        );
+    }
+
+    /// writer 空著時，`write_input` 照常成功（不因 try_lock 而誤拒）。
+    #[test]
+    fn write_input_succeeds_when_writer_is_free() {
+        let (session, _tmp) = non_reading_session();
+        let result = session.write_input(b"input line\r");
+        assert!(
+            result.is_ok(),
+            "繁中說明：writer 空著時 write_input 應成功，實際為 {result:?}"
+        );
+    }
+
+    /// §5.3 的 spawn 層過濾必須涵蓋 `SessionConfig::env`，不只繼承環境。
+    ///
+    /// 這一層的承諾是「任何呼叫端——包括直接用 `SessionConfig` 的測試——都不會
+    /// 把 operator 憑證漏進去」，所以要用「直接指定 `cfg.env`」來驗，不能只驗
+    /// daemon 走的那條路。
+    #[test]
+    fn spawn_removes_operator_prefixed_keys_from_config_env() {
+        let tmp = tempfile::tempdir().expect("繁中說明：應能建立暫存目錄");
+        let out = tmp.path().join("env.txt");
+        let cfg = SessionConfig {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), format!("env > {}", out.display())],
+            cwd: tmp.path().to_path_buf(),
+            env: vec![
+                ("CUSTOM_FLAG".to_owned(), "on".to_owned()),
+                (
+                    "OTTERHIVE_OPERATOR_SMUGGLED".to_owned(),
+                    "leaked".to_owned(),
+                ),
+            ],
+            size: (120, 40),
+            generation: 1,
+            subscriber_queue: 8,
+        };
+        let session = Session::spawn(cfg).expect("繁中說明：/bin/sh 應可啟動");
+        // 等 env 落檔。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !out.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let content = std::fs::read_to_string(&out).expect("繁中說明：子程序應寫出 env");
+        assert!(
+            !content
+                .lines()
+                .any(|line| line.starts_with("OTTERHIVE_OPERATOR")),
+            "繁中說明：cfg.env 的 OTTERHIVE_OPERATOR 前綴變數必須被移除，實際 env：\n{content}"
+        );
+        assert!(
+            content
+                .lines()
+                .any(|line| line.starts_with("CUSTOM_FLAG=on")),
+            "繁中說明：一般 env 仍應生效，實際 env：\n{content}"
+        );
+        drop(session);
+    }
+}

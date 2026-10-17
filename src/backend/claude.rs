@@ -272,3 +272,52 @@ pub fn child_environment(
     env.insert("TERM".to_owned(), "xterm-256color".to_owned());
     env
 }
+
+#[cfg(test)]
+mod tests {
+    //! `child_environment` 的 §5.3 保證（整合層見 `tests/backend_contract.rs`）。
+    use super::child_environment;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn env_of(spec_env: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let base: BTreeMap<String, String> = [
+            ("OTTERHIVE_OPERATOR_TOKEN", "daemon-side-secret"),
+            ("PATH", "/usr/bin"),
+        ]
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+        let spec: BTreeMap<String, String> = spec_env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        child_environment(
+            &base,
+            &spec,
+            Path::new("/tmp/home"),
+            "worker",
+            "token",
+            Path::new("/tmp/bridge"),
+        )
+    }
+
+    /// §5.3：子程序不得看到 `OTTERHIVE_OPERATOR` 前綴的變數——**包括 `env` 指定的**。
+    #[test]
+    fn spec_env_cannot_smuggle_operator_prefixed_variables() {
+        let env = env_of(&[("OTTERHIVE_OPERATOR_SMUGGLED", "leaked")]);
+        assert!(
+            !env.keys().any(|key| key.starts_with("OTTERHIVE_OPERATOR")),
+            "繁中說明：`env` 指定的 OTTERHIVE_OPERATOR 前綴變數也必須被 §5.3 移除，實際：{:?}",
+            env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// 正常 `env` 仍生效（過濾不得誤傷）。
+    #[test]
+    fn spec_env_still_applies_ordinary_variables() {
+        let env = env_of(&[("CUSTOM_FLAG", "on")]);
+        assert_eq!(env.get("CUSTOM_FLAG").map(String::as_str), Some("on"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+}

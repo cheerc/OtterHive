@@ -372,6 +372,74 @@ fn coordination_prompt_contains_name_and_instructions() {
     let _ = instructions_text;
 }
 
+/// §5.1：協調提示必須含**所屬 team 與 orchestrator**，以及**可用的
+/// OtterHive 工具**。team 由 §8.1 的 team 操作設定（deploy 會先建 team 再
+/// start 成員），所以成員在 spawn 時就查得到；工具清單則是 manager 的完整
+/// 集合（含 `interrupt`）。
+#[test]
+fn coordination_prompt_reports_team_and_privileged_tools() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+    let dump = home.root().join("prompted-prompt.txt");
+    let chief_dump = home.root().join("chief-prompt.txt");
+
+    for (name, target) in [("chief", &chief_dump), ("member", &dump)] {
+        let created = daemon.operator_call(
+            &home,
+            "create_instance",
+            serde_json::json!({
+                "name": name,
+                "command": fixture("fake_claude.sh").to_string_lossy(),
+                "env": {"OTTERHIVE_FIXTURE_PROMPT": target.to_string_lossy()},
+            }),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：{name} 應建立成功，實際為 {created:?}"
+        );
+    }
+    let team = daemon.operator_call(
+        &home,
+        "team",
+        serde_json::json!({
+            "action": "create", "name": "squad",
+            "members": ["chief", "member"], "orchestrator": "chief",
+        }),
+    );
+    assert_eq!(
+        team.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {team:?}"
+    );
+
+    // 加入 team 之後重啟成員，讓它的協調提示重新物化。
+    let restarted = daemon.operator_call(
+        &home,
+        "restart_instance",
+        serde_json::json!({"instance": "member"}),
+    );
+    assert!(
+        matches!(
+            restarted.outcome,
+            otterhive::protocol::Outcome::Completed | otterhive::protocol::Outcome::Queued
+        ),
+        "繁中說明：restart 應成功，實際為 {restarted:?}"
+    );
+    assert!(wait_for_file(&dump), "繁中說明：成員應轉儲協調提示");
+
+    let prompt = read_text(&dump);
+    assert!(
+        prompt.contains("squad") && prompt.contains("chief"),
+        "繁中說明：§5.1 要求協調提示含所屬 team 與 orchestrator，實際：{prompt}"
+    );
+    // 工具清單必須是 manager 的完整集合，含 `interrupt`。
+    assert!(
+        prompt.contains("interrupt"),
+        "繁中說明：協調提示的可用的工具清單應含 interrupt（§2 的 manager 集合），實際：{prompt}"
+    );
+}
+
 /// §5.1：MCP 設定權限 0600、JSON 結構符合契約、含該 generation 的 token；
 /// §5.3：子程序環境有 `OTTERHIVE_INSTANCE`／`OTTERHIVE_MCP_BRIDGE`，沒有
 /// `OTTERHIVE_OPERATOR` 前綴變數，且有 `TERM=xterm-256color`。
@@ -1022,6 +1090,90 @@ fn list_instances_can_filter_by_name() {
         Some(otterhive::protocol::ErrorCode::NotFound),
         "實際為 {missing:?}"
     );
+}
+
+/// §4.7／§4.1：`list_instances` 的每一項 MUST 含十個欄位，且 `team` 來自
+/// `team_members`（§8.1 的 team 操作），**不是** `instances.spec`。
+///
+/// 這支同時補兩個洞：
+/// 1. `team` 曾恆為 `null`——它讀 `spec.get("team")`，而 §4.1 的 `InstanceSpec`
+///    欄位清單不含 `team`（「team 成員資格只經 §8.1 的 team 操作設定」），
+///    所以那個鍵從來不存在。T4 的 106 支與 T5 的 357 支都沒讀過這個欄位，
+///    因此缺陷與綠燈同時成立。
+/// 2. 沒有任何測試比對過整組欄位——缺欄位、多欄位都不會被抓到。
+#[test]
+fn list_instances_reports_the_contract_field_set_and_real_team_membership() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+
+    for name in ["solo", "chief"] {
+        let created = daemon.operator_call(
+            &home,
+            "create_instance",
+            serde_json::json!({
+                "name": name,
+                "command": fixture("echo_agent.sh").to_string_lossy(),
+            }),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "實際為 {created:?}"
+        );
+    }
+    // `solo` 不屬任何 team；`chief` 是 `squad` 的 orchestrator。
+    let team = daemon.operator_call(
+        &home,
+        "team",
+        serde_json::json!({
+            "action": "create", "name": "squad",
+            "members": ["chief"], "orchestrator": "chief",
+        }),
+    );
+    assert_eq!(
+        team.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {team:?}"
+    );
+
+    let listed = daemon.operator_call(&home, "list_instances", serde_json::json!({}));
+    assert_eq!(
+        listed.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {listed:?}"
+    );
+    let instances = listed.value["instances"]
+        .as_array()
+        .expect("應回 instances 陣列");
+
+    let mut expected: Vec<&str> = vec![
+        "backend",
+        "description",
+        "generation",
+        "id",
+        "name",
+        "reason",
+        "role",
+        "state",
+        "team",
+        "updated_ms",
+    ];
+    expected.sort_unstable();
+
+    for entry in instances {
+        let object = entry.as_object().expect("每項應為物件");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected, "繁中說明：§4.7 的欄位集不符，實際：{entry}");
+
+        let name = object["name"].as_str().expect("name 應為字串");
+        let want_team = if name == "chief" { Some("squad") } else { None };
+        assert_eq!(
+            object["team"].as_str(),
+            want_team,
+            "繁中說明：{name} 的 team 應為 {want_team:?}（來自 team_members，非 spec），實際：{entry}"
+        );
+    }
 }
 
 /// §5.1：skills symlink 記錄在 journal（`skills_link_created`），restart 時可更新。
