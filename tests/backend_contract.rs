@@ -230,6 +230,20 @@ mod support {
     pub fn wait_for_file(path: &Path) -> bool {
         poll_until(LONG_TIMEOUT, || path.exists())
     }
+
+    /// 等到 `path` 的內容含有 `needle` 為止，回傳當下全文；逾時回 `None`。
+    ///
+    /// 用於 fixture **先建立／截斷檔案、再寫內容** 的情形（`cat x > dump`、
+    /// `env > out`）：`wait_for_file` 的 `exists()` 在那種寫法下會早於內容完成
+    /// 就回真，讀到空檔。判準要對準真正想等的那個狀態。
+    pub fn wait_for_file_containing(path: &Path, needle: &str) -> Option<String> {
+        let mut last = String::new();
+        let found = poll_until(LONG_TIMEOUT, || {
+            last = fs::read_to_string(path).unwrap_or_default();
+            last.contains(needle)
+        });
+        found.then_some(last)
+    }
 }
 
 use support::*;
@@ -426,11 +440,12 @@ fn coordination_prompt_reports_team_and_privileged_tools() {
         ),
         "繁中說明：restart 應成功，實際為 {restarted:?}"
     );
-    assert!(wait_for_file(&dump), "繁中說明：成員應轉儲協調提示");
-
-    let prompt = read_text(&dump);
+    // 等**終態條件**（內容出現），不是「檔案存在」——`cat > "$dump"` 會先建立／
+    // 截斷檔案再寫內容，所以 `exists()` 為真不等於寫完了。
+    let prompt = wait_for_file_containing(&dump, "squad")
+        .unwrap_or_else(|| panic!("繁中說明：成員應轉儲協調提示，實際：{}", read_text(&dump)));
     assert!(
-        prompt.contains("squad") && prompt.contains("chief"),
+        prompt.contains("chief"),
         "繁中說明：§5.1 要求協調提示含所屬 team 與 orchestrator，實際：{prompt}"
     );
     // 工具清單必須是 manager 的完整集合，含 `interrupt`。

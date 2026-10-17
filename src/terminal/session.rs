@@ -802,12 +802,24 @@ mod tests {
             subscriber_queue: 8,
         };
         let session = Session::spawn(cfg).expect("繁中說明：/bin/sh 應可啟動");
-        // 等 env 落檔。
+        // 等**終態條件**：輪詢到檔案出現一般 env 的那一行為止。
+        //
+        // 不能只等 `out.exists()`——`sh -c "env > out"` 的 redirect 會**先建立
+        // 檔案**再寫內容，所以「檔案存在」不代表「child 寫完了」。先前就是這樣
+        // 在 CI（較慢的 runner）上讀到空內容而失敗（`CUSTOM_FLAG=on` 那條斷言）。
+        // 判準要對準真正想等的那個狀態，不是它的中間產物。
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !out.exists() && Instant::now() < deadline {
+        let mut content = String::new();
+        while Instant::now() < deadline {
+            content = std::fs::read_to_string(&out).unwrap_or_default();
+            if content
+                .lines()
+                .any(|line| line.starts_with("CUSTOM_FLAG=on"))
+            {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let content = std::fs::read_to_string(&out).expect("繁中說明：子程序應寫出 env");
         assert!(
             !content
                 .lines()
@@ -818,7 +830,7 @@ mod tests {
             content
                 .lines()
                 .any(|line| line.starts_with("CUSTOM_FLAG=on")),
-            "繁中說明：一般 env 仍應生效，實際 env：\n{content}"
+            "繁中說明：一般 env 仍應生效（5 秒內未觀察到 CUSTOM_FLAG=on），實際 env：\n{content}"
         );
         drop(session);
     }
