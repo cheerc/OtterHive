@@ -296,6 +296,14 @@ impl Session {
     /// `try_lock()` 讓「正在寫入」變成一個**立刻可見的狀態**，呼叫端可以據此回
     /// `failed`（§6.4）或讓操作失敗，而不是無限期地等。
     ///
+    /// **`WouldBlock` 是持續狀態，不是短暫的競態。** `src/` 對 PTY master 沒有任何
+    /// `O_NONBLOCK`（唯一的 `set_nonblocking` 是 daemon 的 `UnixListener`／accepted
+    /// stream），所以 writer 永遠是 blocking：一次寫入一旦卡在 `write(2)`，那把鎖就
+    /// 一直被佔住，直到**子程序讀 stdin** 或 session 停止才解除——而「不讀 stdin 的
+    /// agent」兩個都不會做。因此同一個 instance 的後續寫入會**一路**回 `WouldBlock`
+    /// （`interrupt` 因此持續回 `operation_in_progress`）；代價是有界的，其他
+    /// instance 不受影響。讀這個錯誤碼的人要知道它大概不會自己好。
+    ///
     /// poison 用 `into_inner()` 取回（與 `Drop`、`mark_ended`、`DaemonState::lock`
     /// 一致）：本函式的 panic 會被 daemon 的 `catch_unwind` 吞掉而變成靜默失敗，
     /// 那比取回一個可能不一致的 guard 更糟。
@@ -774,6 +782,82 @@ mod tests {
         assert!(
             result.is_ok(),
             "繁中說明：writer 空著時 write_input 應成功，實際為 {result:?}"
+        );
+    }
+
+    /// §4.7：`interrupt` 靠 `io::ErrorKind::WouldBlock` 把
+    /// `operation_in_progress` 與 `internal` 分開（`daemon/mod.rs` 的
+    /// `Err(write_error) if write_error.kind() == ErrorKind::WouldBlock`）。
+    ///
+    /// 所以「**可區分**」是契約面的事實，不是實作細節：只斷言「writer 被佔住時
+    /// 回 `WouldBlock`」是不夠的——「任何錯誤都回 `WouldBlock`」也會通過，而那樣
+    /// `interrupt` 會永遠回 `operation_in_progress`，**把真正的故障說成預期的併發
+    /// 狀態**，把 non-WouldBlock 的 `internal` 分支變成死碼。
+    ///
+    /// 三種狀態、三個確定的結果，全部毫秒內完成：
+    ///
+    /// 1. writer 空著、child 活著 → `Ok`（對照組：證明不是「一律回 Err」）
+    /// 2. writer 被佔住 → `WouldBlock`（`interrupt` 的 `operation_in_progress`）
+    /// 3. writer 空著、child 已退出（slave 關閉）→ **非** `WouldBlock`
+    ///    （`interrupt` 的 `internal`）
+    ///
+    /// 第 3 種在 macOS 上是 `EIO`（實測：對已關閉的 slave 寫 master 得
+    /// `errno 5`，不是 `EAGAIN`），所以兩者確實分得開。這一條**無法**從整合測試
+    /// 觸發（writer 要持續被佔住），只能靠這個形狀。
+    ///
+    /// 另一個必須寫清楚的邊界：**「這一支在舊版上會紅」是錯的敘述。** 把 `try_lock`
+    /// 改回 `lock()` 之後，舊版對同一個輸入只有兩種可能——鎖空時回 `Ok`（與新版
+    /// 相同），鎖被佔時**永遠不回**。沒有任何輸入能讓舊版回一個**錯的值**，所以它
+    /// 不會紅，只會 hang（`cargo test` 沒有 per-test timeout）。判準因此只能是
+    /// 「**在一個有上限的時間內回一個有型別的 `Err`**」，而不是「紅」。
+    #[test]
+    fn write_input_distinguishes_would_block_from_other_write_errors() {
+        let (session, _tmp) = non_reading_session();
+
+        // (1) 對照組：writer 空著、child 活著 → 成功。
+        let ok = session.write_input(b"before\r");
+        assert!(
+            ok.is_ok(),
+            "繁中說明：writer 空著且 child 活著時應寫入成功，實際為 {ok:?}"
+        );
+
+        // (2) writer 被佔住 → WouldBlock。
+        {
+            let _held = session
+                .core
+                .writer
+                .lock()
+                .expect("繁中說明：測試應能取得寫端");
+            let error = session
+                .write_input(b"during")
+                .expect_err("繁中說明：writer 被佔住時應回 Err");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "繁中說明：writer 被佔住應回 WouldBlock，實際為 {error:?}"
+            );
+        }
+
+        // (3) child 退出、slave 關閉 → 非 WouldBlock 的錯誤。
+        let pid = session.pid();
+        // SAFETY：`pid` 是本 Session 剛 spawn 的 child（`non_reading_session`），
+        // 送 SIGTERM 是測試刻意結束它；`non_reader.sh` 經 `exec` 後即 `sleep`，
+        // 沒有 trap，所以 SIGTERM 的直接作用就是終止。
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert!(
+            session.wait_exit(Duration::from_secs(5)).is_some(),
+            "繁中說明：non_reader child 收到 SIGTERM 後應在 5 秒內退出"
+        );
+
+        let error = session
+            .write_input(b"after")
+            .expect_err("繁中說明：slave 已關閉時寫入應回 Err");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "繁中說明：slave 關閉是真正的寫入失敗，不得與 writer 被佔用（WouldBlock）\
+             混為同一個 kind——否則 interrupt 會把故障誤報成 operation_in_progress，\
+             實際錯誤為 {error:?}"
         );
     }
 
