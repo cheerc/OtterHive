@@ -169,6 +169,13 @@ impl Session {
         builder.args(cfg.args.iter().map(String::as_str));
         builder.cwd(&cfg.cwd);
         for (key, value) in &cfg.env {
+            // 契約 §5.3 的過濾涵蓋**兩個來源**：呼叫端指定的 `cfg.env`（這裡）
+            // 與繼承來的環境（下面 `operator_prefixed_keys`）。先前只做了後者，
+            // 所以直接以 `SessionConfig::env` 傳入的 `OTTERHIVE_OPERATOR_…`
+            // 會漏進子程序——而這段註解當時已聲稱它是「最後一道」。
+            if key.starts_with("OTTERHIVE_OPERATOR") {
+                continue;
+            }
             builder.env(key, value);
         }
         // 契約 §5.3：子程序不得看到名稱以 `OTTERHIVE_OPERATOR` 開頭的變數。
@@ -280,12 +287,41 @@ impl Session {
             .expect("繁中說明：child_released 槽不應中毒") = true;
     }
 
+    /// 寫入 PTY 輸入。
+    ///
+    /// **不等待寫端鎖**（§6.4／§4.7 的可用性要求）：`core.writer` 可能被另一個
+    /// 執行緒長時間佔住——PTY 的 `write(2)` 在輸入佇列滿時會阻塞，而那個佇列
+    /// 只有子程序讀 stdin 才會排空（見 `docs/worklog-pty-write-block.md`）。
+    /// 用 `lock()` 會讓每一個後續呼叫端一起排隊，等一個不知道何時結束的寫入；
+    /// `try_lock()` 讓「正在寫入」變成一個**立刻可見的狀態**，呼叫端可以據此回
+    /// `failed`（§6.4）或讓操作失敗，而不是無限期地等。
+    ///
+    /// **`WouldBlock` 是持續狀態，不是短暫的競態。** `src/` 對 PTY master 沒有任何
+    /// `O_NONBLOCK`（唯一的 `set_nonblocking` 是 daemon 的 `UnixListener`／accepted
+    /// stream），所以 writer 永遠是 blocking：一次寫入一旦卡在 `write(2)`，那把鎖就
+    /// 一直被佔住，直到**子程序讀 stdin** 或 session 停止才解除——而「不讀 stdin 的
+    /// agent」兩個都不會做。因此同一個 instance 的後續寫入會**一路**回 `WouldBlock`
+    /// （`interrupt` 因此持續回 `operation_in_progress`）；代價是有界的，其他
+    /// instance 不受影響。讀這個錯誤碼的人要知道它大概不會自己好。
+    ///
+    /// poison 用 `into_inner()` 取回（與 `Drop`、`mark_ended`、`DaemonState::lock`
+    /// 一致）：本函式的 panic 會被 daemon 的 `catch_unwind` 吞掉而變成靜默失敗，
+    /// 那比取回一個可能不一致的 guard 更糟。
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.core
-            .writer
-            .lock()
-            .expect("繁中說明：Session 寫端不應中毒")
-            .write_all(bytes)
+        let mut writer = match self.core.writer.try_lock() {
+            Ok(writer) => writer,
+            // 另一個執行緒正在寫入（可能已阻塞在 write(2)）：不等待，讓呼叫端
+            // 立刻知道這個寫入沒有送出去。
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "PTY 寫端正被另一個寫入佔用",
+                ));
+            }
+            // poison：取回可能不一致的 guard 並繼續，與本 crate 其他鎖一致。
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        writer.write_all(bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -665,5 +701,221 @@ impl Subscriber {
                 return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `write_input` 的確定性單元測試（§6.4／§4.7）。
+    //!
+    //! 這裡**不**製造真正的 PTY 阻塞（要填滿 1022 B 的輸入佇列、且寫入不含 `\r`
+    //! 時永遠不 EAGAIN——見 `docs/worklog-pty-write-block.md`）。直接佔住
+    //! `core.writer` 精確重現「另一個執行緒正在寫入」這個狀態，毫秒內完成且完全
+    //! 確定。
+    //!
+    //! **這些測試在修正前的版本上會 hang，不是紅**：舊的 `write_input` 用
+    //! `lock().expect(...)`，佔住鎖之後它會阻塞在 `lock()`，而 `cargo test` 沒有
+    //! per-test timeout，結果是跑到 CI timeout。修正後 `try_lock` 立刻回
+    //! `WouldBlock`——所以「有界時間內回 `Err`」本身就是斷言。
+    use super::{Session, SessionConfig};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backends")
+            .join(name)
+    }
+
+    /// 起一個用 `non_reader.sh`（不讀 stdin）的 Session，只在 macOS 上有意義。
+    fn non_reading_session() -> (Session, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("繁中說明：應能建立暫存目錄");
+        let cfg = SessionConfig {
+            program: fixture("non_reader.sh").to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: tmp.path().to_path_buf(),
+            env: Vec::new(),
+            size: (120, 40),
+            generation: 1,
+            subscriber_queue: 8,
+        };
+        let session = Session::spawn(cfg).expect("繁中說明：non_reader fixture 應可啟動");
+        (session, tmp)
+    }
+
+    /// writer 被佔住時，`write_input` 必須**立刻**回 `WouldBlock`，而不是等待。
+    #[test]
+    fn write_input_returns_would_block_without_waiting_when_writer_is_held() {
+        let (session, _tmp) = non_reading_session();
+
+        // 佔住 writer（模擬另一個執行緒正在寫入，且已阻塞在 write(2)）。
+        // 這個 guard 活到函式結束，所以 `write_input` 期間鎖一直是被佔住的。
+        let _held = session
+            .core
+            .writer
+            .lock()
+            .expect("繁中說明：測試應能取得寫端");
+
+        let start = Instant::now();
+        let result = session.write_input(b"input line");
+        let elapsed = start.elapsed();
+
+        // 關鍵斷言：不等待。舊實作會在這裡 hang（沒有上限），所以只要它回來，
+        // 就證明走的是 try_lock 而非 lock。
+        let error = result.expect_err("繁中說明：writer 被佔住時 write_input 應回 Err");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "繁中說明：writer 被佔住應回 WouldBlock"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "繁中說明：write_input 不應等待 writer 鎖，耗時 {elapsed:?}"
+        );
+    }
+
+    /// writer 空著時，`write_input` 照常成功（不因 try_lock 而誤拒）。
+    #[test]
+    fn write_input_succeeds_when_writer_is_free() {
+        let (session, _tmp) = non_reading_session();
+        let result = session.write_input(b"input line\r");
+        assert!(
+            result.is_ok(),
+            "繁中說明：writer 空著時 write_input 應成功，實際為 {result:?}"
+        );
+    }
+
+    /// §4.7：`interrupt` 靠 `io::ErrorKind::WouldBlock` 把
+    /// `operation_in_progress` 與 `internal` 分開（`daemon/mod.rs` 的
+    /// `Err(write_error) if write_error.kind() == ErrorKind::WouldBlock`）。
+    ///
+    /// 所以「**可區分**」是契約面的事實，不是實作細節：只斷言「writer 被佔住時
+    /// 回 `WouldBlock`」是不夠的——「任何錯誤都回 `WouldBlock`」也會通過，而那樣
+    /// `interrupt` 會永遠回 `operation_in_progress`，**把真正的故障說成預期的併發
+    /// 狀態**，把 non-WouldBlock 的 `internal` 分支變成死碼。
+    ///
+    /// 三種狀態、三個確定的結果，全部毫秒內完成：
+    ///
+    /// 1. writer 空著、child 活著 → `Ok`（對照組：證明不是「一律回 Err」）
+    /// 2. writer 被佔住 → `WouldBlock`（`interrupt` 的 `operation_in_progress`）
+    /// 3. writer 空著、child 已退出（slave 關閉）→ **非** `WouldBlock`
+    ///    （`interrupt` 的 `internal`）
+    ///
+    /// 第 3 種在 macOS 上是 `EIO`（實測：對已關閉的 slave 寫 master 得
+    /// `errno 5`，不是 `EAGAIN`），所以兩者確實分得開。這一條**無法**從整合測試
+    /// 觸發（writer 要持續被佔住），只能靠這個形狀。
+    ///
+    /// 另一個必須寫清楚的邊界：**「這一支在舊版上會紅」是錯的敘述。** 把 `try_lock`
+    /// 改回 `lock()` 之後，舊版對同一個輸入只有兩種可能——鎖空時回 `Ok`（與新版
+    /// 相同），鎖被佔時**永遠不回**。沒有任何輸入能讓舊版回一個**錯的值**，所以它
+    /// 不會紅，只會 hang（`cargo test` 沒有 per-test timeout）。判準因此只能是
+    /// 「**在一個有上限的時間內回一個有型別的 `Err`**」，而不是「紅」。
+    #[test]
+    fn write_input_distinguishes_would_block_from_other_write_errors() {
+        let (session, _tmp) = non_reading_session();
+
+        // (1) 對照組：writer 空著、child 活著 → 成功。
+        let ok = session.write_input(b"before\r");
+        assert!(
+            ok.is_ok(),
+            "繁中說明：writer 空著且 child 活著時應寫入成功，實際為 {ok:?}"
+        );
+
+        // (2) writer 被佔住 → WouldBlock。
+        {
+            let _held = session
+                .core
+                .writer
+                .lock()
+                .expect("繁中說明：測試應能取得寫端");
+            let error = session
+                .write_input(b"during")
+                .expect_err("繁中說明：writer 被佔住時應回 Err");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "繁中說明：writer 被佔住應回 WouldBlock，實際為 {error:?}"
+            );
+        }
+
+        // (3) child 退出、slave 關閉 → 非 WouldBlock 的錯誤。
+        let pid = session.pid();
+        // SAFETY：`pid` 是本 Session 剛 spawn 的 child（`non_reading_session`），
+        // 送 SIGTERM 是測試刻意結束它；`non_reader.sh` 經 `exec` 後即 `sleep`，
+        // 沒有 trap，所以 SIGTERM 的直接作用就是終止。
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert!(
+            session.wait_exit(Duration::from_secs(5)).is_some(),
+            "繁中說明：non_reader child 收到 SIGTERM 後應在 5 秒內退出"
+        );
+
+        let error = session
+            .write_input(b"after")
+            .expect_err("繁中說明：slave 已關閉時寫入應回 Err");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "繁中說明：slave 關閉是真正的寫入失敗，不得與 writer 被佔用（WouldBlock）\
+             混為同一個 kind——否則 interrupt 會把故障誤報成 operation_in_progress，\
+             實際錯誤為 {error:?}"
+        );
+    }
+
+    /// §5.3 的 spawn 層過濾必須涵蓋 `SessionConfig::env`，不只繼承環境。
+    ///
+    /// 這一層的承諾是「任何呼叫端——包括直接用 `SessionConfig` 的測試——都不會
+    /// 把 operator 憑證漏進去」，所以要用「直接指定 `cfg.env`」來驗，不能只驗
+    /// daemon 走的那條路。
+    #[test]
+    fn spawn_removes_operator_prefixed_keys_from_config_env() {
+        let tmp = tempfile::tempdir().expect("繁中說明：應能建立暫存目錄");
+        let out = tmp.path().join("env.txt");
+        let cfg = SessionConfig {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), format!("env > {}", out.display())],
+            cwd: tmp.path().to_path_buf(),
+            env: vec![
+                ("CUSTOM_FLAG".to_owned(), "on".to_owned()),
+                (
+                    "OTTERHIVE_OPERATOR_SMUGGLED".to_owned(),
+                    "leaked".to_owned(),
+                ),
+            ],
+            size: (120, 40),
+            generation: 1,
+            subscriber_queue: 8,
+        };
+        let session = Session::spawn(cfg).expect("繁中說明：/bin/sh 應可啟動");
+        // 等**終態條件**：輪詢到檔案出現一般 env 的那一行為止。
+        //
+        // 不能只等 `out.exists()`——`sh -c "env > out"` 的 redirect 會**先建立
+        // 檔案**再寫內容，所以「檔案存在」不代表「child 寫完了」。先前就是這樣
+        // 在 CI（較慢的 runner）上讀到空內容而失敗（`CUSTOM_FLAG=on` 那條斷言）。
+        // 判準要對準真正想等的那個狀態，不是它的中間產物。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut content = String::new();
+        while Instant::now() < deadline {
+            content = std::fs::read_to_string(&out).unwrap_or_default();
+            if content
+                .lines()
+                .any(|line| line.starts_with("CUSTOM_FLAG=on"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !content
+                .lines()
+                .any(|line| line.starts_with("OTTERHIVE_OPERATOR")),
+            "繁中說明：cfg.env 的 OTTERHIVE_OPERATOR 前綴變數必須被移除，實際 env：\n{content}"
+        );
+        assert!(
+            content
+                .lines()
+                .any(|line| line.starts_with("CUSTOM_FLAG=on")),
+            "繁中說明：一般 env 仍應生效（5 秒內未觀察到 CUSTOM_FLAG=on），實際 env：\n{content}"
+        );
+        drop(session);
     }
 }

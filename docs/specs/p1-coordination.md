@@ -122,7 +122,7 @@ PTY 檔案描述元隨舊 daemon 消失，無法重新接上。daemon 啟動時�
 ### 4.7 查詢與控制
 
 - `list_instances`：`value.instances` 為陣列，每項含 `name`、`id`、`state`、`reason`、`generation`、`backend`、`team`、`role`、`description`、`updated_ms`；帶 `instance` 時只回該項。對 instance 呼叫端回同樣欄位。
-- `interrupt`：對目前 generation 的 PTY 寫入一個 ESC（`0x1b`），`effects: ["esc_sent"]`。不確認 agent 是否真的停下。instance 不在 `running` 回 `invalid_argument`。
+- `interrupt`：對目前 generation 的 PTY 寫入一個 ESC（`0x1b`），`effects: ["esc_sent"]`。不確認 agent 是否真的停下。instance 不在 `running` 回 `invalid_argument`；寫入通道被佔用（agent 正在輸入，或前一次寫入尚未完成）時回 `operation_in_progress`，ESC 未送出。
 - `pane_snapshot`：`value.text` 為目前畫面去除 ANSI 後的純文字，每列去掉行尾空白；`lines`（預設 100，上限 10000）只取最後幾列；`value.generation` 標明畫面屬於哪個 generation。instance 不在 `running` 時回 daemon 記憶體中最後一次的畫面並標 `value.live: false`；daemon 重啟後沒有舊畫面，回空字串、`live: false`、`value.reason: "no_screen"`。
 
 ## 5. Backend adapter

@@ -230,6 +230,32 @@ mod support {
     pub fn wait_for_file(path: &Path) -> bool {
         poll_until(LONG_TIMEOUT, || path.exists())
     }
+
+    /// 等到 `path` 的內容含有 `needle` 為止，回傳當下全文；逾時回 `None`。
+    ///
+    /// 用於 fixture **先建立／截斷檔案、再寫內容** 的情形（`cat x > dump`、
+    /// `env > out`）：`wait_for_file` 的 `exists()` 在那種寫法下會早於內容完成
+    /// 就回真，讀到空檔。判準要對準真正想等的那個狀態。
+    ///
+    /// **邊界：本函式保證「`needle` 已出現」，不保證「檔案已完整」。**
+    ///
+    /// 它只等到 needle 那一刻就讀，所以 needle 之後若還有內容沒寫完，回傳的是
+    /// 截斷的檔案。對**正面斷言**（「檔案要含 X」）把 needle 取在欲斷言的字串上
+    /// 就足夠；但對**負面斷言**（「檔案不得含 Y」，例如
+    /// `!env_names.any(|n| n.starts_with("OTTERHIVE_OPERATOR"))`）**只能提高機率，
+    /// 不是保證**——needle 之後才寫進去的 `Y` 會被漏看。
+    ///
+    /// 要真正保證完整得讓 fixture 改成 **write-then-rename**（`tmp` 寫完再
+    /// `mv` 成終名，rename 是原子的），那是 fixture 的改動，不在本處範圍。
+    /// 讀到這裡的人不該以為換成這個 helper 就萬無一失。
+    pub fn wait_for_file_containing(path: &Path, needle: &str) -> Option<String> {
+        let mut last = String::new();
+        let found = poll_until(LONG_TIMEOUT, || {
+            last = fs::read_to_string(path).unwrap_or_default();
+            last.contains(needle)
+        });
+        found.then_some(last)
+    }
 }
 
 use support::*;
@@ -261,8 +287,10 @@ fn claude_argv_order_matches_the_contract() {
         "繁中說明：create 應完成，實際為 {created:?}"
     );
     let workdir = home.workspace("argv-check");
+    // argv log 是**逐行 append**（`printf >>`），行程被殺在中途會留下前綴。
+    // 等真正的終態：最後一個 argv（`args` 附加在最後，`claude.rs:57-59`）。
     assert!(
-        wait_for_file(&argv_log),
+        wait_for_file_containing(&argv_log, "custom-value").is_some(),
         "繁中說明：fake_claude.sh 應寫入 argv log {}",
         argv_log.display()
     );
@@ -342,8 +370,12 @@ fn coordination_prompt_contains_name_and_instructions() {
         "繁中說明：create 應完成，實際為 {created:?}"
     );
     let prompt_file = home.workspace("prompted").join(".claude/otterhive.md");
+    // `cat > dump` 先截斷再寫：`exists()` 會早於內容完成就回真。
+    // needle 用**最後寫入**的那段（instructions 附在協調提示之後，
+    // `claude.rs:95-97`），而不是開頭就會出現的 instance 名稱——名稱早寫，
+    // 不能當終態；而且它正是下方 `contains` 斷言用的字串。
     assert!(
-        wait_for_file(&prompt_dump),
+        wait_for_file_containing(&prompt_dump, "這是 instance 專屬的指示原文。").is_some(),
         "繁中說明：fake_claude.sh 應轉儲協調提示 {}",
         prompt_dump.display()
     );
@@ -370,6 +402,75 @@ fn coordination_prompt_contains_name_and_instructions() {
         "繁中說明：instructions 應附在協調提示之後，實際：{prompt}"
     );
     let _ = instructions_text;
+}
+
+/// §5.1：協調提示必須含**所屬 team 與 orchestrator**，以及**可用的
+/// OtterHive 工具**。team 由 §8.1 的 team 操作設定（deploy 會先建 team 再
+/// start 成員），所以成員在 spawn 時就查得到；工具清單則是 manager 的完整
+/// 集合（含 `interrupt`）。
+#[test]
+fn coordination_prompt_reports_team_and_privileged_tools() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+    let dump = home.root().join("prompted-prompt.txt");
+    let chief_dump = home.root().join("chief-prompt.txt");
+
+    for (name, target) in [("chief", &chief_dump), ("member", &dump)] {
+        let created = daemon.operator_call(
+            &home,
+            "create_instance",
+            serde_json::json!({
+                "name": name,
+                "command": fixture("fake_claude.sh").to_string_lossy(),
+                "env": {"OTTERHIVE_FIXTURE_PROMPT": target.to_string_lossy()},
+            }),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "繁中說明：{name} 應建立成功，實際為 {created:?}"
+        );
+    }
+    let team = daemon.operator_call(
+        &home,
+        "team",
+        serde_json::json!({
+            "action": "create", "name": "squad",
+            "members": ["chief", "member"], "orchestrator": "chief",
+        }),
+    );
+    assert_eq!(
+        team.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {team:?}"
+    );
+
+    // 加入 team 之後重啟成員，讓它的協調提示重新物化。
+    let restarted = daemon.operator_call(
+        &home,
+        "restart_instance",
+        serde_json::json!({"instance": "member"}),
+    );
+    assert!(
+        matches!(
+            restarted.outcome,
+            otterhive::protocol::Outcome::Completed | otterhive::protocol::Outcome::Queued
+        ),
+        "繁中說明：restart 應成功，實際為 {restarted:?}"
+    );
+    // 等**終態條件**（內容出現），不是「檔案存在」——`cat > "$dump"` 會先建立／
+    // 截斷檔案再寫內容，所以 `exists()` 為真不等於寫完了。
+    let prompt = wait_for_file_containing(&dump, "squad")
+        .unwrap_or_else(|| panic!("繁中說明：成員應轉儲協調提示，實際：{}", read_text(&dump)));
+    assert!(
+        prompt.contains("chief"),
+        "繁中說明：§5.1 要求協調提示含所屬 team 與 orchestrator，實際：{prompt}"
+    );
+    // 工具清單必須是 manager 的完整集合，含 `interrupt`。
+    assert!(
+        prompt.contains("interrupt"),
+        "繁中說明：協調提示的可用的工具清單應含 interrupt（§2 的 manager 集合），實際：{prompt}"
+    );
 }
 
 /// §5.1：MCP 設定權限 0600、JSON 結構符合契約、含該 generation 的 token；
@@ -416,16 +517,27 @@ fn mcp_config_and_child_environment_match_the_contract() {
         "繁中說明：MCP 設定權限應為 0600，實際 {:o}",
         permissions.mode() & 0o777
     );
+    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它是 JSON 的**最後**欄位
+    // （`claude.rs:114-126`），也就是終態。若只等到 `"otterhive"` 就讀走，JSON
+    // 會截斷而解析失敗，變成誤導性的「應是合法 JSON」紅。
     assert!(
-        wait_for_file(&mcp_dump),
+        wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：fake_claude 應轉儲 MCP 設定"
     );
+    // env dump 是 `env | sed | sort`：先截斷再寫，且幾百個變數要數毫秒。
+    // `OTTERHIVE_HOME` 是 sort 後的第一位，等它即代表前面那些 OTTERHIVE 行寫完了。
+    //
+    // **但下面的負面斷言（「不得有 `OTTERHIVE_OPERATOR`」）不因此有保證**：
+    // 本 helper 只保證 needle 已出現。`OTTERHIVE_OPERATOR_*` 排序在後面，
+    // 若檔案在它寫入前就在這裡被讀走，那條斷言會假綠。詳見
+    // `wait_for_file_containing` 的「邊界」註解——要真正保證得改 fixture 成
+    // write-then-rename。
     assert!(
-        wait_for_file(&env_dump),
+        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數名稱"
     );
     assert!(
-        wait_for_file(&term_dump),
+        wait_for_file_containing(&term_dump, "xterm-256color").is_some(),
         "繁中說明：fake_claude 應轉儲 TERM 的值"
     );
 
@@ -683,8 +795,9 @@ fn claude_resume_uses_continue_when_evidence_exists() {
         ),
         "繁中說明：有證據時 resume 應成功，實際為 {resumed:?}"
     );
+    // argv log 逐行 append；等測試真正要斷言的那一行（`--continue`）。
     assert!(
-        wait_for_file(&argv_log),
+        wait_for_file_containing(&argv_log, "--continue").is_some(),
         "繁中說明：resume 後 fake_claude 應再寫一次 argv"
     );
     let argv = read_lines(&argv_log);
@@ -692,8 +805,11 @@ fn claude_resume_uses_continue_when_evidence_exists() {
         argv.iter().any(|arg| arg == "--continue"),
         "繁中說明：有證據的 resume 應加 --continue，實際：{argv:?}"
     );
+    // 這一行在 `restart_instance` **之後**（在該測試稍早處），所以 `resume_dump`
+    // 已被 resume 那次 spawn 覆寫。等 `evidence`——它是這個位置的終態，也是本測試
+    // 建立的條件（`$HOME/.claude/projects/<編碼>/session.jsonl` 含 `"type":"user"`）。
     assert!(
-        wait_for_file(&resume_dump),
+        wait_for_file_containing(&resume_dump, "evidence").is_some(),
         "繁中說明：fake_claude 應轉儲證據判定"
     );
 }
@@ -893,7 +1009,7 @@ fn spec_env_is_passed_to_the_child() {
         "實際為 {created:?}"
     );
     assert!(
-        wait_for_file(&env_dump),
+        wait_for_file_containing(&env_dump, "CUSTOM_VAR").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數"
     );
     let names = read_lines(&env_dump);
@@ -1024,6 +1140,90 @@ fn list_instances_can_filter_by_name() {
     );
 }
 
+/// §4.7／§4.1：`list_instances` 的每一項 MUST 含十個欄位，且 `team` 來自
+/// `team_members`（§8.1 的 team 操作），**不是** `instances.spec`。
+///
+/// 這支同時補兩個洞：
+/// 1. `team` 曾恆為 `null`——它讀 `spec.get("team")`，而 §4.1 的 `InstanceSpec`
+///    欄位清單不含 `team`（「team 成員資格只經 §8.1 的 team 操作設定」），
+///    所以那個鍵從來不存在。T4 的 106 支與 T5 的 357 支都沒讀過這個欄位，
+///    因此缺陷與綠燈同時成立。
+/// 2. 沒有任何測試比對過整組欄位——缺欄位、多欄位都不會被抓到。
+#[test]
+fn list_instances_reports_the_contract_field_set_and_real_team_membership() {
+    let home = TestHome::new();
+    let daemon = Daemon::start(&home);
+
+    for name in ["solo", "chief"] {
+        let created = daemon.operator_call(
+            &home,
+            "create_instance",
+            serde_json::json!({
+                "name": name,
+                "command": fixture("echo_agent.sh").to_string_lossy(),
+            }),
+        );
+        assert_eq!(
+            created.outcome,
+            otterhive::protocol::Outcome::Completed,
+            "實際為 {created:?}"
+        );
+    }
+    // `solo` 不屬任何 team；`chief` 是 `squad` 的 orchestrator。
+    let team = daemon.operator_call(
+        &home,
+        "team",
+        serde_json::json!({
+            "action": "create", "name": "squad",
+            "members": ["chief"], "orchestrator": "chief",
+        }),
+    );
+    assert_eq!(
+        team.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {team:?}"
+    );
+
+    let listed = daemon.operator_call(&home, "list_instances", serde_json::json!({}));
+    assert_eq!(
+        listed.outcome,
+        otterhive::protocol::Outcome::Completed,
+        "實際為 {listed:?}"
+    );
+    let instances = listed.value["instances"]
+        .as_array()
+        .expect("應回 instances 陣列");
+
+    let mut expected: Vec<&str> = vec![
+        "backend",
+        "description",
+        "generation",
+        "id",
+        "name",
+        "reason",
+        "role",
+        "state",
+        "team",
+        "updated_ms",
+    ];
+    expected.sort_unstable();
+
+    for entry in instances {
+        let object = entry.as_object().expect("每項應為物件");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected, "繁中說明：§4.7 的欄位集不符，實際：{entry}");
+
+        let name = object["name"].as_str().expect("name 應為字串");
+        let want_team = if name == "chief" { Some("squad") } else { None };
+        assert_eq!(
+            object["team"].as_str(),
+            want_team,
+            "繁中說明：{name} 的 team 應為 {want_team:?}（來自 team_members，非 spec），實際：{entry}"
+        );
+    }
+}
+
 /// §5.1：skills symlink 記錄在 journal（`skills_link_created`），restart 時可更新。
 #[test]
 fn skills_symlink_journal_entry_is_recorded() {
@@ -1084,8 +1284,14 @@ fn bridge_path_in_env_matches_mcp_config() {
         otterhive::protocol::Outcome::Completed,
         "實際為 {created:?}"
     );
-    assert!(wait_for_file(&mcp_dump), "繁中說明：應轉儲 MCP 設定");
-    assert!(wait_for_file(&env_dump), "繁中說明：應轉儲環境變數");
+    assert!(
+        wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
+        "繁中說明：應轉儲 MCP 設定"
+    );
+    assert!(
+        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        "繁中說明：應轉儲環境變數"
+    );
     let mcp: Value = serde_json::from_str(&read_text(&mcp_dump))
         .unwrap_or_else(|e| panic!("繁中說明：MCP 設定應是 JSON：{e}"));
     let bridge_in_config = mcp["mcpServers"]["otterhive"]["command"]

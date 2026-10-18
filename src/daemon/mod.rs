@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -245,12 +245,16 @@ struct Running {
     /// **這個型別強制解決的是鎖的粒度，不是「寫入不會阻塞」。** `write_input`
     /// 內部仍要鎖 `core.writer`（`Mutex<Box<dyn Write>>`），而 PTY 的 `write(2)`
     /// 在收件人不讀 stdin 時**確實會阻塞**——`interrupt`、attach Input 與喚醒
-    /// 三條路徑都走它。證據（CI 兩次因此紅、`sample` 取得的執行緒堆疊、累積門檻）
-    /// 見 [`docs/worklog-t6-pty-write-block.md`](crate::docs)。已裁決的修法是 writer
-    /// 改 `O_NONBLOCK`，作為 T6 開工前的第一項工作包。
+    /// 三條路徑都走它。證據見 [`docs/worklog-pty-write-block.md`](crate::docs)。
+    ///
+    /// 該阻塞的處置已完成兩半：寫入移出 daemon 鎖（本型別保證的那半）與
+    /// [`Session::write_input`] 改用 `try_lock`（讓「正在寫入」立刻可見，呼叫端
+    /// 不必排隊等一個不知何時結束的寫入）。**`O_NONBLOCK` 那條路線已否決**：
+    /// dup 不隔離旗標會讓 reader 自殺，`open(tty_name)` 的 slave 方向送不到
+    /// child stdin，且 `write_all` 在非阻塞下會把提示行寫成半行。
     ///
     /// 所以保留 `Arc` 的理由是：它讓「寫入不持 daemon 鎖」由型別保證、且
-    /// `Session` 不可 `Clone` 使它成為唯一選項——**不是**因為寫入不會阻塞。
+    /// `Session` 不可 `Clone` 使它成為唯一選項。
     session: Arc<Session>,
     /// 本次 spawn 的 generation（契約 §4.2-2 記錄的值）。
     ///
@@ -572,6 +576,20 @@ fn install_signal_handlers() {
 
 /// 收到終止訊號的旗標。
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// attach 的 Input frame 因寫端正被佔用而丟棄的累計次數。
+///
+/// §7.2 對 Input 的寫入失敗**沒有錯誤通道**（`0x05` Error frame 只涵蓋
+/// generation 不符），所以處置是靜默丟棄該 frame——「operator 打的那一格按鍵
+/// 掉了」。靜默丟棄若完全不可觀察就違反本專案「不靜默忽略」的原則，所以用這個
+/// 計數讓它可見（先例：`Session` 的 `DETACHED_THREADS`）。它**不在對外契約
+/// 上**，只是 daemon 內部的可觀察性。
+static INPUT_WRITES_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// attach Input 被丟棄的累計次數（見 [`INPUT_WRITES_REJECTED`]）。
+pub fn input_writes_rejected() -> usize {
+    INPUT_WRITES_REJECTED.load(Ordering::Relaxed)
+}
 
 extern "C" fn handle_terminate(_signal: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -1152,17 +1170,35 @@ fn spawn_instance(
     // §5.1：物化協調提示、MCP 設定、skills symlink。
     let mut warnings: Vec<String> = Vec::new();
     let _ = std::fs::create_dir_all(spec.working_directory.join(".claude"));
+    // §5.1 要求協調提示含「所屬 team 與 orchestrator」。deploy（§8.3）先建 team
+    // 再 start 成員，所以這裡（`spawn` 時）查得到。成員尚未加入 team 時為 `None`
+    // ——那是合法狀態（§8.1 允許 instance 不屬任何 team）。
+    let team_membership = {
+        let mut inner = state.lock();
+        let names = inner.store.transaction(|tx| {
+            let Some(team_name) = tx.team_name_of_instance(&spec.name)? else {
+                return Ok(None);
+            };
+            let Some(team) = tx.team(&team_name)? else {
+                return Ok(None);
+            };
+            let orchestrator = tx
+                .all_live_instances()?
+                .into_iter()
+                .find(|row| row.id == team.orchestrator_id)
+                .map(|row| row.name)
+                .unwrap_or_default();
+            Ok(Some((team_name, orchestrator)))
+        });
+        names.unwrap_or(None)
+    };
+    let tool_names: Vec<&str> = crate::mcp::P1A_PRIVILEGED_TOOLS.to_vec();
     let prompt = claude::coordination_prompt(
         &spec.name,
-        None,
-        &[
-            "list_instances",
-            "restart_instance",
-            "pane_snapshot",
-            "send",
-            "inbox",
-            "team",
-        ],
+        team_membership
+            .as_ref()
+            .map(|(team_name, orchestrator)| (team_name.as_str(), orchestrator.as_str())),
+        &tool_names,
         spec.instructions_text.as_deref(),
     );
     let prompt_path = match claude::write_prompt(&spec.working_directory, &prompt) {
@@ -2116,7 +2152,7 @@ fn write_hint_outside_lock(state: &DaemonState, instance: &str, bytes: &[u8]) ->
     // 所以「測試綠」不能證明這裡的鎖區間正確。
     //
     // 值得記錄的是：**當時那個寫法所防的威脅後來被證實可達**（見
-    // `docs/worklog-t6-pty-write-block.md`：PTY 的 `write(2)` 在收件人不讀 stdin
+    // `docs/worklog-pty-write-block.md`：PTY 的 `write(2)` 在收件人不讀 stdin
     // 時會阻塞，而 `interrupt`／attach Input／喚醒三條路徑都走 `write_input`）。
     // 但型別強制仍然值得保留——`Session` 不可 clone 使 `Arc` 成為唯一選項，而它
     // 讓「寫入不持 **daemon** 鎖」不必靠註解紀律維持。
@@ -2509,12 +2545,25 @@ fn restart_instance(
 /// `list_instances`：§4.7 的欄位集。
 fn list_instances(state: &DaemonState, operation_id: &str, args: &Value) -> OperationResult {
     let filter = target_name(args, "instance");
-    let rows = {
+    // §4.1：「team 成員資格只經 §8.1 的 team 操作設定」，所以 team 名稱從
+    // `team_members` 讀（`Tx::team_name_of_instance`），**不是** `instances.spec`
+    // ——`InstanceSpec` 的欄位清單根本不含 `team`，那個鍵從來不存在，先前的
+    // `spec.get("team")` 因此恆為 `null`。
+    let list_result = {
         let mut inner = state.lock();
-        inner.store.transaction(|tx| tx.all_live_instances())
+        inner.store.transaction(|tx| {
+            let rows = tx.all_live_instances()?;
+            let mut team_of: HashMap<String, String> = HashMap::new();
+            for row in &rows {
+                if let Some(team) = tx.team_name_of_instance(&row.name)? {
+                    team_of.insert(row.name.clone(), team);
+                }
+            }
+            Ok((rows, team_of))
+        })
     };
-    let rows = match rows {
-        Ok(rows) => rows,
+    let (rows, team_of) = match list_result {
+        Ok(pair) => pair,
         Err(store_error) => {
             return OperationResult::refused(
                 operation_id,
@@ -2543,7 +2592,7 @@ fn list_instances(state: &DaemonState, operation_id: &str, args: &Value) -> Oper
                 "reason": row.reason,
                 "generation": row.generation,
                 "backend": row.spec.get("backend").cloned().unwrap_or(json!("claude")),
-                "team": row.spec.get("team").cloned().unwrap_or(Value::Null),
+                "team": team_of.get(&row.name).cloned().map_or(Value::Null, Value::String),
                 "role": row.spec.get("role").cloned().unwrap_or(Value::Null),
                 "description": row.spec.get("description").cloned().unwrap_or(Value::Null),
                 "updated_ms": row.updated_ms,
@@ -2576,15 +2625,26 @@ fn interrupt_instance(
     {
         return denied;
     }
-    let inner = state.lock();
-    let Some(running) = inner.running.get(&name) else {
-        return OperationResult::refused(
-            operation_id,
-            ErrorCode::InvalidArgument,
-            "此 instance 未在執行中",
-        );
+    // 寫入必須在 **daemon 鎖外**進行（D-1 的同一原則，`write_hint_outside_lock`
+    // 已是這個形狀）：`state.lock()` 是全域的，而 PTY 的 `write(2)` 在輸入佇列
+    // 滿時會阻塞（佇列只由子程序讀 stdin 排空）。若在鎖內寫入，一個不讀 stdin
+    // 的 agent 就會讓 daemon 的每一次 `state.lock()` 全部停擺——不只是這條
+    // `interrupt`，還有 list_instances／pane_snapshot／inbox／send／stop 等。
+    // 鎖內只 clone 出 `Arc<Session>`，放掉鎖之後才寫。
+    let session = {
+        let inner = state.lock();
+        match inner.running.get(&name) {
+            Some(running) => Arc::clone(&running.session),
+            None => {
+                return OperationResult::refused(
+                    operation_id,
+                    ErrorCode::InvalidArgument,
+                    "此 instance 未在執行中",
+                );
+            }
+        }
     };
-    match running.session.write_input(&[0x1b]) {
+    match session.write_input(&[0x1b]) {
         Ok(()) => OperationResult {
             operation_id: operation_id.to_owned(),
             outcome: Outcome::Completed,
@@ -2593,6 +2653,16 @@ fn interrupt_instance(
             effects: vec![String::from("esc_sent")],
             error: None,
         },
+        // 寫端正被佔用（agent 正在輸入／前一次寫入仍阻塞）：這是**預期**的併發
+        // 狀態，不是 daemon 內部故障——所以回 §3 的 `operation_in_progress`
+        // （§4.7 明文），不回 `internal`。
+        Err(write_error) if write_error.kind() == std::io::ErrorKind::WouldBlock => {
+            OperationResult::refused(
+                operation_id,
+                ErrorCode::OperationInProgress,
+                "PTY 寫入通道正被佔用（agent 正在輸入），ESC 未送出",
+            )
+        }
         Err(write_error) => OperationResult::refused(
             operation_id,
             ErrorCode::Internal,
@@ -2957,12 +3027,28 @@ fn read_client_frames(
                     // 喚醒排程之後會讀這個欄位判斷「operator 正在打字」，
                     // 而排程器自己送出的提示行不經這裡（那走
                     // `Session::write_input`），所以不會污染它。
-                    let mut inner = state.lock();
-                    inner
-                        .last_client_input
-                        .insert(name.to_owned(), Instant::now());
-                    if let Some(running) = inner.running.get(name) {
-                        let _ = running.session.write_input(&payload[8..]);
+                    //
+                    // `last_client_input` 的更新**必須留在鎖內**（它是 `Inner`
+                    // 的可變狀態、§6.4 延後條件的資料來源），而 `write_input`
+                    // **必須在鎖外**——與 `interrupt` 同一個理由：PTY 寫入可能
+                    // 阻塞，daemon 鎖是全域的。所以鎖內只 clone 出 `Arc<Session>`。
+                    let session = {
+                        let mut inner = state.lock();
+                        inner
+                            .last_client_input
+                            .insert(name.to_owned(), Instant::now());
+                        inner
+                            .running
+                            .get(name)
+                            .map(|running| Arc::clone(&running.session))
+                    };
+                    if let Some(session) = session {
+                        // §7.2：Input 的寫入沒有錯誤通道（`0x05` Error frame 只涵蓋
+                        // generation 不符）。寫入被拒（寫端正被佔用）時靜默丟棄這個
+                        // frame，並累計可觀察計數——不發明未定義的 frame。
+                        if session.write_input(&payload[8..]).is_err() {
+                            INPUT_WRITES_REJECTED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

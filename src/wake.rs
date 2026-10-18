@@ -677,8 +677,9 @@ mod tests {
     /// 型別上不可達。
     ///
     /// 範圍提醒：`Session::write_input` **內部**仍要鎖 `core.writer`，而 PTY 的
-    /// `write(2)` 在收件人不讀 stdin 時確實會阻塞——那把鎖仍會被佔住。證據與已
-    /// 裁決的修法見 `docs/worklog-t6-pty-write-block.md`。
+    /// `write(2)` 在收件人不讀 stdin 時確實會阻塞——那個執行緒仍會卡住。但它
+    /// 已用 `try_lock`，所以**其他呼叫端不會排隊等它**（§6.4 的 `failed`）。
+    /// 證據與完整處置見 `docs/worklog-pty-write-block.md`。
     ///
     /// 函式指標的型別即證明：簽章要匹配，`check` 只能接受這六個參數。
     #[test]

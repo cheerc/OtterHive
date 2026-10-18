@@ -31,6 +31,6 @@ backend CLI 由 daemon 在 PTY 中啟動，經 MCP 設定連到 bridge。client 
 | 範圍 | 狀態 |
 |---|---|
 | P0：功能對照、MCP catalog、REA 行為基線 | 完成 |
-| P1a：lifecycle、訊息、終端 attach、team、deployment | T2（PR #1）、T3 程序／終端 Session（PR #2）、T4 daemon、授權、lifecycle、claude backend、bridge transport 與 CLI（PR #3）完成並合併。T5 的 team、訊息（send／inbox）、喚醒排程、完整 P1a MCP 工具集合與 CLI 的 `send`／`team` 已實作並集中驗證：`cargo test --locked --all-targets --no-fail-fast` 連續三輪全綠 347 passed／0 failed（T5 四個測試檔共 65 支：team_ops 17、message_delivery 27、wake_delivery 8、store_t5 13），待 PR 與雙 review；T6 deployment 起未開始。見 [P1a 實作計畫](plans/p1a-implementation.md) |
+| P1a：lifecycle、訊息、終端 attach、team、deployment | T2（PR #1）、T3 程序／終端 Session（PR #2）、T4 daemon、授權、lifecycle、claude backend、bridge transport 與 CLI（PR #3）、T5 team／訊息（send／inbox）／喚醒排程／完整 P1a MCP 工具集合／CLI 的 `send`／`team`（PR #4，merge `9681a3d`）完成並合併。T5 之後、T6 之前另完成一批修正（`worktree-p1a-pty-write-fix`，RED `80bd7c4` → GREEN `72d3059`）：PTY 寫入不再阻塞 daemon（`write_input` 改 `try_lock`、`interrupt` 與 attach Input 的寫入移出 daemon 鎖、`interrupt` 改回 `operation_in_progress`），以及三條「契約要求、實作少做、測試零覆蓋」的缺陷——`list_instances` 的 `team` 改讀 `team_members`、`spec.env` 與 `SessionConfig::env` 的 `OTTERHIVE_OPERATOR` 前綴過濾、協調提示補上 team／orchestrator 與完整工具清單。診斷過程與被推翻的結論見 [PTY 寫入阻塞](worklog-pty-write-block.md)。全量 `cargo test --locked --all-targets` 連續三輪 364 passed／0 failed；待 PR 與雙 review。T6 deployment 起未開始。見 [P1a 實作計畫](plans/p1a-implementation.md) |
 | P1b：TUI、resume／handoff 觸發、`set_metadata` 等 | 未開始 |
 | P2 以後：task、decision、worktree、review、CI、channel | 未開始；清單在 [`mcp-catalog.json`](reverse-engineering/mcp-catalog.json) |
