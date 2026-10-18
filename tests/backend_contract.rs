@@ -460,7 +460,12 @@ fn coordination_prompt_reports_team_and_privileged_tools() {
     );
     // 等**終態條件**（內容出現），不是「檔案存在」——`cat > "$dump"` 會先建立／
     // 截斷檔案再寫內容，所以 `exists()` 為真不等於寫完了。
-    let prompt = wait_for_file_containing(&dump, "squad")
+    //
+    // needle 用 `interrupt`：它是本測試**最後**一個斷言的子字串（下方 `contains`），
+    // 而在 `coordination_prompt` 的輸出順序裡它排在 team 行（`squad`／`chief`）**之後**
+    // （`src/backend/claude.rs` 的 `coordination_prompt`：名稱 → team 行 → 工具清單 → …）。
+    // 用 `squad` 會提早匹配，「已出現」不代表工具清單寫完了。判準要對齊真正要斷言的內容。
+    let prompt = wait_for_file_containing(&dump, "interrupt")
         .unwrap_or_else(|| panic!("繁中說明：成員應轉儲協調提示，實際：{}", read_text(&dump)));
     assert!(
         prompt.contains("chief"),
@@ -517,9 +522,16 @@ fn mcp_config_and_child_environment_match_the_contract() {
         "繁中說明：MCP 設定權限應為 0600，實際 {:o}",
         permissions.mode() & 0o777
     );
-    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它是 JSON 的**最後**欄位
-    // （`claude.rs:114-126`），也就是終態。若只等到 `"otterhive"` 就讀走，JSON
-    // 會截斷而解析失敗，變成誤導性的「應是合法 JSON」紅。
+    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它比 `"otterhive"` **晚**出現，
+    // 足以避開「JSON 只寫到 server 名就讀走」的截斷（那一種會讓 `from_str` 失敗成
+    // 誤導性的「應是合法 JSON」紅）。
+    //
+    // **它並不是最後一個欄位**（先前這裡這樣寫，是錯的）：`serde_json` 未開
+    // `preserve_order`（`Cargo.lock` 的依賴無 `indexmap`）⇒ `Map` 是 `BTreeMap`，
+    // key 因此**按字母排序**，`json!` 的插入順序在序列化時不留痕。`mcpServers` 底下
+    // 的 `otterhive` 物件排序後是 args／command／env／type，所以 token 在 `env` 物件
+    // 內、而**最後**的 key 是 `"type"`（`claude.rs:114-126`）。留這段是要避免下一個
+    // 人以為這個等待保證了「JSON 完整」——它只保證 needle 已出現。
     assert!(
         wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：fake_claude 應轉儲 MCP 設定"
