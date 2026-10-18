@@ -10,11 +10,13 @@
 
 ## 目前狀態
 
-- 已完成：P0、T2、T3（T2 由 PR #1 合併，T3 由 PR #2 合併，merge commit `482cd0a`）。
-- T4 基準：`main`／`origin/main` 為 `482cd0ae1b6d8fa0349f4b9341ca97b572903896`；本包使用獨立整合分支，不直接修改 main。
-- T4 已集中 GREEN（本分支 HEAD）：daemon（socket 服務、單一 home 單一 daemon、啟動自檢 fail-closed、dispatch、lifecycle 操作、attach frame 串流、`Tuning` 讀測試環境變數）、授權（§2 權限表）、claude backend（§5.1 argv／協調提示／MCP 設定／skills symlink、§5.3 環境、§5.4 resume 證據）、MCP bridge transport（§10 全數）、client／CLI（§9 lifecycle 指令與 exit code 映射）、store 最小擴充（lifecycle 狀態／程序紀錄 API）。`backend: command` 本期回 `unsupported_in_phase`（見上）。
-- T4 驗證：`cargo test --locked --all-targets --no-fail-fast` 全綠 **226 passed／0 failed**；`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --doc` 通過。
-- T4 期內以三方討論裁決並落地的關鍵修正：`Session::drop` 的 join 改為真有界（`is_finished` 輪詢到單一 deadline、超時 detach；Drop 不持鎖），修正 §4.3-2「不以無限等待 join 冒充有界停止」；`kill(-pgid)` 對已退出 leader 回 `EPERM` 為 macOS 預期行為，EPERM＋probe 已確認 Exited 不視為失敗（活體 EPERM 仍 `Unproven`）；`RecordedLeader` 以 `pbi_status` 區分活體與 zombie（`waitid` 對非本程序子程序必然 `ECHILD`，故 probe 在該路徑為無效證據）。待雙 review 後發 PR #3。
+- 已完成並合併：P0、T2（PR #1）、T3（PR #2）、T4（PR #3）、T5（PR #4，merge `9681a3d`）。
+- T5 之後、T6 之前完成兩批修正並合併：**PR #5**（merge `0c8a1ed`）——PTY 寫入不再阻塞 daemon（`write_input` 改 `try_lock`、`interrupt` 與 attach Input 的寫入移出 daemon 鎖）＋ 三條「契約要求、實作少做、測試零覆蓋」的缺陷；**PR #8**（merge `aceead9`）——測試等待條件的敘述與 needle 依據修正。診斷過程與**被推翻的結論**見 [`worklog-pty-write-block.md`](../worklog-pty-write-block.md)。
+- 目前基準：`main`／`origin/main` 為 `aceead9`；`cargo test --locked --all-targets` **365 passed／0 failed**。
+- 已知未修：`resume_evidence` 的 `HOME` 與 `encode_project_dir` 的編碼規則（兩者都需 REA，見 worklog 的「仍未修」）；fixture 的 write-then-rename（issue #6）；`daemon_recovery` 三支測試在高負載下不穩定（issue #7，**未定性**）。
+- 下一包：**T6（deployment，§8.2–§8.4）**。
+- 各包的逐輪細節（T4 的 226 passed、T4 期內的三方討論裁決、T5 的 RED/GREEN）留在各自的 PR 與前述 worklog 中，不再重述——**避免同一份狀態在多處各自更新**。
+
 
 ## 全域約束
 
