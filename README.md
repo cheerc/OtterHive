@@ -4,7 +4,7 @@ OtterHive 是一個精簡的 Rust daemon，讓多個 AI coding agent CLI（例�
 
 ## 狀態
 
-尚無可用的程式。目前完成功能對照、行為基線，以及 P1a 的規格與實作計畫；P1a（instance 生命週期、訊息、終端 attach、team 與 deployment）尚未開始實作。各期範圍見 [架構](docs/architecture.md#實作狀態)。
+P1a（instance 生命週期、訊息、終端 attach、team 與喚醒）已完成 T2–T5 並合併，`cargo test --locked --all-targets` 365 passed／0 failed。**T6（deployment）未開始**，尚不能端到端使用；也尚無對外發行的版本。各期範圍與已知未修見 [架構](docs/architecture.md#實作狀態)。
 
 ## 文件
 
