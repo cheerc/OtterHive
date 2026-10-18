@@ -460,7 +460,12 @@ fn coordination_prompt_reports_team_and_privileged_tools() {
     );
     // 等**終態條件**（內容出現），不是「檔案存在」——`cat > "$dump"` 會先建立／
     // 截斷檔案再寫內容，所以 `exists()` 為真不等於寫完了。
-    let prompt = wait_for_file_containing(&dump, "squad")
+    //
+    // needle 用 `interrupt`：它是本測試**最後**一個斷言的子字串（下方 `contains`），
+    // 而在 `coordination_prompt` 的輸出順序裡它排在 team 行（`squad`／`chief`）**之後**
+    // （`src/backend/claude.rs` 的 `coordination_prompt`：名稱 → team 行 → 工具清單 → …）。
+    // 用 `squad` 會提早匹配，「已出現」不代表工具清單寫完了。判準要對齊真正要斷言的內容。
+    let prompt = wait_for_file_containing(&dump, "interrupt")
         .unwrap_or_else(|| panic!("繁中說明：成員應轉儲協調提示，實際：{}", read_text(&dump)));
     assert!(
         prompt.contains("chief"),
@@ -517,23 +522,42 @@ fn mcp_config_and_child_environment_match_the_contract() {
         "繁中說明：MCP 設定權限應為 0600，實際 {:o}",
         permissions.mode() & 0o777
     );
-    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它是 JSON 的**最後**欄位
-    // （`claude.rs:114-126`），也就是終態。若只等到 `"otterhive"` 就讀走，JSON
-    // 會截斷而解析失敗，變成誤導性的「應是合法 JSON」紅。
+    // mcp_dump 的 needle 用 `OTTERHIVE_INSTANCE_TOKEN`：它比 `"otterhive"` **晚**出現，
+    // 足以避開「JSON 只寫到 server 名就讀走」的截斷（那一種會讓 `from_str` 失敗成
+    // 誤導性的「應是合法 JSON」紅）。
+    //
+    // **它並不是最後一個欄位**（先前這裡這樣寫，是錯的）：`serde_json` 未開
+    // `preserve_order`（`Cargo.lock` 的依賴無 `indexmap`）⇒ `Map` 是 `BTreeMap`，
+    // key 因此**按字母排序**，`json!` 的插入順序在序列化時不留痕。`mcpServers` 底下
+    // 的 `otterhive` 物件排序後是 args／command／env／type，所以 token 在 `env` 物件
+    // 內、而**最後**的 key 是 `"type"`（`claude.rs:114-126`）。留這段是要避免下一個
+    // 人以為這個等待保證了「JSON 完整」——它只保證 needle 已出現。
     assert!(
         wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：fake_claude 應轉儲 MCP 設定"
     );
     // env dump 是 `env | sed | sort`：先截斷再寫，且幾百個變數要數毫秒。
-    // `OTTERHIVE_HOME` 是 sort 後的第一位，等它即代表前面那些 OTTERHIVE 行寫完了。
     //
-    // **但下面的負面斷言（「不得有 `OTTERHIVE_OPERATOR`」）不因此有保證**：
-    // 本 helper 只保證 needle 已出現。`OTTERHIVE_OPERATOR_*` 排序在後面，
-    // 若檔案在它寫入前就在這裡被讀走，那條斷言會假綠。詳見
-    // `wait_for_file_containing` 的「邊界」註解——要真正保證得改 fixture 成
-    // write-then-rename。
+    // needle 用 `"\nTERM\n"`（**整行錨定**，含前後換行）。它涵蓋底下**全部**斷言
+    // 的理由是一個排序事實，不是運氣：`TERM` 排在所有要斷言的名稱**之後**——
+    // `OTTERHIVE_HOME` < `OTTERHIVE_INSTANCE` < `..._INSTANCE_TOKEN`
+    // < `OTTERHIVE_MCP_BRIDGE` < `OTTERHIVE_OPERATOR_*` < `TERM`。這個順序**與
+    // locale 無關**（`'O' < 'T'` 是基本字母序；實測 C／POSIX／en_US.UTF-8／
+    // zh_TW.UTF-8 皆然），而 `fake_claude.sh` 的 `env | sed | sort` 也**沒有設
+    // `LC_ALL`**——所以不要為了「讓註解成立」去 fixture 加 `LC_ALL=C`，那是不必要
+    // 的依賴。命中時，上面那四條與負面斷言的目標都**已寫入**。
+    //
+    // **不要讀成「等它就夠了」**：涵蓋是**因為它們排在 `TERM` 之前**才成立的。
+    // 日後若在下面新增一個排 `TERM` **之後**的斷言，涵蓋會**靜默失效**——那時
+    // 必須改 needle。這也是為什麼用整行錨定而不是子字串：`COLORTERM` **含
+    // `TERM` 子串**，用 `"TERM"` 會在 `COLORTERM` 那行就命中（與它排第幾無關）。
+    //
+    // 邊界：本 helper 只保證「needle 已出現」，**不保證「檔案完整」**（見
+    // `wait_for_file_containing` 的註解）。所以負面斷言在這裡是「**已涵蓋**」
+    // 而非「已保證」。此 race 未定案（600 次重現 0 次）；本改動的價值在**讓判準
+    // 與斷言對齊**，不在於證明了它會 flaky。
     assert!(
-        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        wait_for_file_containing(&env_dump, "\nTERM\n").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數名稱"
     );
     assert!(
@@ -1008,6 +1032,11 @@ fn spec_env_is_passed_to_the_child() {
         otterhive::protocol::Outcome::Completed,
         "實際為 {created:?}"
     );
+    // 這裡的 needle **刻意**不用 `"\nTERM\n"`，而是取在本測試唯一要斷言的
+    // `CUSTOM_VAR` 上。規則的界線是：needle 取在所有**被斷言**的名字之後即可；
+    // **單條**斷言時，取在該斷言的字串上、且該斷言之後沒有其他讀取，就已滿足
+    // 那條規則（它就是最後一條）。改成 `"\nTERM\n"` 反而引入「needle 與被斷言者
+    // 無關」的耦合。（本檔另兩處 env dump 有多條斷言，才需要整行錨定的 `TERM`。）
     assert!(
         wait_for_file_containing(&env_dump, "CUSTOM_VAR").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數"
@@ -1288,8 +1317,13 @@ fn bridge_path_in_env_matches_mcp_config() {
         wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：應轉儲 MCP 設定"
     );
+    // needle 用 `"\nTERM\n"`（整行錨定）——與本檔另一處 env dump 的等待同一條規則：
+    // **取排在所有被斷言名字之後的那一條**。這裡要斷言的是 `OTTERHIVE_MCP_BRIDGE`
+    // （見下方 `names.iter().any(...)`），而 `TERM` 排在所有 `OTTERHIVE_*` **之後**
+    // （`'O' < 'T'`，各 locale 皆然），所以 `TERM` 命中時 MCP_BRIDGE 必已寫入。
+    // 整行錨定是必要的：`COLORTERM` **含 `TERM` 子串**，用 `"TERM"` 會誤命中。
     assert!(
-        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        wait_for_file_containing(&env_dump, "\nTERM\n").is_some(),
         "繁中說明：應轉儲環境變數"
     );
     let mcp: Value = serde_json::from_str(&read_text(&mcp_dump))
