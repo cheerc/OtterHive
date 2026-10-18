@@ -537,15 +537,24 @@ fn mcp_config_and_child_environment_match_the_contract() {
         "繁中說明：fake_claude 應轉儲 MCP 設定"
     );
     // env dump 是 `env | sed | sort`：先截斷再寫，且幾百個變數要數毫秒。
-    // `OTTERHIVE_HOME` 是 sort 後的第一位，等它即代表前面那些 OTTERHIVE 行寫完了。
     //
-    // **但下面的負面斷言（「不得有 `OTTERHIVE_OPERATOR`」）不因此有保證**：
-    // 本 helper 只保證 needle 已出現。`OTTERHIVE_OPERATOR_*` 排序在後面，
-    // 若檔案在它寫入前就在這裡被讀走，那條斷言會假綠。詳見
-    // `wait_for_file_containing` 的「邊界」註解——要真正保證得改 fixture 成
-    // write-then-rename。
+    // needle 用 `"\nTERM\n"`（**整行錨定**，含前後換行）。它涵蓋底下**全部**斷言
+    // 的理由是一個排序事實，不是運氣：`LC_ALL=C sort` 下 `TERM` 排在所有要斷言的
+    // 名稱**之後**——`OTTERHIVE_HOME` < `OTTERHIVE_INSTANCE` < `..._INSTANCE_TOKEN`
+    // < `OTTERHIVE_MCP_BRIDGE` < `OTTERHIVE_OPERATOR_*` < `TERM`（因為 `'O' < 'T'`）。
+    // 所以這個 needle 命中時，上面那四條與負面斷言的目標都**已寫入**。
+    //
+    // **不要讀成「等它就夠了」**：涵蓋是**因為它們排在 `TERM` 之前**才成立的。
+    // 日後若在下面新增一個排 `TERM` **之後**的斷言，涵蓋會**靜默失效**——那時
+    // 必須改 needle。這也是為什麼用整行錨定而不是子字串：`COLORTERM` 含 `TERM`
+    // 子串且排在最前（第 1 位），用 `"TERM"` 會在 `COLORTERM` 那行就命中。
+    //
+    // 邊界：本 helper 只保證「needle 已出現」，**不保證「檔案完整」**（見
+    // `wait_for_file_containing` 的註解）。所以負面斷言在這裡是「**已涵蓋**」
+    // 而非「已保證」。此 race 未定案（600 次重現 0 次）；本改動的價值在**讓判準
+    // 與斷言對齊**，不在於證明了它會 flaky。
     assert!(
-        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        wait_for_file_containing(&env_dump, "\nTERM\n").is_some(),
         "繁中說明：fake_claude 應轉儲環境變數名稱"
     );
     assert!(
@@ -1300,8 +1309,13 @@ fn bridge_path_in_env_matches_mcp_config() {
         wait_for_file_containing(&mcp_dump, "OTTERHIVE_INSTANCE_TOKEN").is_some(),
         "繁中說明：應轉儲 MCP 設定"
     );
+    // needle 用 `"\nTERM\n"`（整行錨定）——與本檔另一處 env dump 的等待同一條規則：
+    // **取排在所有被斷言名字之後的那一條**。這裡要斷言的是 `OTTERHIVE_MCP_BRIDGE`
+    // （見下方 `names.iter().any(...)`），而 `LC_ALL=C sort` 下 `TERM` 排在所有
+    // `OTTERHIVE_*` **之後**（`'O' < 'T'`），所以 `TERM` 命中時 MCP_BRIDGE 必已寫入。
+    // 整行錨定是必要的：`COLORTERM` 含 `TERM` 子串且排在最前，用 `"TERM"` 會誤命中。
     assert!(
-        wait_for_file_containing(&env_dump, "OTTERHIVE_HOME").is_some(),
+        wait_for_file_containing(&env_dump, "\nTERM\n").is_some(),
         "繁中說明：應轉儲環境變數"
     );
     let mcp: Value = serde_json::from_str(&read_text(&mcp_dump))
